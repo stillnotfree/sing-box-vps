@@ -1,0 +1,14 @@
+.DS_Store
+
+# Private project research and machine exports; never publish these.
+/export/
+/diagnostic-report.txt
+/PROJECT_BASELINE.md
+/TECHNICAL_HANDOFF.md
+/INSTALLATION_REVIEW.md
+/deep-research-report.md
+
+# Local client experiments that are not part of the server release.
+/SHADOWROCKET_IOS_ROUTING.md
+/shadowrocket-ios-optimized.conf
+/debian13-readonly-diagnostic.sh
