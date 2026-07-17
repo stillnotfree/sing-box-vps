@@ -26,7 +26,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly SCRIPT_VERSION="1.0.0"
+readonly SCRIPT_VERSION="1.0.1"
 readonly PROJECT_NAME="vpn-setup"
 readonly SAGERNET_KEY_URL="https://sing-box.app/gpg.key"
 readonly SAGERNET_KEY_FILE="/etc/apt/keyrings/sagernet.asc"
@@ -63,6 +63,7 @@ readonly JOURNAL_DROPIN="${JOURNAL_DROPIN_DIR}/90-vpn-limits.conf"
 readonly UDP_SYSCTL_FILE="/etc/sysctl.d/90-vpn-udp-buffers.conf"
 readonly NFT_CONFIG="/etc/nftables.conf"
 readonly SSH_DROPIN="/etc/ssh/sshd_config.d/00-vpn-hardening.conf"
+readonly FIRST_LOGIN_HOOK="/etc/profile.d/90-vpn-first-login.sh"
 readonly INSTALLED_HELPER="/usr/local/sbin/vpn"
 readonly CERT_HOOK="/etc/letsencrypt/renewal-hooks/deploy/50-vpn-sing-box"
 readonly FIREWALL_UNIT_STATE="${STATE_DIR}/firewall.rollback.unit"
@@ -256,6 +257,7 @@ Usage:
   sudo vpn update
   sudo vpn self-update /path/to/new/install-sing-box-server.sh
   sudo vpn diagnostic
+  sudo vpn finalize --yes
   sudo vpn confirm-firewall --yes
   sudo vpn rollback-firewall --yes
   sudo vpn lockdown-ssh --yes
@@ -414,7 +416,17 @@ validate_domain() {
 }
 
 validate_email() {
-  [[ "$1" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]] || die 'Provide a valid ACME email with --email.'
+  local value="$1" domain
+  [[ "$value" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]] || \
+    die 'Provide a real ACME account email with --email.'
+  domain="${value##*@}"
+  domain="$(printf '%s' "$domain" | tr '[:upper:]' '[:lower:]')"
+  case "$domain" in
+    example.com|example.net|example.org|test|invalid|localhost|example|\
+    *.test|*.invalid|*.localhost|*.example)
+      die 'Reserved example/test email domains are not accepted by ACME. Rerun install with --email and a real reachable address.'
+      ;;
+  esac
 }
 
 validate_ipv4() {
@@ -583,6 +595,7 @@ save_settings() {
 }
 
 load_settings() {
+  local skip_email_validation="${1:-0}"
   require_root
   [[ -r "$SETTINGS_FILE" ]] || die 'VPN settings are unavailable; install the server first.'
   jq -e '.schema_version == 1' "$SETTINGS_FILE" >/dev/null || die 'Unsupported settings schema.'
@@ -601,7 +614,9 @@ load_settings() {
   validate_public_key_text "$ADMIN_PUBLIC_KEY"
   validate_ipv4 "$SERVER_IPV4"
   validate_domain "$TLS_DOMAIN"
-  validate_email "$ACME_EMAIL"
+  if (( skip_email_validation == 0 )); then
+    validate_email "$ACME_EMAIL"
+  fi
   validate_ssh_port "$SSH_PORT"
   validate_domain "$REALITY_TARGET"
   validate_emoji "$COUNTRY_EMOJI"
@@ -619,7 +634,10 @@ load_resume_settings() {
   local requested_emoji="$COUNTRY_EMOJI"
   local requested_fingerprint="$CLIENT_FINGERPRINT"
 
-  load_settings
+  # An interrupted v1.0.0 installation may contain an address that passed the
+  # old syntax-only check but was rejected by the ACME server. Load it once
+  # without validating the email so a corrected --email can replace it.
+  load_settings 1
 
   [[ -z "$requested_admin" || "$requested_admin" == "$ADMIN_USER" ]] || \
     die "--admin-user conflicts with the saved installation state (${ADMIN_USER})."
@@ -629,8 +647,14 @@ load_resume_settings() {
     die "--server-ipv4 conflicts with the saved installation state (${SERVER_IPV4})."
   [[ -z "$requested_domain" || "$requested_domain" == "$TLS_DOMAIN" ]] || \
     die "--domain conflicts with the saved installation state (${TLS_DOMAIN})."
-  [[ -z "$requested_email" || "$requested_email" == "$ACME_EMAIL" ]] || \
-    die "--email conflicts with the saved installation state (${ACME_EMAIL})."
+  if [[ -n "$requested_email" && "$requested_email" != "$ACME_EMAIL" ]]; then
+    [[ ! -f "$INSTALL_COMPLETE_FILE" ]] || \
+      die "--email conflicts with the completed installation state (${ACME_EMAIL})."
+    validate_email "$requested_email"
+    warn "Replacing the saved ACME email for this interrupted installation."
+    ACME_EMAIL="$requested_email"
+  fi
+  validate_email "$ACME_EMAIL"
   [[ -z "$requested_ssh_port" || "$requested_ssh_port" == "$SSH_PORT" ]] || \
     die "--ssh-port conflicts with the saved installation state (${SSH_PORT})."
   [[ -z "$requested_target" || "$requested_target" == "$REALITY_TARGET" ]] || \
@@ -703,7 +727,7 @@ Target:
   Minimum free disk:    2.5 GiB
   Init/runtime:         real systemd boot; containers without systemd and WSL unsupported
   Admin account:        ${plan_admin}
-  SSH:                  TCP/${plan_ssh_port}, public key only after explicit lockdown
+  SSH:                  TCP/${plan_ssh_port}, key-only after first verified admin login
   Server IPv4:          ${plan_ip}
   Server core:          latest stable sing-box from its signed official APT repository
   Primary inbound:      VLESS + REALITY + Vision, TCP/443
@@ -739,7 +763,7 @@ Package commands:
 Account and SSH commands:
   useradd/usermod/chpasswd/install/visudo
   sshd -t
-  systemctl reload ssh (only in the later lockdown-ssh command)
+  systemctl reload ssh (automatically after the first verified admin login)
 
 Certificate commands:
   dig A ${plan_domain} using 1.1.1.1 and 8.8.8.8
@@ -771,6 +795,7 @@ Files changed by install:
   /etc/fstab and /swapfile (only if swap is absent)
   /home/${plan_admin}/.ssh/authorized_keys
   /etc/sudoers.d/90-${plan_admin}
+  ${FIRST_LOGIN_HOOK} (removed after successful one-time finalization)
   ${INSTALLED_HELPER}
   ${SETTINGS_FILE}
   ${CLIENTS_FILE} (root-only client database)
@@ -799,10 +824,10 @@ Safety gates:
     are verified and reused instead of being recreated;
   * each installation attempt writes a detailed root-only log with the failed
     step, exit code, command, source location, and shell call stack;
-  * firewall automatically rolls back after five minutes unless confirmed from
-    a second SSH session;
-  * root/password SSH is not disabled by install; lockdown-ssh must be run from
-    a verified administrative sudo session.
+  * firewall automatically rolls back after five minutes unless the first SSH
+    login as the new administrator proves that the managed policy and key work;
+  * that verified login automatically confirms firewall persistence, applies
+    key-only SSH hardening, and removes its one-time login hook.
 EOF
 }
 
@@ -2571,6 +2596,33 @@ confirm_firewall() {
   log 'Firewall persistence confirmed; automatic rollback cancelled.'
 }
 
+render_first_login_hook() {
+  local candidate="$1"
+  cat >"$candidate" <<EOF
+#!/bin/sh
+# Managed by VPN setup. Removed after one verified administrator SSH login.
+if [ "\${USER:-}" = "${ADMIN_USER}" ] && [ -n "\${SSH_CONNECTION:-}" ] && [ -x "${INSTALLED_HELPER}" ]; then
+  printf '%s\n' 'Completing one-time VPN server security setup...'
+  if ! sudo -n "${INSTALLED_HELPER}" finalize --yes; then
+    printf '%s\n' 'Automatic finalization failed. Keep this SSH session open and review the error above.' >&2
+  fi
+fi
+EOF
+}
+
+configure_first_login_hook() {
+  local candidate
+  if [[ -f "${STATE_DIR}/firewall.confirmed" && -f "$SSH_DROPIN" ]]; then
+    rm -f -- "$FIRST_LOGIN_HOOK"
+    return
+  fi
+  candidate="$(mktemp)"
+  render_first_login_hook "$candidate"
+  sh -n "$candidate"
+  write_atomic "$FIRST_LOGIN_HOOK" root root 0644 "$candidate"
+  rm -f -- "$candidate"
+}
+
 lockdown_ssh() {
   local candidate invoking_user effective
   require_root
@@ -2613,6 +2665,43 @@ EOF
   fi
   systemctl reload ssh.service
   log 'SSH lockdown applied: key-only, no root login, no password login.'
+}
+
+finalize_installation() {
+  local invoking_user
+  require_root
+  require_confirmation
+  load_settings
+  invoking_user="${SUDO_USER:-}"
+  [[ "$invoking_user" == "$ADMIN_USER" ]] || \
+    die "Run finalization from an SSH session of ${ADMIN_USER} using sudo."
+  [[ -f "$INSTALL_COMPLETE_FILE" ]] || \
+    die 'Installation payload is not complete; rerun the install command first.'
+
+  acquire_operation_lock
+  load_settings
+
+  if [[ ! -f "${STATE_DIR}/firewall.confirmed" ]]; then
+    if [[ -f "${STATE_DIR}/firewall.managed" ]]; then
+      confirm_firewall
+    else
+      warn 'The previous firewall safety window expired before a verified administrator login.'
+      apply_firewall
+      cat <<EOF
+The managed firewall was reapplied with a new five-minute safety window.
+Open one more new SSH session as ${ADMIN_USER}; it will finish automatically.
+Keep this session open until the new login succeeds.
+EOF
+      return
+    fi
+  fi
+
+  # Re-render and validate the drop-in even when it already exists. This keeps
+  # finalization idempotent and proves the effective sshd policy before reload.
+  lockdown_ssh
+  rm -f -- "$FIRST_LOGIN_HOOK"
+  log 'VPN server setup finalized automatically: firewall persistent and SSH key-only.'
+  printf '%s\n' 'One-time security setup complete. Future SSH logins require the configured key.'
 }
 
 update_sing_box() {
@@ -3040,6 +3129,7 @@ prepare_upgrade_transaction() {
   backup_upgrade_file "$UDP_SYSCTL_FILE" udp-sysctl 0644
   backup_upgrade_file "$CERT_HOOK" certificate-hook 0750
   backup_upgrade_file "$INSTALLED_HELPER" vpn-helper 0750
+  backup_upgrade_file "$FIRST_LOGIN_HOOK" first-login-hook 0644
   backup_upgrade_file "$INSTALL_COMPLETE_FILE" completion-marker 0600
   UPGRADE_ROLLBACK_FAILED=0
   UPGRADE_ROLLBACK_ACTIVE=1
@@ -3053,6 +3143,7 @@ rollback_upgrade_transaction() {
   restore_upgrade_file "$UDP_SYSCTL_FILE" udp-sysctl root root 0644 || restore_failed=1
   restore_upgrade_file "$CERT_HOOK" certificate-hook root root 0750 || restore_failed=1
   restore_upgrade_file "$INSTALLED_HELPER" vpn-helper root root 0750 || restore_failed=1
+  restore_upgrade_file "$FIRST_LOGIN_HOOK" first-login-hook root root 0644 || restore_failed=1
   restore_upgrade_file "$INSTALL_COMPLETE_FILE" completion-marker root root 0600 || restore_failed=1
   if [[ "$UPGRADE_ORIGINAL_RMEM" =~ ^[0-9]+$ ]]; then
     sysctl -q -w "net.core.rmem_max=${UPGRADE_ORIGINAL_RMEM}" >/dev/null 2>&1 || restore_failed=1
@@ -3128,6 +3219,8 @@ EOF
     restore_installed_helper "$helper_backup" || die 'New helper failed its post-install check and automatic helper rollback also failed.'
     die 'New helper failed its post-install check; the previous helper was restored.'
   fi
+  set_step 'first-login security finalization hook migration'
+  configure_first_login_hook
   set_step 'managed state version marker'
   write_install_completion_marker
   UPGRADE_ROLLBACK_ACTIVE=0
@@ -3171,14 +3264,16 @@ run_install() {
       require_command nft
       require_command systemctl
       require_command systemd-run
+      set_step 'management helper recovery update'
+      install_helper >/dev/null
+      set_step 'first-login security finalization hook recovery'
+      configure_first_login_hook
       set_step 'nftables firewall recovery deployment'
       apply_firewall
       cat <<EOF
 
 Firewall reapplied with automatic rollback in five minutes.
-From a SECOND verified SSH session run:
-  sudo vpn confirm-firewall --yes
-  sudo vpn status
+Open a new SSH session as ${ADMIN_USER}; finalization will run automatically.
 EOF
       return
     fi
@@ -3253,6 +3348,8 @@ EOF
   smoke_test_certificate_hook
   set_step 'management command installation'
   install_helper >/dev/null
+  set_step 'first-login security finalization hook'
+  configure_first_login_hook
   set_step 'nftables firewall deployment'
   apply_firewall
   set_step 'installation completion marker'
@@ -3260,17 +3357,14 @@ EOF
 
   cat <<EOF
 
-Installation payload completed, but two safety confirmations remain.
+Installation payload completed.
 
-Within five minutes, open a SECOND local terminal and test:
+Within five minutes, keep this session open and use a new local terminal to run:
   ssh -p ${SSH_PORT} ${ADMIN_USER}@${SERVER_IPV4}
 
-From that new ${ADMIN_USER} session run:
-  sudo vpn confirm-firewall --yes
-  sudo vpn status
-
-Only after that session works, disable root/password SSH:
-  sudo vpn lockdown-ssh --yes
+That verified key login automatically confirms firewall persistence and enables
+key-only SSH. No post-install command is required. If the five-minute safety
+window has already expired, follow the prompt and reconnect once more.
 
 An independent ${INITIAL_CLIENT_NAME} VPN profile was created. Its credentials
 were NOT printed. Manage profiles from the verified ${ADMIN_USER} session:
@@ -3315,6 +3409,9 @@ main() {
       ;;
     status)
       show_status
+      ;;
+    finalize)
+      finalize_installation
       ;;
     confirm-firewall)
       confirm_firewall

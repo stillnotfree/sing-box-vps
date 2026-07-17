@@ -17,6 +17,7 @@ terminal-only management CLI with transactional updates and rollback.
 - a real systemd boot, not WSL or a container without systemd;
 - a public IPv4 address;
 - a domain or subdomain with a direct `A` record to the VPS;
+- a real reachable email address for the Let's Encrypt account;
 - a one-line OpenSSH public key;
 - a reviewed REALITY target supporting TLS 1.3 and HTTP/2.
 
@@ -29,7 +30,7 @@ a CDN or DNS proxy because Certbot uses the HTTP-01 standalone challenge.
 Connect to the VPS as `root`, then run:
 
 ```bash
-wget -qO vpn-install.sh https://raw.githubusercontent.com/stillnotfree/sing-box-vps/v1.0.0/install-sing-box-server.sh && chmod 700 vpn-install.sh && ./vpn-install.sh install
+wget -qO vpn-install.sh https://raw.githubusercontent.com/stillnotfree/sing-box-vps/v1.0.1/install-sing-box-server.sh && chmod 700 vpn-install.sh && ./vpn-install.sh install
 ```
 
 The installer asks for:
@@ -38,7 +39,7 @@ The installer asks for:
 2. the administrator's public SSH key;
 3. the VPS public IPv4 address;
 4. the TLS and subscription domain;
-5. a Let's Encrypt account email;
+5. a real reachable Let's Encrypt account email;
 6. the existing SSH port;
 7. the REALITY target;
 8. a country or server emoji;
@@ -50,19 +51,28 @@ running the same install command again.
 
 ## Finish the installation safely
 
-Do not close the original SSH session after installation. Open a second session
-using the newly created administrator and its private key, then run:
+Do not close the original SSH session. Within five minutes, open one new SSH
+session using the administrator and private key configured during installation:
 
 ```bash
-sudo vpn confirm-firewall --yes
-sudo vpn status
-sudo vpn lockdown-ssh --yes
+ssh ADMIN_USER@SERVER_IP
 ```
 
-Open one more SSH session and verify key-based access before closing the
-original session. Firewall changes roll back automatically after five minutes
-unless they are confirmed from the second session. SSH lockdown is a separate
-operation and disables root, password, and keyboard-interactive login.
+That verified key login automatically confirms the managed firewall, enables
+key-only SSH, and removes the one-time login hook. No post-install command is
+required. If the safety window expired first, the login reapplies the firewall
+with a new rollback timer and asks for one more SSH login. Keep the earlier
+session open until finalization reports success.
+
+If an interrupted installation saved an ACME address that Let's Encrypt rejects,
+resume it with a real address instead of reinstalling the VPS:
+
+```bash
+./vpn-install.sh install --email you@your-domain.com
+```
+
+Replace the example above with an address you actually receive mail at;
+reserved `example.*` addresses are deliberately rejected by the installer.
 
 The initial independent client is named `default`:
 
@@ -146,6 +156,16 @@ Selects a client fingerprint interactively or directly. Supported values are
 `random`. Subscription URLs remain unchanged; refresh them on each device.
 
 ### Updates and recovery
+
+The following finalization commands are recovery tools; a normal fresh install
+runs them automatically on the first administrator SSH login.
+
+```bash
+sudo vpn finalize --yes
+```
+
+Completes pending firewall confirmation and SSH hardening from a verified
+administrator SSH session.
 
 ```bash
 sudo vpn update
