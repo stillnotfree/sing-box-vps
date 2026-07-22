@@ -9,7 +9,7 @@ repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck disable=SC1091
 source "${repo_root}/install-sing-box-server.sh"
 
-[[ "$SCRIPT_VERSION" == "1.0.4" ]]
+[[ "$SCRIPT_VERSION" == "1.0.5" ]]
 (( ${#SUPPORTED_CLIENT_FINGERPRINTS[@]} == 9 ))
 (( ${#SUPPORTED_HY2_OBFS_MODES[@]} == 2 ))
 
@@ -122,14 +122,33 @@ if declare -F configure_first_login_hook >/dev/null || declare -F render_first_l
   printf 'Obsolete automatic first-login finalization hook is still present.\n' >&2
   exit 1
 fi
+render_auto_finalize_wrapper "${work}/auto-finalize-login"
+sh -n "${work}/auto-finalize-login"
+grep -Fq 'SSH_ORIGINAL_COMMAND' "${work}/auto-finalize-login"
+grep -Fq 'sudo -n "/usr/local/sbin/vpn" finalize --yes' "${work}/auto-finalize-login"
+grep -Fq 'exec "$login_shell" -l' "${work}/auto-finalize-login"
+render_auto_finalize_ssh_dropin "${work}/auto-finalize.conf"
+grep -Fxq 'Match User vpnadmin' "${work}/auto-finalize.conf"
+grep -Fxq '    DisableForwarding yes' "${work}/auto-finalize.conf"
+grep -Fxq '    ForceCommand /usr/local/libexec/vpn-auto-finalize-login' "${work}/auto-finalize.conf"
+grep -Fxq 'Match all' "${work}/auto-finalize.conf"
+
 finalize_body="$(declare -f finalize_installation)"
 grep -Fq 'ASSUME_YES=1' <<<"$finalize_body"
 grep -Fq 'apply_firewall' <<<"$finalize_body"
 grep -Fq 'confirm_firewall' <<<"$finalize_body"
+grep -Fq 'remove_auto_finalization' <<<"$finalize_body"
 if grep -Fq 'Open one more new SSH session' <<<"$finalize_body"; then
   printf 'Finalization still requires a second authorization cycle.\n' >&2
   exit 1
 fi
+configure_auto_body="$(declare -f configure_auto_finalization)"
+grep -Fq '/usr/sbin/sshd -t' <<<"$configure_auto_body"
+grep -Fq '/usr/sbin/sshd -T -C' <<<"$configure_auto_body"
+grep -Fq 'forcecommand ${AUTO_FINALIZE_WRAPPER}' <<<"$configure_auto_body"
+grep -Fq 'systemctl reload ssh.service' <<<"$configure_auto_body"
+create_admin_body="$(declare -f create_admin_account)"
+grep -Fq 'sudo -u "$ADMIN_USER" sudo -n /bin/true' <<<"$create_admin_body"
 
 # Firewall confirmation must verify transient unit state instead of trusting a
 # combined `systemctl stop timer service` exit code.  The service is commonly

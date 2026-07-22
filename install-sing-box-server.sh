@@ -27,7 +27,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly SCRIPT_VERSION="1.0.4"
+readonly SCRIPT_VERSION="1.0.5"
 readonly PROJECT_NAME="vpn-setup"
 readonly SAGERNET_KEY_URL="https://sing-box.app/gpg.key"
 readonly SAGERNET_KEY_FILE="/etc/apt/keyrings/sagernet.asc"
@@ -67,6 +67,9 @@ readonly JOURNAL_DROPIN="${JOURNAL_DROPIN_DIR}/90-vpn-limits.conf"
 readonly UDP_SYSCTL_FILE="/etc/sysctl.d/90-vpn-udp-buffers.conf"
 readonly NFT_CONFIG="/etc/nftables.conf"
 readonly SSH_DROPIN="/etc/ssh/sshd_config.d/00-vpn-hardening.conf"
+readonly AUTO_FINALIZE_SSH_DROPIN="/etc/ssh/sshd_config.d/99-vpn-auto-finalize.conf"
+readonly AUTO_FINALIZE_WRAPPER="/usr/local/libexec/vpn-auto-finalize-login"
+readonly AUTO_FINALIZE_REMOVAL_STAGE="${STATE_DIR}/vpn-auto-finalize.conf.removing"
 readonly LEGACY_FIRST_LOGIN_HOOK="/etc/profile.d/90-vpn-first-login.sh"
 readonly FIRST_LOGIN_SSH_RC_NAME="rc"
 readonly FIRST_LOGIN_SSH_RC_ORIGINAL_NAME="rc.vpn-setup-original"
@@ -827,7 +830,7 @@ Target:
   Minimum free disk:    2.5 GiB
   Init/runtime:         real systemd boot; containers without systemd and WSL unsupported
   Admin account:        ${plan_admin}
-  SSH:                  TCP/${plan_ssh_port}, key-only after explicit finalization
+  SSH:                  TCP/${plan_ssh_port}, automatically finalized on first admin login
   Server IPv4:          ${plan_ip}
   Server core:          latest stable sing-box from its signed official APT repository
   Primary inbound:      VLESS + REALITY + Vision, TCP/443
@@ -865,7 +868,7 @@ Package commands:
 Account and SSH commands:
   useradd/usermod/chpasswd/install/visudo
   sshd -t
-  systemctl reload ssh (during explicit "sudo vpn finalize --yes")
+  systemctl reload ssh (one-time automatic finalization on first admin login)
 
 Certificate commands:
   dig A ${plan_domain} using 1.1.1.1 and 8.8.8.8
@@ -897,6 +900,8 @@ Files changed by install:
   /etc/fstab and /swapfile (only if swap is absent)
   /home/${plan_admin}/.ssh/authorized_keys
   /etc/sudoers.d/90-${plan_admin}
+  ${AUTO_FINALIZE_SSH_DROPIN} (removed after the first successful admin login)
+  ${AUTO_FINALIZE_WRAPPER} (removed after the first successful admin login)
   ${INSTALLED_HELPER}
   ${SETTINGS_FILE}
   ${CLIENTS_FILE} (root-only client database)
@@ -927,10 +932,11 @@ Safety gates:
     are verified and reused instead of being recreated;
   * each installation attempt writes a detailed root-only log with the failed
     step, exit code, command, source location, and shell call stack;
-  * firewall automatically rolls back after five minutes unless the new
-    administrator explicitly runs "sudo vpn finalize --yes";
-  * finalization verifies the live policy and SSH listener, confirms firewall
-    persistence, and applies key-only SSH hardening as one transaction.
+  * firewall automatically rolls back after five minutes unless a successful
+    interactive login with the new administrator key finalizes the setup;
+  * the first administrator login verifies the live policy and SSH listener,
+    confirms firewall persistence, applies key-only SSH hardening, removes its
+    temporary ForceCommand, and then opens the normal login shell.
 EOF
 }
 
@@ -1256,6 +1262,8 @@ create_admin_account() {
     install -o root -g root -m 0440 "$sudoers_stage" "/etc/sudoers.d/90-${ADMIN_USER}"
   fi
   rm -f -- "$sudoers_stage"
+  sudo -u "$ADMIN_USER" sudo -n /bin/true || \
+    die "Passwordless sudo validation failed for ${ADMIN_USER}; automatic first-login finalization would not be reliable."
 
   if (( created_account == 1 )); then
     # Keep the PAM account usable for public-key SSH while making its password
@@ -2946,6 +2954,138 @@ restore_first_login_hook() {
   fi
 }
 
+render_auto_finalize_wrapper() {
+  local candidate="$1"
+  cat >"$candidate" <<EOF
+#!/bin/sh
+# Managed by vpn-setup. Removed after the first successful administrator login.
+set -u
+
+if [ -n "\${SSH_ORIGINAL_COMMAND:-}" ]; then
+  printf '%s\n' 'Open one interactive SSH session before using SCP, SFTP, or remote commands.' >&2
+  exit 1
+fi
+
+if ! /usr/bin/sudo -n "${INSTALLED_HELPER}" finalize --yes; then
+  printf '%s\n' 'Automatic VPN security finalization failed. This login remains available for diagnostics.' >&2
+fi
+
+login_shell="\${SHELL:-/bin/bash}"
+if [ ! -x "\$login_shell" ]; then
+  login_shell=/bin/bash
+fi
+exec "\$login_shell" -l
+EOF
+}
+
+render_auto_finalize_ssh_dropin() {
+  local candidate="$1"
+  cat >"$candidate" <<EOF
+# Managed by vpn-setup. Removed after the first successful administrator login.
+Match User ${ADMIN_USER}
+    DisableForwarding yes
+    ForceCommand ${AUTO_FINALIZE_WRAPPER}
+Match all
+EOF
+}
+
+remove_auto_finalization() {
+  local restore_required=0
+  require_root
+
+  if [[ ! -e "$AUTO_FINALIZE_SSH_DROPIN" &&
+        ! -e "$AUTO_FINALIZE_REMOVAL_STAGE" &&
+        ! -e "$AUTO_FINALIZE_WRAPPER" ]]; then
+    return
+  fi
+
+  if [[ -e "$AUTO_FINALIZE_SSH_DROPIN" ]]; then
+    [[ -f "$AUTO_FINALIZE_SSH_DROPIN" && ! -L "$AUTO_FINALIZE_SSH_DROPIN" ]] || \
+      die "Refusing to remove unexpected automatic-finalization SSH path: ${AUTO_FINALIZE_SSH_DROPIN}"
+    grep -Fq '# Managed by vpn-setup. Removed after the first successful administrator login.' \
+      "$AUTO_FINALIZE_SSH_DROPIN" || \
+      die "Refusing to remove an unmanaged SSH configuration: ${AUTO_FINALIZE_SSH_DROPIN}"
+    [[ ! -e "$AUTO_FINALIZE_REMOVAL_STAGE" ]] || \
+      die "Stale automatic-finalization removal state exists: ${AUTO_FINALIZE_REMOVAL_STAGE}"
+    mv -- "$AUTO_FINALIZE_SSH_DROPIN" "$AUTO_FINALIZE_REMOVAL_STAGE"
+    restore_required=1
+  fi
+
+  if ! /usr/sbin/sshd -t; then
+    if (( restore_required == 1 )); then
+      mv -- "$AUTO_FINALIZE_REMOVAL_STAGE" "$AUTO_FINALIZE_SSH_DROPIN"
+    fi
+    die 'sshd validation failed while removing automatic first-login finalization.'
+  fi
+  if ! systemctl reload ssh.service; then
+    if (( restore_required == 1 )); then
+      mv -- "$AUTO_FINALIZE_REMOVAL_STAGE" "$AUTO_FINALIZE_SSH_DROPIN"
+      /usr/sbin/sshd -t >/dev/null 2>&1 && systemctl reload ssh.service >/dev/null 2>&1 || true
+    fi
+    die 'SSH reload failed while removing automatic first-login finalization.'
+  fi
+
+  rm -f -- "$AUTO_FINALIZE_WRAPPER" "$AUTO_FINALIZE_REMOVAL_STAGE"
+}
+
+configure_auto_finalization() {
+  local wrapper_candidate dropin_candidate effective
+  require_root
+
+  if [[ -f "${STATE_DIR}/firewall.confirmed" ]] && ssh_lockdown_is_effective; then
+    remove_auto_finalization
+    return
+  fi
+
+  if [[ -e "$AUTO_FINALIZE_WRAPPER" ]]; then
+    [[ -f "$AUTO_FINALIZE_WRAPPER" && ! -L "$AUTO_FINALIZE_WRAPPER" ]] || \
+      die "Refusing to replace unexpected automatic-finalization wrapper: ${AUTO_FINALIZE_WRAPPER}"
+    grep -Fq '# Managed by vpn-setup. Removed after the first successful administrator login.' \
+      "$AUTO_FINALIZE_WRAPPER" || \
+      die "Refusing to replace an unmanaged wrapper: ${AUTO_FINALIZE_WRAPPER}"
+  fi
+  if [[ -e "$AUTO_FINALIZE_SSH_DROPIN" ]]; then
+    [[ -f "$AUTO_FINALIZE_SSH_DROPIN" && ! -L "$AUTO_FINALIZE_SSH_DROPIN" ]] || \
+      die "Refusing to replace unexpected automatic-finalization SSH path: ${AUTO_FINALIZE_SSH_DROPIN}"
+    grep -Fq '# Managed by vpn-setup. Removed after the first successful administrator login.' \
+      "$AUTO_FINALIZE_SSH_DROPIN" || \
+      die "Refusing to replace an unmanaged SSH configuration: ${AUTO_FINALIZE_SSH_DROPIN}"
+  fi
+
+  install -d -o root -g root -m 0755 "$(dirname "$AUTO_FINALIZE_WRAPPER")"
+  wrapper_candidate="$(mktemp)"
+  render_auto_finalize_wrapper "$wrapper_candidate"
+  sh -n "$wrapper_candidate"
+  write_atomic "$AUTO_FINALIZE_WRAPPER" root root 0755 "$wrapper_candidate"
+  rm -f -- "$wrapper_candidate"
+
+  dropin_candidate="$(mktemp)"
+  render_auto_finalize_ssh_dropin "$dropin_candidate"
+  write_atomic "$AUTO_FINALIZE_SSH_DROPIN" root root 0644 "$dropin_candidate"
+  rm -f -- "$dropin_candidate"
+
+  if ! /usr/sbin/sshd -t; then
+    rm -f -- "$AUTO_FINALIZE_SSH_DROPIN" "$AUTO_FINALIZE_WRAPPER"
+    die 'sshd rejected the temporary automatic-finalization rule; it was removed.'
+  fi
+  if ! effective="$(/usr/sbin/sshd -T -C \
+    "user=${ADMIN_USER},host=localhost,addr=127.0.0.1,laddr=127.0.0.1,lport=${SSH_PORT}")"; then
+    rm -f -- "$AUTO_FINALIZE_SSH_DROPIN" "$AUTO_FINALIZE_WRAPPER"
+    die 'Unable to evaluate the administrator SSH policy; temporary automatic-finalization files were removed.'
+  fi
+  if ! grep -Fxq "forcecommand ${AUTO_FINALIZE_WRAPPER}" <<<"$effective" ||
+     ! grep -Fxq 'disableforwarding yes' <<<"$effective"; then
+    rm -f -- "$AUTO_FINALIZE_SSH_DROPIN" "$AUTO_FINALIZE_WRAPPER"
+    die 'The effective administrator SSH policy did not activate automatic finalization; temporary files were removed.'
+  fi
+  if ! systemctl reload ssh.service; then
+    rm -f -- "$AUTO_FINALIZE_SSH_DROPIN" "$AUTO_FINALIZE_WRAPPER"
+    /usr/sbin/sshd -t >/dev/null 2>&1 && systemctl reload ssh.service >/dev/null 2>&1 || true
+    die 'SSH could not load the temporary automatic-finalization rule; it was removed.'
+  fi
+  log 'Armed one-time automatic security finalization for the first administrator SSH login.'
+}
+
 lockdown_ssh() {
   local candidate invoking_user effective
   require_root
@@ -3014,18 +3154,19 @@ finalize_installation() {
     fi
     # The caller has already reached the administrator account and authorized
     # this transaction. Check the live SSH listener and explicit accept rule,
-    # persist the policy, and cancel rollback in the same transaction. Keep
-    # this session alive so the user can independently test a second login.
+    # persist the policy, and cancel rollback in the same transaction. The
+    # already authenticated session remains available throughout the change.
     confirm_firewall
   fi
 
   # Re-render and validate the drop-in even when it already exists. This keeps
   # finalization idempotent and proves the effective sshd policy before reload.
   lockdown_ssh
+  remove_auto_finalization
   restore_first_login_hook
   log 'VPN server setup finalized: firewall persistent and SSH key-only.'
   printf '%s\n' 'One-time security setup complete. Future SSH logins require the configured key.'
-  printf '%s\n' 'Keep this session open until one additional SSH login has been tested.'
+  printf '%s\n' 'No further setup command or reconnect is required.'
 }
 
 update_sing_box() {
@@ -3445,6 +3586,14 @@ show_status() {
   else
     printf 'not confirmed\n'
   fi
+  printf 'Automatic security finalization: '
+  if [[ -f "$AUTO_FINALIZE_SSH_DROPIN" && -x "$AUTO_FINALIZE_WRAPPER" ]]; then
+    printf 'armed for first interactive admin login\n'
+  elif [[ -f "${STATE_DIR}/firewall.confirmed" ]] && ssh_lockdown_is_effective; then
+    printf 'complete\n'
+  else
+    printf 'not armed or incomplete\n'
+  fi
   printf 'SSH lockdown: '
   ssh_lockdown_is_effective && printf 'installed and effective\n' || printf 'not installed or ineffective\n'
   printf 'REALITY target: %s\n' "$configured_target"
@@ -3582,7 +3731,7 @@ upgrade_existing_installation() {
   require_client_runtime
   [[ -f "$INSTALL_COMPLETE_FILE" ]] || die 'Installation completion marker is missing; resume the install command instead of upgrading.'
   [[ -f "${STATE_DIR}/firewall.confirmed" ]] || \
-    die 'Firewall is not confirmed; log in as the administrator and run "sudo vpn finalize --yes" before upgrading.'
+    die 'Firewall is not confirmed; rerun the install command to arm automatic first-login finalization before upgrading.'
 
   current_helper_version="$(installed_helper_version)"
   current_state_version="$(installed_state_version)"
@@ -3637,6 +3786,7 @@ EOF
   fi
   set_step 'obsolete first-login hook cleanup'
   restore_first_login_hook
+  remove_auto_finalization
   set_step 'managed state version marker'
   write_install_completion_marker
   set_step 'managed server configuration and subscription migration'
@@ -3688,13 +3838,15 @@ run_install() {
       install_helper >/dev/null
       set_step 'obsolete first-login hook cleanup'
       restore_first_login_hook
+      set_step 'automatic first-login security finalization'
+      configure_auto_finalization
       set_step 'nftables firewall recovery deployment'
       apply_firewall
       cat <<EOF
 
 Firewall reapplied with automatic rollback in five minutes.
-Open a new SSH session as ${ADMIN_USER}, then run:
-  sudo vpn finalize --yes
+Open one interactive SSH session as ${ADMIN_USER}. It will finish the security
+setup automatically and then open the normal shell.
 EOF
       return
     fi
@@ -3776,21 +3928,20 @@ EOF
   set_step 'installation completion marker'
   write_install_completion_marker
   write_runtime_version_marker
+  set_step 'automatic first-login security finalization'
+  configure_auto_finalization
 
   cat <<EOF
 
 Installation payload completed.
 
-Within five minutes, keep this session open and use a new local terminal to run:
+Keep this session open and use a new local terminal to run:
   ssh -p ${SSH_PORT} ${ADMIN_USER}@${SERVER_IPV4}
 
-From that administrator session, complete the one-time security transaction:
-  sudo vpn finalize --yes
-
-This confirms firewall persistence and enables key-only SSH. If the five-minute
-safety window has expired, finalization safely reapplies and confirms the
-firewall in the same command. Keep the original session open until a subsequent
-SSH login has also been tested.
+The first successful interactive login automatically confirms firewall
+persistence, enables key-only SSH, removes its temporary login rule, and opens
+the normal shell. No command or second login is required. If the five-minute
+safety window has expired, the same login safely reapplies the firewall first.
 
 An independent ${INITIAL_CLIENT_NAME} VPN profile was created. Its credentials
 were NOT printed. Manage profiles from the verified ${ADMIN_USER} session:

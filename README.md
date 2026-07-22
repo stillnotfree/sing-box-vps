@@ -30,7 +30,7 @@ a CDN or DNS proxy because Certbot uses the HTTP-01 standalone challenge.
 Connect to the VPS as `root`, then run:
 
 ```bash
-wget -qO vpn-install.sh https://raw.githubusercontent.com/stillnotfree/sing-box-vps/v1.0.4/install-sing-box-server.sh && chmod 700 vpn-install.sh && ./vpn-install.sh install
+wget -qO vpn-install.sh https://raw.githubusercontent.com/stillnotfree/sing-box-vps/v1.0.5/install-sing-box-server.sh && chmod 700 vpn-install.sh && ./vpn-install.sh install
 ```
 
 The installer asks for:
@@ -49,21 +49,21 @@ It displays the complete plan before making changes and requires an explicit
 `YES` confirmation. Failed runs keep validated settings and can be resumed by
 running the same install command again.
 
-## Finish the installation safely
+## First login
 
-Do not close the original SSH session. Within five minutes, open one new SSH
-session using the administrator and private key configured during installation:
+Keep the installer session open and make one interactive SSH login using the
+administrator and private key configured during installation:
 
 ```bash
 ssh ADMIN_USER@SERVER_IP
-sudo vpn finalize --yes
 ```
 
-`finalize` confirms the managed firewall and enables key-only SSH as one
-explicit transaction. If the rollback window already expired, the same command
-reapplies and confirms the firewall; a second mandatory authorization cycle is
-not required. Keep the original session open, then test one additional SSH
-login before closing it.
+That successful login automatically confirms the managed firewall, enables
+key-only SSH, removes the temporary first-login rule, and opens the normal
+shell. No command or second login is required. If the rollback window already
+expired, the same login safely reapplies the firewall before finalization.
+SCP, SFTP, and remote commands become available after this first interactive
+login.
 
 If an interrupted installation saved an ACME address that Let's Encrypt rejects,
 resume it with a real address instead of reinstalling the VPS:
@@ -170,8 +170,9 @@ native Hysteria2 is filtered or throttled.
 
 ### Updates and recovery
 
-Run this once from the newly created administrator account after a fresh
-installation:
+Fresh installations finalize automatically on the first interactive
+administrator login. The following command is only a recovery tool if that
+automatic step reports an error:
 
 ```bash
 sudo vpn finalize --yes
