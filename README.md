@@ -1,8 +1,8 @@
 # sing-box-vps
 
 A minimal interactive installer for a private sing-box server on a clean VPS.
-It deploys two independent transports, private per-device subscriptions, and a
-terminal-only management CLI with transactional updates and rollback.
+It is designed for a small personal server that should be easy to install,
+update, and manage without a web panel.
 
 ## Features
 
@@ -10,233 +10,93 @@ terminal-only management CLI with transactional updates and rollback.
 - Runs VLESS + REALITY + Vision on TCP/443 and Hysteria2 + TLS on UDP/443.
 - No web panel, Docker, statistics, telemetry, or access logging.
 
-## Requirements
+## Before you start
+
+You need:
 
 - Debian 13, Ubuntu 24.04 LTS, or Ubuntu 26.04 LTS on `amd64`;
-- 1 vCPU, 1 GB RAM, and 10 GB disk;
-- a real systemd boot, not WSL or a container without systemd;
-- a public IPv4 address;
-- a domain or subdomain with a direct `A` record to the VPS;
-- a real reachable email address for the Let's Encrypt account;
-- a one-line OpenSSH public key;
+- at least 1 vCPU, 1 GB RAM, and 10 GB disk;
+- a public IPv4 address and a real systemd boot;
+- a domain or subdomain with a direct `A` record pointing to the VPS;
+- a real email address for Let's Encrypt;
+- an OpenSSH **public** key, such as one line beginning with `ssh-ed25519`;
 - a reviewed REALITY target supporting TLS 1.3 and HTTP/2.
 
-The provider firewall or security group must allow the current SSH port,
-TCP/80, TCP/443, TCP/8443, and UDP/443. The DNS record must not be hidden behind
-a CDN or DNS proxy because Certbot uses the HTTP-01 standalone challenge.
+Never paste or upload your private SSH key.
 
-## Quick install
+Allow these ports in the provider firewall or security group:
 
-Connect to the VPS as `root`, then run:
+| Protocol | Port | Purpose |
+| --- | ---: | --- |
+| TCP | Current SSH port | Server administration |
+| TCP | 80 | Let's Encrypt validation |
+| TCP | 443 | VLESS + REALITY |
+| UDP | 443 | Hysteria2 |
+| TCP | 8443 | Private subscriptions |
+
+The DNS record must point directly to the VPS. Do not enable a CDN or DNS proxy
+for it, and do not add an `AAAA` record unless IPv6 is deliberately configured.
+
+## Install
+
+Connect to the VPS as `root` and run:
 
 ```bash
 wget -qO vpn-install.sh https://raw.githubusercontent.com/stillnotfree/sing-box-vps/v1.0.5/install-sing-box-server.sh && chmod 700 vpn-install.sh && ./vpn-install.sh install
 ```
 
-The installer asks for:
-
-1. the administrative username to create;
-2. the administrator's public SSH key;
-3. the VPS public IPv4 address;
-4. the TLS and subscription domain;
-5. a real reachable Let's Encrypt account email;
-6. the existing SSH port;
-7. the REALITY target;
-8. the VPS country from a numbered list;
-9. the initial client TLS fingerprint.
-
-It displays the complete plan before making changes and requires an explicit
-`YES` confirmation. Failed runs keep validated settings and can be resumed by
-running the same install command again.
+The installer asks for the administrator, public SSH key, VPS address, domain,
+email, current SSH port, REALITY target, VPS country, and client fingerprint. It
+shows the complete plan before making changes and waits for an explicit `YES`.
+An interrupted installation can normally be resumed with the same command.
 
 ## First login
 
-Keep the installer session open and make one interactive SSH login using the
-administrator and private key configured during installation:
+Keep the installer session open. In a second terminal, log in once with the new
+administrator and the configured private key:
 
 ```bash
 ssh ADMIN_USER@SERVER_IP
 ```
 
-That successful login automatically confirms the managed firewall, enables
-key-only SSH, removes the temporary first-login rule, and opens the normal
-shell. No command or second login is required. If the rollback window already
-expired, the same login safely reapplies the firewall before finalization.
-SCP, SFTP, and remote commands become available after this first interactive
-login.
+That successful interactive login automatically confirms the firewall and
+enables key-only SSH. No separate finalization command or second login is
+normally required.
 
-If an interrupted installation saved an ACME address that Let's Encrypt rejects,
-resume it with a real address instead of reinstalling the VPS:
-
-```bash
-./vpn-install.sh install --email you@your-domain.com
-```
-
-Replace the example above with an address you actually receive mail at;
-reserved `example.*` addresses are deliberately rejected by the installer.
-
-The initial independent client is named `default`:
+The first independent client is named `default`. Display its private
+subscription, direct links, and QR codes with:
 
 ```bash
 sudo vpn show default
 ```
 
-This command prints private subscription URLs, direct import links, and QR
-codes. Do not share its output.
+Do not share this output: the links contain client credentials.
 
 ## Commands
 
-### Read-only checks
+| Task | Command |
+| --- | --- |
+| Show server state | `sudo vpn status` |
+| Run share-safe diagnostics | `sudo vpn diagnostic` |
+| Check installation compatibility | `sudo vpn check` |
+| List clients | `sudo vpn list` |
+| Show links and QR codes | `sudo vpn show NAME` |
+| Add an independent client | `sudo vpn add NAME` |
+| Revoke a client | `sudo vpn delete NAME --yes` |
+| Update sing-box safely | `sudo vpn update` |
+| Change the REALITY target | `sudo vpn set-target DOMAIN` |
+| Select a client fingerprint | `sudo vpn set-fingerprint` |
+| Use native Hysteria2/QUIC | `sudo vpn set-obfs off` |
+| Enable Salamander | `sudo vpn set-obfs salamander` |
+| Show built-in help | `sudo vpn help` |
 
-```bash
-sudo vpn check
-```
-
-Checks OS, architecture, memory, disk, systemd, ports, and runtime compatibility.
-
-```bash
-sudo vpn status
-```
-
-Shows sing-box, nginx, nftables, SSH lockdown, congestion control, swap,
-certificate timer, listeners, DNS, and client count.
-
-```bash
-sudo vpn diagnostic
-```
-
-Runs health checks for both transports, subscriptions, DNS, certificates,
-Certbot, REALITY target, and nftables, followed by a redacted diagnostic report.
-Review the report before sharing it.
-
-### Client management
-
-```bash
-sudo vpn list
-```
-
-Lists clients without printing credentials.
-
-```bash
-sudo vpn add WorkPC
-```
-
-Creates an independent VLESS UUID, Hysteria2 password, and subscription token,
-then displays the new subscription and QR code.
-
-```bash
-sudo vpn show WorkPC
-```
-
-Displays the existing client's subscription, direct links, and QR codes.
-
-```bash
-sudo vpn delete WorkPC --yes
-```
-
-Revokes the client's VLESS, Hysteria2, and subscription credentials. The last
-remaining client cannot be deleted.
-
-### Connection settings
-
-```bash
-sudo vpn set-target example.com
-```
-
-Validates TLS 1.3, HTTP/2, and the certificate before transactionally changing
-the REALITY target and regenerating subscriptions. No target is automatically
-selected or guaranteed to work through every network.
-
-```bash
-sudo vpn set-fingerprint
-sudo vpn set-fingerprint firefox
-```
-
-Selects a client fingerprint interactively or directly. Supported values are
-`chrome`, `firefox`, `safari`, `ios`, `android`, `edge`, `360`, `qq`, and
-`random`. Subscription URLs remain unchanged; refresh them on each device.
-
-```bash
-sudo vpn set-obfs off
-sudo vpn set-obfs salamander
-```
-
-Switches Hysteria2 globally between its native QUIC/HTTP/3 appearance (`off`,
-the default) and Salamander UDP obfuscation. The server configuration and every
-subscription format are changed transactionally and restored on failure.
-Subscription URLs stay unchanged, but every Hysteria2 client must refresh after
-the switch. Use Salamander only when tests on the affected network show that
-native Hysteria2 is filtered or throttled.
-
-### Updates and recovery
-
-Fresh installations finalize automatically on the first interactive
-administrator login. The following command is only a recovery tool if that
-automatic step reports an error:
-
-```bash
-sudo vpn finalize --yes
-```
-
-Completes pending firewall confirmation and SSH hardening from a verified
-administrator SSH session.
-
-```bash
-sudo vpn update
-```
-
-Updates sing-box from its official repository, validates the current
-configuration, and restores the cached previous package if startup fails.
-
-```bash
-sudo vpn self-update /root/install-sing-box-server.sh
-```
-
-Applies an already downloaded newer installer file after syntax, project, and
-version validation. Downgrades are rejected and the previous CLI is retained as
-a rollback copy.
-
-```bash
-sudo vpn confirm-firewall --yes
-sudo vpn rollback-firewall --yes
-```
-
-Confirms the managed nftables policy or restores the saved pre-install ruleset.
-
-```bash
-sudo vpn lockdown-ssh --yes
-```
-
-Enables key-only SSH. It must be run with `sudo` from a verified session of the
-administrator created during installation.
-
-```bash
-sudo vpn help
-```
-
-Displays the built-in command reference.
-
-## Subscriptions
-
-Every client receives a stable random HTTPS subscription URL on TCP/8443. The
-default response is a Base64 URI list containing VLESS and Hysteria2. Mihomo,
-FlClash, and Clash Verge receive a complete Mihomo profile based on their
-`User-Agent`; an explicit `/mihomo` suffix is also available. Frontends based
-on sing-box or Xray receive the URI list; neither core defines a portable
-cross-platform subscription document of its own.
-
-Changing the REALITY target or fingerprint regenerates every representation
-without changing subscription URLs. Regional routing and split tunneling remain
-client policy and are not coupled to third-party rule providers. See
-[docs/SUBSCRIPTIONS.md](docs/SUBSCRIPTIONS.md) for the format and threat model.
-
-The installation domain is also the HTTPS subscription hostname and Hysteria2
-TLS identity. The installer does not automate domain migration because clients
-cannot portably replace their own saved subscription URL.
+Target, fingerprint, obfuscation, client, and update changes are validated and
+applied transactionally. Existing subscription URLs remain stable; refresh the
+subscription in clients after changing connection settings.
 
 ## System updates
 
-Normal OS updates are supported:
+Normal operating-system updates are supported:
 
 ```bash
 sudo apt update
@@ -245,34 +105,67 @@ sudo vpn update
 sudo vpn status
 ```
 
-The sing-box package is held from unattended APT upgrades and is updated only
-through `vpn update`, which performs validation and rollback. OS security
-updates remain enabled without automatic reboot.
+OS security updates are enabled automatically without automatic reboot.
+sing-box is updated separately by `vpn update`, which validates the current
+configuration and can restore the cached previous package if startup fails.
 
 ## What the installer configures
 
 | Component | Configuration |
 | --- | --- |
-| Core | One stable sing-box package from the signed SagerNet repository |
-| Primary | VLESS + REALITY + Vision, TCP/443 |
+| Core | Stable sing-box from the signed SagerNet repository |
+| Primary | VLESS + REALITY + Vision on TCP/443 |
 | Reserve | Hysteria2 + TLS on UDP/443; native QUIC by default, optional Salamander |
-| Subscription | Static nginx-light HTTPS service, TCP/8443 |
-| Firewall | Native nftables with a five-minute rollback timer |
-| SSH | Dedicated administrator, then optional key-only lockdown |
-| TLS | Certbot renewal hook with certificate/key validation and rollback |
-| Network | BBR + `fq` when supported and conservative Hysteria2 UDP ceilings |
+| Clients | Independent credentials, HTTPS subscription, links, and QR codes |
+| SSH | Dedicated administrator, public-key authentication, root/password login disabled |
+| Firewall | Native nftables with a temporary automatic rollback window |
+| TLS | Let's Encrypt certificate with tested automatic renewal |
+| Network | BBR + `fq` when supported and conservative UDP buffer ceilings |
 | Storage | 1 GiB swap when absent and a 200 MiB / 30-day journal limit |
-| Updates | Unattended OS security updates; transactional sing-box updates |
+| Updates | Automatic OS security updates and transactional sing-box updates |
+
+## Subscriptions
+
+Each client receives an unguessable HTTPS subscription URL on TCP/8443. The
+same URL serves a Base64 VLESS/Hysteria2 list or a complete Mihomo profile based
+on the client `User-Agent`; `/mihomo` is also available explicitly. Routing,
+split tunneling, and GeoIP policy remain the responsibility of the client.
+
+See [docs/SUBSCRIPTIONS.md](docs/SUBSCRIPTIONS.md) for compatibility details and
+the subscription threat model.
 
 ## Limitations
 
-- No protocol, target, or fingerprint guarantees access through every current or future filter.
+- No protocol, REALITY target, or fingerprint is guaranteed to bypass every network filter.
 - Hysteria2 requires usable UDP and may be degraded by some networks.
-- IPv6 server profiles, CDN transports, port hopping, panels, and traffic statistics are not configured.
-- Client-side routing, GeoIP rules, and TLS fragmentation are not forced by the server.
-- End-to-end tests must be performed from the actual Wi-Fi and mobile networks where the service will be used.
+- IPv6 profiles, CDN transports, port hopping, panels, and traffic statistics are not configured.
+- Client routing and TLS fragmentation are not forced by the server.
+- Test both transports on the actual Wi-Fi and mobile networks where they will be used.
 
-## Development checks
+<details>
+<summary><strong>Recovery commands</strong></summary>
+
+Fresh installations finalize automatically. Use these only when installation
+or diagnostics explicitly report a recovery condition.
+
+```bash
+sudo vpn finalize --yes
+sudo vpn confirm-firewall --yes
+sudo vpn rollback-firewall --yes
+sudo vpn lockdown-ssh --yes
+sudo vpn self-update /root/install-sing-box-server.sh
+```
+
+If Let's Encrypt rejected an email saved during an interrupted installation:
+
+```bash
+./vpn-install.sh install --email you@your-domain.com
+```
+
+</details>
+
+<details>
+<summary><strong>Development checks</strong></summary>
 
 ```bash
 bash -n install-sing-box-server.sh
@@ -281,6 +174,14 @@ bash tests/static-smoke.sh
 bash tests/fingerprint-smoke.sh
 ./install-sing-box-server.sh plan
 ```
+
+</details>
+
+## Development note
+
+This project was vibe-coded with AI assistance, then reviewed, tested, and
+iterated on real Debian and Ubuntu VPS installations. Read the code and assess
+the trade-offs before using it on infrastructure you do not control.
 
 ## License
 
