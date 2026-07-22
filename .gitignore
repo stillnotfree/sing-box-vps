@@ -12,3 +12,6 @@
 /SHADOWROCKET_IOS_ROUTING.md
 /shadowrocket-ios-optimized.conf
 /debian13-readonly-diagnostic.sh
+
+# Personal client tooling kept locally and never published with the server.
+/private/

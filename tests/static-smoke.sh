@@ -12,6 +12,22 @@ repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck disable=SC1091,SC2034
 source "${repo_root}/install-sing-box-server.sh"
 
+# Candidate extraction must consume the complete producer stream. An early
+# awk exit makes pipefail report SIGPIPE (141) on apt-cache in some Ubuntu
+# installations.
+apt-cache() {
+  printf '%s\n' \
+    'sing-box:' \
+    '  Installed: (none)' \
+    '  Candidate: 1.13.14' \
+    '  Version table:'
+  local line
+  for line in {1..4096}; do
+    printf '     1.13.14 500 source-%s\n' "$line"
+  done
+}
+[[ "$(sing_box_candidate_version)" == "1.13.14" ]]
+
 # Subscription rendering only needs already-generated server secrets. Replacing
 # this loader keeps the test entirely inside its temporary directory.
 generate_or_load_server_secrets() { :; }
@@ -23,7 +39,6 @@ COUNTRY_EMOJI="🇩🇪"
 CLIENT_FINGERPRINT="firefox"
 REALITY_PUBLIC_KEY="testPublicKey"
 REALITY_SHORT_ID="deadbeef"
-HY2_OBFS_PASSWORD="0123456789abcdef0123456789abcdef0123456789abcdef"
 
 work="$(mktemp -d)"
 trap 'rm -rf -- "$work"' EXIT
@@ -44,6 +59,10 @@ openssl base64 -d -A -in "${work}/${token}.links" >"${work}/decoded.links"
 grep -q '^vless://' "${work}/decoded.links"
 grep -q '^hysteria2://' "${work}/decoded.links"
 grep -Fq '&fp=firefox&' "${work}/decoded.links"
+if grep -Eq 'obfs=|obfs-password=' "${work}/decoded.links"; then
+  printf 'Unexpected Hysteria2 obfuscation in URI subscription.\n' >&2
+  exit 1
+fi
 
 jq -e '
   .mode == "rule" and
@@ -51,10 +70,12 @@ jq -e '
   .ipv6 == false and
   (.proxies | length == 2) and
   (.proxies[0].type == "vless") and
+  (.proxies[0]["packet-encoding"] == "xudp") and
   (.proxies[0].flow == "xtls-rprx-vision") and
   (.proxies[0]["client-fingerprint"] == "firefox") and
   (.proxies[1].type == "hysteria2") and
-  (.proxies[1].obfs == "salamander") and
+  ((.proxies[1] | has("obfs")) | not) and
+  ((.proxies[1] | has("obfs-password")) | not) and
   (.rules[-1] == "MATCH,PROXY")
 ' "${work}/${token}.mihomo" >/dev/null
 
@@ -72,6 +93,14 @@ render_nginx_subscription_site "${work}/nginx.conf"
 grep -Fq 'default links;' "${work}/nginx.conf"
 grep -Fq '~*(clash|mihomo|flclash|clash-verge|clashverge|stash) mihomo;' \
   "${work}/nginx.conf"
+grep -Fq '~*(sing-box|singbox|hiddify|happ|nekobox|xray|v2ray|v2rayn|v2rayng|shadowrocket) links;' \
+  "${work}/nginx.conf"
+grep -Fq 'links|mihomo' "${work}/nginx.conf"
+if grep -Fq 'links|mihomo|sing-box' "${work}/nginx.conf" || \
+   find "$work" -maxdepth 1 -type f -name '*.sing-box' -print -quit | grep -q .; then
+  printf 'Unexpected platform-specific sing-box subscription endpoint.\n' >&2
+  exit 1
+fi
 grep -Fq 'access_log off;' "${work}/nginx.conf"
 grep -Fq 'limit_except GET HEAD' "${work}/nginx.conf"
 

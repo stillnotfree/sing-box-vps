@@ -50,11 +50,12 @@ supported representations atomically from the same client record:
   cannot consume a remote subscription.
 
 An nginx `map` selects a pre-generated static file from a conservative
-`User-Agent` allowlist. Unknown clients receive the Base64 URI list. An explicit
-`/mihomo` suffix remains available when an application sends a generic or
-undocumented `User-Agent`. Thus the normal user
-experience is one stable URL, while troubleshooting does not depend on an
-external converter or a dynamic web backend.
+`User-Agent` allowlist. Mihomo frontends receive the Mihomo profile; known
+sing-box/Xray frontends and unknown clients receive the Base64 URI list. An
+explicit `/mihomo` suffix remains available when an application sends a generic
+or undocumented `User-Agent`. Thus the normal user experience is one stable
+URL, while troubleshooting does not depend on an external converter or a
+dynamic web backend.
 
 Base64 is only a compatibility encoding and provides no secrecy; confidentiality
 comes from HTTPS and the unguessable bearer token. User-Agent detection is a
@@ -122,16 +123,16 @@ Shadowrocket supports URL subscriptions and manual/background updates, but node
 sharing formats are not standardized between applications. Hiddify documents
 V2Ray URI lists, Clash, and sing-box profiles; FlClash is a Mihomo frontend and
 therefore needs a valid Mihomo configuration. A native sing-box remote profile
-would be a complete JSON configuration whose routing, DNS, and TUN policy are
-platform-specific. Release 1.0.0 therefore does not advertise a misleading
-universal sing-box JSON. Hiddify/Happ and other sing-box-based applications that
-accept V2Ray-style URI subscriptions use the URI fallback. Unknown applications
-also receive that conservative fallback.
+would be a complete JSON configuration whose routing, DNS, paths, TUN policy,
+and privilege model are platform-specific. The project therefore does not
+advertise a misleading universal sing-box JSON. Frontends based on sing-box or
+Xray that accept V2Ray-style URI subscriptions use the URI fallback. Unknown
+applications also receive that conservative fallback.
 
 The generated Mihomo profile sends private/local networks directly and all
 other traffic through the selected VPN proxy. Regional GeoIP/geosite routing is
 client policy and is deliberately not coupled to this server installer or to an
-unreviewed third-party rule provider. A separate Shadowrocket configuration is
+unreviewed third-party rule provider. A separate client routing configuration is
 not replaced by this node subscription.
 
 ## Multiple independent VPS nodes

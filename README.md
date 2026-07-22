@@ -7,7 +7,7 @@ terminal-only management CLI with transactional updates and rollback.
 ## Features
 
 - Installs the latest stable sing-box from its official signed repository.
-- Runs VLESS + REALITY + Vision on TCP/443 and Hysteria2 + TLS + Salamander on UDP/443.
+- Runs VLESS + REALITY + Vision on TCP/443 and Hysteria2 + TLS on UDP/443.
 - No web panel, Docker, statistics, telemetry, or access logging.
 
 ## Requirements
@@ -30,7 +30,7 @@ a CDN or DNS proxy because Certbot uses the HTTP-01 standalone challenge.
 Connect to the VPS as `root`, then run:
 
 ```bash
-wget -qO vpn-install.sh https://raw.githubusercontent.com/stillnotfree/sing-box-vps/v1.0.1/install-sing-box-server.sh && chmod 700 vpn-install.sh && ./vpn-install.sh install
+wget -qO vpn-install.sh https://raw.githubusercontent.com/stillnotfree/sing-box-vps/v1.0.2/install-sing-box-server.sh && chmod 700 vpn-install.sh && ./vpn-install.sh install
 ```
 
 The installer asks for:
@@ -42,7 +42,7 @@ The installer asks for:
 5. a real reachable Let's Encrypt account email;
 6. the existing SSH port;
 7. the REALITY target;
-8. a country or server emoji;
+8. the VPS country from a numbered list;
 9. the initial client TLS fingerprint.
 
 It displays the complete plan before making changes and requires an explicit
@@ -207,7 +207,9 @@ Displays the built-in command reference.
 Every client receives a stable random HTTPS subscription URL on TCP/8443. The
 default response is a Base64 URI list containing VLESS and Hysteria2. Mihomo,
 FlClash, and Clash Verge receive a complete Mihomo profile based on their
-`User-Agent`; an explicit `/mihomo` suffix is also available.
+`User-Agent`; an explicit `/mihomo` suffix is also available. Frontends based
+on sing-box or Xray receive the URI list; neither core defines a portable
+cross-platform subscription document of its own.
 
 Changing the REALITY target or fingerprint regenerates every representation
 without changing subscription URLs. Regional routing and split tunneling remain
@@ -239,7 +241,7 @@ updates remain enabled without automatic reboot.
 | --- | --- |
 | Core | One stable sing-box package from the signed SagerNet repository |
 | Primary | VLESS + REALITY + Vision, TCP/443 |
-| Reserve | Hysteria2 + TLS + Salamander, UDP/443 |
+| Reserve | Hysteria2 + TLS with native HTTP/3 camouflage, UDP/443 |
 | Subscription | Static nginx-light HTTPS service, TCP/8443 |
 | Firewall | Native nftables with a five-minute rollback timer |
 | SSH | Dedicated administrator, then optional key-only lockdown |

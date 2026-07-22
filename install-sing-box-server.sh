@@ -26,7 +26,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly SCRIPT_VERSION="1.0.1"
+readonly SCRIPT_VERSION="1.0.2"
 readonly PROJECT_NAME="vpn-setup"
 readonly SAGERNET_KEY_URL="https://sing-box.app/gpg.key"
 readonly SAGERNET_KEY_FILE="/etc/apt/keyrings/sagernet.asc"
@@ -271,7 +271,7 @@ Install options (missing values are requested interactively):
   --ssh-port PORT          Existing SSH port (default: 22).
   --reality-target DOMAIN  REALITY handshake target (required; no universal default).
   --fingerprint VALUE      Initial client TLS fingerprint (default: chrome).
-  --emoji EMOJI            Server/country emoji used in generated profile names.
+  --emoji EMOJI            Server/country emoji for non-interactive installs.
   --yes                    Confirm a mutating operation non-interactively.
   --automatic              Internal use by the firewall rollback timer.
   -h, --help               Show this help.
@@ -507,6 +507,38 @@ EOF
   printf -v "$variable" '%s' "$selected"
 }
 
+select_country_emoji() {
+  local variable="$1" answer selected
+  [[ -t 0 ]] || die 'A country emoji is required in non-interactive mode.'
+  cat <<'EOF'
+Select the VPS location used in generated profile names:
+  1) 🇩🇪 Germany
+  2) 🇳🇱 Netherlands
+  3) 🇫🇮 Finland
+  4) 🇸🇪 Sweden
+  5) 🇱🇻 Latvia
+  6) 🇱🇹 Lithuania
+  7) 🇫🇷 France
+  8) 🇺🇸 United States
+  9) 🌐 Other / neutral
+EOF
+  read -r -p 'Location [9]: ' answer
+  answer="${answer:-9}"
+  case "$answer" in
+    1) selected="🇩🇪" ;;
+    2) selected="🇳🇱" ;;
+    3) selected="🇫🇮" ;;
+    4) selected="🇸🇪" ;;
+    5) selected="🇱🇻" ;;
+    6) selected="🇱🇹" ;;
+    7) selected="🇫🇷" ;;
+    8) selected="🇺🇸" ;;
+    9) selected="🌐" ;;
+    *) die 'Choose a location number from 1 to 9.' ;;
+  esac
+  printf -v "$variable" '%s' "$selected"
+}
+
 validate_public_key_text() {
   [[ "$1" != *$'\n'* && "$1" != *$'\r'* ]] || die 'The public key must be exactly one line.'
   [[ "$1" == ssh-ed25519\ * || "$1" == sk-ssh-ed25519@openssh.com\ * ]] || \
@@ -545,7 +577,13 @@ collect_install_settings() {
       'The installer checks TLS properties, not resistance to a specific censor.'
   fi
   prompt_value REALITY_TARGET 'REALITY target (explicit choice required)'
-  prompt_value COUNTRY_EMOJI 'Country/server emoji' '🌐'
+  if [[ -z "$COUNTRY_EMOJI" ]]; then
+    if [[ -t 0 ]]; then
+      select_country_emoji COUNTRY_EMOJI
+    else
+      COUNTRY_EMOJI="🌐"
+    fi
+  fi
   if [[ -z "$CLIENT_FINGERPRINT" ]]; then
     if [[ -t 0 ]]; then
       select_client_fingerprint CLIENT_FINGERPRINT
@@ -731,7 +769,7 @@ Target:
   Server IPv4:          ${plan_ip}
   Server core:          latest stable sing-box from its signed official APT repository
   Primary inbound:      VLESS + REALITY + Vision, TCP/443
-  Reserve inbound:      Hysteria2 + TLS + Salamander, UDP/443
+  Reserve inbound:      Hysteria2 + TLS (native HTTP/3 camouflage), UDP/443
   TLS hostname:         ${plan_domain}
   REALITY target:       ${plan_target}
   Client fingerprint:   ${plan_fingerprint} (selectable; stored in subscriptions)
@@ -805,8 +843,8 @@ Files changed only by lockdown-ssh:
 
 Secret handling:
   Each client receives an independent VLESS UUID, Hysteria2 password, and
-  256-bit subscription bearer token. Shared REALITY and Hysteria2 obfuscation
-  secrets are generated locally on the VPS. Private material is shown only by
+  256-bit subscription bearer token. Shared REALITY credentials are generated
+  locally on the VPS. Private material is shown only by
   an explicit "sudo vpn show NAME" command. nginx cannot list directories or
   write subscription files, and access logging is disabled.
 
@@ -1009,7 +1047,18 @@ EOF
 }
 
 sing_box_candidate_version() {
-  apt-cache policy sing-box | awk '/Candidate:/ {print $2; exit}'
+  # Consume the complete apt-cache stream. With pipefail enabled, exiting awk
+  # after the first match can send SIGPIPE to apt-cache and turn a successful
+  # lookup into exit status 141 on hosts with a sufficiently large policy list.
+  apt-cache policy sing-box | awk '
+    /^[[:space:]]*Candidate:/ && !found {
+      candidate=$2
+      found=1
+    }
+    END {
+      if (found) print candidate
+    }
+  '
 }
 
 download_sing_box_package() {
@@ -1511,8 +1560,6 @@ generate_or_load_server_secrets() {
     REALITY_PRIVATE_KEY="$(awk -F': *' 'tolower($1) ~ /private/ {print $2; exit}' <<<"$keypair")"
     REALITY_PUBLIC_KEY="$(awk -F': *' 'tolower($1) ~ /public/ {print $2; exit}' <<<"$keypair")"
     REALITY_SHORT_ID="$(openssl rand -hex 4)"
-    HY2_OBFS_PASSWORD="$(openssl rand -hex 24)"
-
     [[ -n "$REALITY_PRIVATE_KEY" && -n "$REALITY_PUBLIC_KEY" ]] || die 'Credential generation failed.'
     [[ "$REALITY_SHORT_ID" =~ ^[0-9a-f]{8}$ ]] || die 'Invalid generated REALITY short ID.'
 
@@ -1520,7 +1567,6 @@ generate_or_load_server_secrets() {
       printf 'REALITY_PRIVATE_KEY=%q\n' "$REALITY_PRIVATE_KEY"
       printf 'REALITY_PUBLIC_KEY=%q\n' "$REALITY_PUBLIC_KEY"
       printf 'REALITY_SHORT_ID=%q\n' "$REALITY_SHORT_ID"
-      printf 'HY2_OBFS_PASSWORD=%q\n' "$HY2_OBFS_PASSWORD"
     } >"${SECRETS_FILE}.new"
     chmod 0600 "${SECRETS_FILE}.new"
     mv -f -- "${SECRETS_FILE}.new" "$SECRETS_FILE"
@@ -1531,7 +1577,6 @@ generate_or_load_server_secrets() {
   : "${REALITY_PRIVATE_KEY:?missing REALITY private key}"
   : "${REALITY_PUBLIC_KEY:?missing REALITY public key}"
   : "${REALITY_SHORT_ID:?missing REALITY short ID}"
-  : "${HY2_OBFS_PASSWORD:?missing Hysteria2 obfuscation password}"
 }
 
 initialize_client_database() {
@@ -1635,10 +1680,6 @@ build_sing_box_config() {
       "tag": "hysteria2-in",
       "listen": "0.0.0.0",
       "listen_port": 443,
-      "obfs": {
-        "type": "salamander",
-        "password": "${HY2_OBFS_PASSWORD}"
-      },
       "users": ${hy2_users_json},
       "tls": {
         "enabled": true,
@@ -1867,7 +1908,7 @@ build_client_uris() {
   reality_label="$(jq -rn --arg value "${COUNTRY_EMOJI} Reality" '$value | @uri')"
   hy2_label="$(jq -rn --arg value "${COUNTRY_EMOJI} Hysteria2" '$value | @uri')"
   VLESS_URI="vless://${uuid}@${SERVER_IPV4}:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_TARGET}&fp=${CLIENT_FINGERPRINT}&pbk=${REALITY_PUBLIC_KEY}&sid=${REALITY_SHORT_ID}&type=tcp#${reality_label}"
-  HY2_URI="hysteria2://${hy2}@${TLS_DOMAIN}:443/?sni=${TLS_DOMAIN}&obfs=salamander&obfs-password=${HY2_OBFS_PASSWORD}#${hy2_label}"
+  HY2_URI="hysteria2://${hy2}@${TLS_DOMAIN}:443/?sni=${TLS_DOMAIN}#${hy2_label}"
 }
 
 render_client_subscription_files() {
@@ -1896,7 +1937,6 @@ render_client_subscription_files() {
     --arg short_id "$REALITY_SHORT_ID" \
     --arg tls_domain "$TLS_DOMAIN" \
     --arg hy2_password "$(jq -r '.hy2_password' <<<"$client")" \
-    --arg hy2_obfs_password "$HY2_OBFS_PASSWORD" \
     '{
       "mixed-port": 7890,
       "allow-lan": false,
@@ -1913,6 +1953,7 @@ render_client_subscription_files() {
           network: "tcp",
           tls: true,
           udp: true,
+          "packet-encoding": "xudp",
           flow: "xtls-rprx-vision",
           servername: $target,
           "client-fingerprint": $fingerprint,
@@ -1928,9 +1969,7 @@ render_client_subscription_files() {
           port: 443,
           password: $hy2_password,
           sni: $tls_domain,
-          "skip-cert-verify": false,
-          obfs: "salamander",
-          "obfs-password": $hy2_obfs_password
+          "skip-cert-verify": false
         }
       ],
       "proxy-groups": [
@@ -2000,6 +2039,7 @@ render_nginx_subscription_site() {
 map \$http_user_agent \$vpn_subscription_format {
     default links;
     ~*(clash|mihomo|flclash|clash-verge|clashverge|stash) mihomo;
+    ~*(sing-box|singbox|hiddify|happ|nekobox|xray|v2ray|v2rayn|v2rayng|shadowrocket) links;
 }
 
 server {
@@ -2804,7 +2844,7 @@ diagnostic_report() {
 
   printf '### Client profiles\n'
   printf 'REALITY fingerprint: %s\n' "$CLIENT_FINGERPRINT"
-  printf 'Hysteria2 obfuscation: salamander\n'
+  printf 'Hysteria2 obfuscation: disabled (native HTTP/3 camouflage)\n'
   printf 'Subscription URLs: stable across target/fingerprint changes\n\n'
 
   printf '### System\n'
