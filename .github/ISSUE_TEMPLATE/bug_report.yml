@@ -1,0 +1,67 @@
+name: Bug report
+description: Report a reproducible installer, upgrade, or management problem.
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not paste subscription URLs, UUIDs, passwords, private keys, certificates, or unredacted installation logs.
+
+  - type: input
+    id: version
+    attributes:
+      label: Installer version
+      description: Run `sudo vpn status` and copy only the version line.
+      placeholder: 1.0.5
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Debian 13
+        - Ubuntu 24.04 LTS
+        - Ubuntu 26.04 LTS
+        - Other / unsupported
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What happened, and what did you expect instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Include the exact command, but remove all credentials.
+      placeholder: |
+        1. Run ...
+        2. Select ...
+        3. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Share-safe diagnostics
+      description: Paste the output of `sudo vpn diagnostic` after reviewing it once more for private data.
+      render: shell
+
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety check
+      options:
+        - label: I removed subscription URLs, credentials, private keys, certificates, and personal data.
+          required: true
+        - label: I tested the latest released installer version.
+          required: true

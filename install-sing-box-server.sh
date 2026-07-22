@@ -2787,6 +2787,9 @@ stop_pending_firewall_rollback() {
   rm -f -- "$FIREWALL_UNIT_STATE"
 }
 
+# The optional state path is an intentional test seam. Production callers use
+# FIREWALL_UNIT_STATE, while the smoke test exercises cancellation in /tmp.
+# shellcheck disable=SC2120
 cancel_pending_firewall_rollback_strict() {
   local state_file="${1:-$FIREWALL_UNIT_STATE}"
   local unit_base timer_state service_state
@@ -2916,6 +2919,7 @@ confirm_firewall() {
   systemctl enable --now nftables.service >/dev/null
   systemctl is-active --quiet nftables.service || \
     die 'nftables persistence service did not become active; firewall confirmation was not recorded.'
+  # shellcheck disable=SC2119
   cancel_pending_firewall_rollback_strict || \
     die 'Could not prove that the automatic rollback timer was cancelled; firewall confirmation was not recorded.'
   # Re-check the live rules after cancelling the timer so a timer firing at the
@@ -3020,7 +3024,9 @@ remove_auto_finalization() {
   if ! systemctl reload ssh.service; then
     if (( restore_required == 1 )); then
       mv -- "$AUTO_FINALIZE_REMOVAL_STAGE" "$AUTO_FINALIZE_SSH_DROPIN"
-      /usr/sbin/sshd -t >/dev/null 2>&1 && systemctl reload ssh.service >/dev/null 2>&1 || true
+      if /usr/sbin/sshd -t >/dev/null 2>&1; then
+        systemctl reload ssh.service >/dev/null 2>&1 || true
+      fi
     fi
     die 'SSH reload failed while removing automatic first-login finalization.'
   fi
@@ -3080,7 +3086,9 @@ configure_auto_finalization() {
   fi
   if ! systemctl reload ssh.service; then
     rm -f -- "$AUTO_FINALIZE_SSH_DROPIN" "$AUTO_FINALIZE_WRAPPER"
-    /usr/sbin/sshd -t >/dev/null 2>&1 && systemctl reload ssh.service >/dev/null 2>&1 || true
+    if /usr/sbin/sshd -t >/dev/null 2>&1; then
+      systemctl reload ssh.service >/dev/null 2>&1 || true
+    fi
     die 'SSH could not load the temporary automatic-finalization rule; it was removed.'
   fi
   log 'Armed one-time automatic security finalization for the first administrator SSH login.'
