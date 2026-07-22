@@ -1,8 +1,8 @@
 # Subscription design
 
-Subscription delivery is included in the 1.0.0 release candidate. This document
-describes its security boundary and the compatibility model that must be tested
-on a fresh VPS before the public release is tagged.
+Subscription delivery is included in the public release. This document
+describes its security boundary and the compatibility model used by the
+installer.
 
 ## Goal
 
@@ -92,6 +92,7 @@ vpn list              List clients without printing secrets
 vpn set-target DOMAIN Validate and transactionally change the REALITY target
 vpn set-fingerprint   Interactively select and transactionally publish a fingerprint
 vpn set-fingerprint VALUE  Use an explicit supported fingerprint
+vpn set-obfs MODE     Transactionally switch Hysteria2 between off and salamander
 ```
 
 `set-target` stages the settings, sing-box configuration, and all
@@ -111,6 +112,15 @@ The cross-format compatibility set is `chrome`, `firefox`, `safari`, `ios`,
 `android`, `edge`, `360`, `qq`, and `random`. `randomized` is excluded because
 current Mihomo documentation does not list it, even though Xray and sing-box do.
 The installer does not rotate fingerprints automatically.
+
+`set-obfs` is a global Hysteria2 cutover. It stages settings, the sing-box
+server configuration, and all subscription representations; validates the
+candidate server configuration; atomically publishes the files; restarts
+sing-box; and rolls everything back if the service or subscription self-test
+fails. Supported modes are only `off` and `salamander`. Stable sing-box and
+Mihomo support both; experimental Gecko is deliberately outside the v1.0
+compatibility boundary. Existing subscription URLs remain valid, but clients
+must update them before using Hysteria2 after a switch.
 
 Client deletion removes both credentials and the corresponding subscription
 files. Client creation generates a new token. Certificate renewal tests the

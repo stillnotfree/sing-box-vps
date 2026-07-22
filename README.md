@@ -30,7 +30,7 @@ a CDN or DNS proxy because Certbot uses the HTTP-01 standalone challenge.
 Connect to the VPS as `root`, then run:
 
 ```bash
-wget -qO vpn-install.sh https://raw.githubusercontent.com/stillnotfree/sing-box-vps/v1.0.2/install-sing-box-server.sh && chmod 700 vpn-install.sh && ./vpn-install.sh install
+wget -qO vpn-install.sh https://raw.githubusercontent.com/stillnotfree/sing-box-vps/v1.0.3/install-sing-box-server.sh && chmod 700 vpn-install.sh && ./vpn-install.sh install
 ```
 
 The installer asks for:
@@ -59,10 +59,12 @@ ssh ADMIN_USER@SERVER_IP
 ```
 
 That verified key login automatically confirms the managed firewall, enables
-key-only SSH, and removes the one-time login hook. No post-install command is
-required. If the safety window expired first, the login reapplies the firewall
-with a new rollback timer and asks for one more SSH login. Keep the earlier
-session open until finalization reports success.
+key-only SSH, and removes the one-time SSH hook. The hook is run directly by
+`sshd`, so it does not depend on Bash profile loading; an existing user SSH rc
+file is preserved and restored. No post-install command is required. If the
+safety window expired first, the login reapplies the firewall with a new
+rollback timer and asks for one more SSH login. Keep the earlier session open
+until finalization reports success.
 
 If an interrupted installation saved an ACME address that Let's Encrypt rejects,
 resume it with a real address instead of reinstalling the VPS:
@@ -155,6 +157,18 @@ Selects a client fingerprint interactively or directly. Supported values are
 `chrome`, `firefox`, `safari`, `ios`, `android`, `edge`, `360`, `qq`, and
 `random`. Subscription URLs remain unchanged; refresh them on each device.
 
+```bash
+sudo vpn set-obfs off
+sudo vpn set-obfs salamander
+```
+
+Switches Hysteria2 globally between its native QUIC/HTTP/3 appearance (`off`,
+the default) and Salamander UDP obfuscation. The server configuration and every
+subscription format are changed transactionally and restored on failure.
+Subscription URLs stay unchanged, but every Hysteria2 client must refresh after
+the switch. Use Salamander only when tests on the affected network show that
+native Hysteria2 is filtered or throttled.
+
 ### Updates and recovery
 
 The following finalization commands are recovery tools; a normal fresh install
@@ -217,7 +231,7 @@ client policy and are not coupled to third-party rule providers. See
 [docs/SUBSCRIPTIONS.md](docs/SUBSCRIPTIONS.md) for the format and threat model.
 
 The installation domain is also the HTTPS subscription hostname and Hysteria2
-TLS identity. Release 1.0.0 does not automate domain migration because clients
+TLS identity. The installer does not automate domain migration because clients
 cannot portably replace their own saved subscription URL.
 
 ## System updates
@@ -241,7 +255,7 @@ updates remain enabled without automatic reboot.
 | --- | --- |
 | Core | One stable sing-box package from the signed SagerNet repository |
 | Primary | VLESS + REALITY + Vision, TCP/443 |
-| Reserve | Hysteria2 + TLS with native HTTP/3 camouflage, UDP/443 |
+| Reserve | Hysteria2 + TLS on UDP/443; native QUIC by default, optional Salamander |
 | Subscription | Static nginx-light HTTPS service, TCP/8443 |
 | Firewall | Native nftables with a five-minute rollback timer |
 | SSH | Dedicated administrator, then optional key-only lockdown |

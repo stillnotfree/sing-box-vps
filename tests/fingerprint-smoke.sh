@@ -9,12 +9,24 @@ repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck disable=SC1091
 source "${repo_root}/install-sing-box-server.sh"
 
+[[ "$SCRIPT_VERSION" == "1.0.3" ]]
 (( ${#SUPPORTED_CLIENT_FINGERPRINTS[@]} == 9 ))
+(( ${#SUPPORTED_HY2_OBFS_MODES[@]} == 2 ))
 
 parse_args set-fingerprint firefox --yes
 [[ "$COMMAND" == "set-fingerprint" ]]
 [[ "$NEW_CLIENT_FINGERPRINT" == "firefox" ]]
 (( ASSUME_YES == 1 ))
+
+(
+  COMMAND="plan"
+  NEW_HY2_OBFS_MODE=""
+  ASSUME_YES=0
+  parse_args set-obfs salamander --yes
+  [[ "$COMMAND" == "set-obfs" ]]
+  [[ "$NEW_HY2_OBFS_MODE" == "salamander" ]]
+  (( ASSUME_YES == 1 ))
+)
 
 (
   COMMAND="plan"
@@ -28,6 +40,15 @@ for fingerprint in chrome firefox safari ios android edge 360 qq random; do
   client_fingerprint_is_supported "$fingerprint"
   validate_client_fingerprint "$fingerprint"
 done
+
+for mode in off salamander; do
+  hy2_obfs_mode_is_supported "$mode"
+  validate_hy2_obfs_mode "$mode"
+done
+if (validate_hy2_obfs_mode gecko >/dev/null 2>&1); then
+  printf 'gecko unexpectedly passed the stable cross-client compatibility set\n' >&2
+  exit 1
+fi
 
 if (validate_client_fingerprint randomized >/dev/null 2>&1); then
   printf 'randomized unexpectedly passed the cross-client compatibility set\n' >&2
@@ -43,6 +64,7 @@ SSH_PORT="22"
 REALITY_TARGET="www.example.com"
 COUNTRY_EMOJI="🇩🇪"
 CLIENT_FINGERPRINT="random"
+HY2_OBFS_MODE="salamander"
 
 work="$(mktemp -d)"
 trap 'rm -rf -- "$work"' EXIT
@@ -50,6 +72,7 @@ render_settings "${work}/settings.json"
 jq -e '
   .schema_version == 1 and
   .client_fingerprint == "random" and
+  .hy2_obfs_mode == "salamander" and
   .reality_target == "www.example.com"
 ' "${work}/settings.json" >/dev/null
 
@@ -78,6 +101,7 @@ done
   REALITY_TARGET=""
   COUNTRY_EMOJI=""
   CLIENT_FINGERPRINT=""
+  HY2_OBFS_MODE=""
   load_settings() {
     ADMIN_USER="vpnadmin"
     ADMIN_PUBLIC_KEY="ssh-ed25519 test"
@@ -88,6 +112,7 @@ done
     REALITY_TARGET="www.example.com"
     COUNTRY_EMOJI="🇩🇪"
     CLIENT_FINGERPRINT="chrome"
+    HY2_OBFS_MODE="off"
   }
   load_resume_settings
   [[ "$ACME_EMAIL" == "admin@vpn-mail.net" ]]
@@ -95,7 +120,38 @@ done
 
 render_first_login_hook "${work}/first-login.sh"
 sh -n "${work}/first-login.sh"
-grep -Fq "[ \"\${USER:-}\" = \"vpnadmin\" ]" "${work}/first-login.sh"
+grep -Fq '[ -n "${SSH_CONNECTION:-}" ]' "${work}/first-login.sh"
+grep -Fq '[ -n "${SSH_TTY:-}" ]' "${work}/first-login.sh"
 grep -Fq 'vpn" finalize --yes' "${work}/first-login.sh"
+grep -Fq '. "/home/vpnadmin/.ssh/rc.vpn-setup-original"' "${work}/first-login.sh"
+
+# Firewall confirmation must verify transient unit state instead of trusting a
+# combined `systemctl stop timer service` exit code.  The service is commonly
+# not loaded before the timer fires on both Debian and Ubuntu.
+cancel_body="$(declare -f cancel_pending_firewall_rollback_strict)"
+grep -Fq 'systemctl show --property=ActiveState --value' <<<"$cancel_body"
+if grep -Fq 'systemctl stop "${unit_base}.timer" "${unit_base}.service"' <<<"$cancel_body"; then
+  printf 'Firewall rollback cancellation still couples timer success to an absent transient service.\n' >&2
+  exit 1
+fi
+
+(
+  state_file="${work}/firewall.rollback.unit"
+  printf '%s\n' 'vpn-nft-rollback-123-456' >"$state_file"
+  systemctl() {
+    case "$1" in
+      show) printf '%s\n' inactive ;;
+      stop|reset-failed) return 0 ;;
+      is-active) return 3 ;;
+      *) return 1 ;;
+    esac
+  }
+  cancel_pending_firewall_rollback_strict "$state_file"
+  [[ ! -e "$state_file" ]]
+)
+
+upgrade_body="$(declare -f upgrade_existing_installation)"
+grep -Fq 'reconcile_managed_runtime' <<<"$upgrade_body"
+grep -Fq 'write_runtime_version_marker' <<<"$upgrade_body"
 
 printf 'Fingerprint state smoke test: PASS\n'

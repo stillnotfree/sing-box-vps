@@ -14,6 +14,7 @@
 #   sudo vpn show WorkPC
 #   sudo vpn set-target example.com
 #   sudo vpn set-fingerprint
+#   sudo vpn set-obfs off|salamander
 #   sudo vpn update
 #   sudo vpn self-update /path/to/new/install-sing-box-server.sh
 #   sudo vpn diagnostic
@@ -26,7 +27,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly SCRIPT_VERSION="1.0.2"
+readonly SCRIPT_VERSION="1.0.3"
 readonly PROJECT_NAME="vpn-setup"
 readonly SAGERNET_KEY_URL="https://sing-box.app/gpg.key"
 readonly SAGERNET_KEY_FILE="/etc/apt/keyrings/sagernet.asc"
@@ -39,15 +40,18 @@ readonly CLIENTS_FILE="${STATE_DIR}/clients.json"
 readonly CLIENT_LOCK_FILE="${STATE_DIR}/clients.lock"
 readonly SETTINGS_FILE="${STATE_DIR}/settings.json"
 readonly INSTALL_COMPLETE_FILE="${STATE_DIR}/install.complete"
+readonly RUNTIME_VERSION_FILE="${STATE_DIR}/runtime.version"
 readonly INSTALL_LOCK_FILE="${STATE_DIR}/install.lock"
 readonly FIREWALL_LOCK_FILE="${STATE_DIR}/firewall.lock"
 readonly PACKAGE_CACHE_DIR="${STATE_DIR}/packages"
 readonly INSTALLER_BACKUP_DIR="${STATE_DIR}/installer-backups"
 readonly INITIAL_CLIENT_NAME="default"
 readonly DEFAULT_CLIENT_FINGERPRINT="chrome"
+readonly DEFAULT_HY2_OBFS_MODE="off"
 readonly -a SUPPORTED_CLIENT_FINGERPRINTS=(
   chrome firefox safari ios android edge 360 qq random
 )
+readonly -a SUPPORTED_HY2_OBFS_MODES=(off salamander)
 readonly SUBSCRIPTION_PORT="8443"
 readonly SUBSCRIPTION_ROOT="/var/www/vpn-subscriptions"
 readonly NGINX_SITE="/etc/nginx/sites-available/vpn-subscription"
@@ -63,7 +67,9 @@ readonly JOURNAL_DROPIN="${JOURNAL_DROPIN_DIR}/90-vpn-limits.conf"
 readonly UDP_SYSCTL_FILE="/etc/sysctl.d/90-vpn-udp-buffers.conf"
 readonly NFT_CONFIG="/etc/nftables.conf"
 readonly SSH_DROPIN="/etc/ssh/sshd_config.d/00-vpn-hardening.conf"
-readonly FIRST_LOGIN_HOOK="/etc/profile.d/90-vpn-first-login.sh"
+readonly LEGACY_FIRST_LOGIN_HOOK="/etc/profile.d/90-vpn-first-login.sh"
+readonly FIRST_LOGIN_SSH_RC_NAME="rc"
+readonly FIRST_LOGIN_SSH_RC_ORIGINAL_NAME="rc.vpn-setup-original"
 readonly INSTALLED_HELPER="/usr/local/sbin/vpn"
 readonly CERT_HOOK="/etc/letsencrypt/renewal-hooks/deploy/50-vpn-sing-box"
 readonly FIREWALL_UNIT_STATE="${STATE_DIR}/firewall.rollback.unit"
@@ -78,6 +84,7 @@ REALITY_TARGET=""
 COUNTRY_EMOJI=""
 ACME_EMAIL=""
 CLIENT_FINGERPRINT=""
+HY2_OBFS_MODE=""
 ASSUME_YES=0
 AUTOMATIC=0
 COMMAND="plan"
@@ -85,6 +92,7 @@ TMP_DIR=""
 CLIENT_NAME=""
 NEW_REALITY_TARGET=""
 NEW_CLIENT_FINGERPRINT=""
+NEW_HY2_OBFS_MODE=""
 SELF_UPDATE_SOURCE=""
 OS_ID=""
 OS_VERSION=""
@@ -254,6 +262,7 @@ Usage:
   sudo vpn list
   sudo vpn set-target DOMAIN
   sudo vpn set-fingerprint [VALUE]
+  sudo vpn set-obfs [off|salamander]
   sudo vpn update
   sudo vpn self-update /path/to/new/install-sing-box-server.sh
   sudo vpn diagnostic
@@ -299,6 +308,15 @@ parse_args() {
         COMMAND="set-fingerprint"
         if (( $# >= 2 )) && [[ "$2" != -* ]]; then
           NEW_CLIENT_FINGERPRINT="$2"
+          shift 2
+        else
+          shift
+        fi
+        ;;
+      set-obfs)
+        COMMAND="set-obfs"
+        if (( $# >= 2 )) && [[ "$2" != -* ]]; then
+          NEW_HY2_OBFS_MODE="$2"
           shift 2
         else
           shift
@@ -471,6 +489,41 @@ validate_client_fingerprint() {
     "Unsupported client fingerprint: $1 (supported: chrome, firefox, safari, ios, android, edge, 360, qq, random)."
 }
 
+hy2_obfs_mode_is_supported() {
+  local value="$1" item
+  for item in "${SUPPORTED_HY2_OBFS_MODES[@]}"; do
+    [[ "$value" == "$item" ]] && return 0
+  done
+  return 1
+}
+
+validate_hy2_obfs_mode() {
+  hy2_obfs_mode_is_supported "$1" || die \
+    "Unsupported Hysteria2 obfuscation mode: $1 (supported: off, salamander)."
+}
+
+select_hy2_obfs_mode() {
+  local variable="$1" answer selected
+  [[ -t 0 ]] || die 'An obfuscation mode is required in non-interactive mode.'
+  cat <<'EOF'
+Select the Hysteria2 obfuscation mode:
+  1) off         — native QUIC/HTTP/3 appearance (default)
+  2) salamander  — password-based UDP obfuscation for networks that filter QUIC
+
+This is a global server setting. Every Hysteria2 client must refresh its
+subscription after a change. Use Salamander only when testing shows that native
+Hysteria2 is filtered or throttled on the affected network.
+EOF
+  read -r -p 'Hysteria2 obfuscation [1]: ' answer
+  answer="${answer:-1}"
+  case "$answer" in
+    1|off) selected="off" ;;
+    2|salamander) selected="salamander" ;;
+    *) die 'Choose 1/off or 2/salamander.' ;;
+  esac
+  printf -v "$variable" '%s' "$selected"
+}
+
 select_client_fingerprint() {
   local variable="$1" answer selected
   [[ -t 0 ]] || die 'A fingerprint value is required in non-interactive mode.'
@@ -573,7 +626,7 @@ collect_install_settings() {
   if [[ -z "$REALITY_TARGET" ]]; then
     printf '%s\n' \
       'No REALITY target is universally safe. Prefer a TLS 1.3 / HTTP/2 hostname' \
-      'reachable from this VPS and, where practical, hosted by the same network/ASN.' \
+      'reachable from this VPS and, where practical, topologically close to it.' \
       'The installer checks TLS properties, not resistance to a specific censor.'
   fi
   prompt_value REALITY_TARGET 'REALITY target (explicit choice required)'
@@ -592,6 +645,7 @@ collect_install_settings() {
     fi
   fi
   CLIENT_FINGERPRINT="${CLIENT_FINGERPRINT,,}"
+  HY2_OBFS_MODE="${HY2_OBFS_MODE:-$DEFAULT_HY2_OBFS_MODE}"
 
   validate_admin_user "$ADMIN_USER"
   validate_public_key_text "$ADMIN_PUBLIC_KEY"
@@ -602,11 +656,13 @@ collect_install_settings() {
   validate_domain "$REALITY_TARGET"
   validate_emoji "$COUNTRY_EMOJI"
   validate_client_fingerprint "$CLIENT_FINGERPRINT"
+  validate_hy2_obfs_mode "$HY2_OBFS_MODE"
 }
 
 render_settings() {
   local candidate="$1"
   validate_client_fingerprint "$CLIENT_FINGERPRINT"
+  validate_hy2_obfs_mode "$HY2_OBFS_MODE"
   jq -n \
     --arg admin_user "$ADMIN_USER" \
     --arg admin_public_key "$ADMIN_PUBLIC_KEY" \
@@ -617,10 +673,12 @@ render_settings() {
     --arg reality_target "$REALITY_TARGET" \
     --arg country_emoji "$COUNTRY_EMOJI" \
     --arg client_fingerprint "$CLIENT_FINGERPRINT" \
+    --arg hy2_obfs_mode "$HY2_OBFS_MODE" \
     '{schema_version: 1, admin_user: $admin_user, admin_public_key: $admin_public_key,
       server_ipv4: $server_ipv4, tls_domain: $tls_domain, acme_email: $acme_email,
       ssh_port: $ssh_port, reality_target: $reality_target,
-      country_emoji: $country_emoji, client_fingerprint: $client_fingerprint}' >"$candidate"
+      country_emoji: $country_emoji, client_fingerprint: $client_fingerprint,
+      hy2_obfs_mode: $hy2_obfs_mode}' >"$candidate"
 }
 
 save_settings() {
@@ -647,6 +705,8 @@ load_settings() {
   COUNTRY_EMOJI="$(jq -r '.country_emoji' "$SETTINGS_FILE")"
   CLIENT_FINGERPRINT="$(jq -r --arg default "$DEFAULT_CLIENT_FINGERPRINT" \
     '.client_fingerprint // $default' "$SETTINGS_FILE")"
+  HY2_OBFS_MODE="$(jq -r --arg default "$DEFAULT_HY2_OBFS_MODE" \
+    '.hy2_obfs_mode // $default' "$SETTINGS_FILE")"
 
   validate_admin_user "$ADMIN_USER"
   validate_public_key_text "$ADMIN_PUBLIC_KEY"
@@ -659,6 +719,7 @@ load_settings() {
   validate_domain "$REALITY_TARGET"
   validate_emoji "$COUNTRY_EMOJI"
   validate_client_fingerprint "$CLIENT_FINGERPRINT"
+  validate_hy2_obfs_mode "$HY2_OBFS_MODE"
 }
 
 load_resume_settings() {
@@ -755,6 +816,7 @@ show_plan() {
   local plan_target="${REALITY_TARGET:-<explicit choice required>}"
   local plan_emoji="${COUNTRY_EMOJI:-<interactive>}"
   local plan_fingerprint="${CLIENT_FINGERPRINT:-$DEFAULT_CLIENT_FINGERPRINT}"
+  local plan_hy2_obfs="${HY2_OBFS_MODE:-$DEFAULT_HY2_OBFS_MODE}"
   local plan_ssh_port="${SSH_PORT:-22}"
   cat <<EOF
 VPN installer ${SCRIPT_VERSION} — reviewed plan (no changes performed)
@@ -769,7 +831,8 @@ Target:
   Server IPv4:          ${plan_ip}
   Server core:          latest stable sing-box from its signed official APT repository
   Primary inbound:      VLESS + REALITY + Vision, TCP/443
-  Reserve inbound:      Hysteria2 + TLS (native HTTP/3 camouflage), UDP/443
+  Reserve inbound:      Hysteria2 + TLS, UDP/443
+  Hysteria2 obfs:       ${plan_hy2_obfs} (off keeps the native QUIC/HTTP/3 appearance)
   TLS hostname:         ${plan_domain}
   REALITY target:       ${plan_target}
   Client fingerprint:   ${plan_fingerprint} (selectable; stored in subscriptions)
@@ -784,6 +847,7 @@ Target:
   Client management:    sudo vpn add/show/delete/list
   REALITY target change: sudo vpn set-target DOMAIN (transactional)
   Fingerprint change:   sudo vpn set-fingerprint [VALUE] (transactional)
+  Hysteria2 obfs:       sudo vpn set-obfs [off|salamander] (transactional)
   Core update:          sudo vpn update (validated with package rollback)
   Installer update:     local verified file; atomic replacement with previous-version backup
   Diagnostics:          sudo vpn diagnostic (health summary plus redacted details)
@@ -833,10 +897,13 @@ Files changed by install:
   /etc/fstab and /swapfile (only if swap is absent)
   /home/${plan_admin}/.ssh/authorized_keys
   /etc/sudoers.d/90-${plan_admin}
-  ${FIRST_LOGIN_HOOK} (removed after successful one-time finalization)
+  /home/${plan_admin}/.ssh/${FIRST_LOGIN_SSH_RC_NAME} (one-time finalization hook;
+    any existing file is restored after successful finalization)
   ${INSTALLED_HELPER}
   ${SETTINGS_FILE}
   ${CLIENTS_FILE} (root-only client database)
+  ${INSTALL_COMPLETE_FILE}
+  ${RUNTIME_VERSION_FILE}
 
 Files changed only by lockdown-ssh:
   ${SSH_DROPIN}
@@ -1560,6 +1627,7 @@ generate_or_load_server_secrets() {
     REALITY_PRIVATE_KEY="$(awk -F': *' 'tolower($1) ~ /private/ {print $2; exit}' <<<"$keypair")"
     REALITY_PUBLIC_KEY="$(awk -F': *' 'tolower($1) ~ /public/ {print $2; exit}' <<<"$keypair")"
     REALITY_SHORT_ID="$(openssl rand -hex 4)"
+    HY2_OBFS_PASSWORD="$(openssl rand -hex 24)"
     [[ -n "$REALITY_PRIVATE_KEY" && -n "$REALITY_PUBLIC_KEY" ]] || die 'Credential generation failed.'
     [[ "$REALITY_SHORT_ID" =~ ^[0-9a-f]{8}$ ]] || die 'Invalid generated REALITY short ID.'
 
@@ -1567,6 +1635,7 @@ generate_or_load_server_secrets() {
       printf 'REALITY_PRIVATE_KEY=%q\n' "$REALITY_PRIVATE_KEY"
       printf 'REALITY_PUBLIC_KEY=%q\n' "$REALITY_PUBLIC_KEY"
       printf 'REALITY_SHORT_ID=%q\n' "$REALITY_SHORT_ID"
+      printf 'HY2_OBFS_PASSWORD=%q\n' "$HY2_OBFS_PASSWORD"
     } >"${SECRETS_FILE}.new"
     chmod 0600 "${SECRETS_FILE}.new"
     mv -f -- "${SECRETS_FILE}.new" "$SECRETS_FILE"
@@ -1577,6 +1646,23 @@ generate_or_load_server_secrets() {
   : "${REALITY_PRIVATE_KEY:?missing REALITY private key}"
   : "${REALITY_PUBLIC_KEY:?missing REALITY public key}"
   : "${REALITY_SHORT_ID:?missing REALITY short ID}"
+  [[ "$REALITY_SHORT_ID" =~ ^[0-9a-f]{8}$ ]] || die 'Invalid stored REALITY short ID.'
+
+  # v1.0.2 and earlier did not have a shared Hysteria2 obfuscation secret.
+  # Generate it once during an in-place upgrade, even while obfuscation is off,
+  # so a later set-obfs transaction never has to rotate any unrelated secret.
+  if [[ -z "${HY2_OBFS_PASSWORD:-}" ]]; then
+    HY2_OBFS_PASSWORD="$(openssl rand -hex 24)"
+    {
+      printf 'REALITY_PRIVATE_KEY=%q\n' "$REALITY_PRIVATE_KEY"
+      printf 'REALITY_PUBLIC_KEY=%q\n' "$REALITY_PUBLIC_KEY"
+      printf 'REALITY_SHORT_ID=%q\n' "$REALITY_SHORT_ID"
+      printf 'HY2_OBFS_PASSWORD=%q\n' "$HY2_OBFS_PASSWORD"
+    } >"${SECRETS_FILE}.new"
+    chmod 0600 "${SECRETS_FILE}.new"
+    mv -f -- "${SECRETS_FILE}.new" "$SECRETS_FILE"
+  fi
+  [[ "$HY2_OBFS_PASSWORD" =~ ^[0-9a-f]{48}$ ]] || die 'Invalid stored Hysteria2 obfuscation secret.'
 }
 
 initialize_client_database() {
@@ -1620,9 +1706,10 @@ initialize_client_database() {
 build_sing_box_config() {
   local database="$1"
   local output="$2"
-  local vless_users_json hy2_users_json
+  local vless_users_json hy2_users_json hy2_obfs_block=""
   generate_or_load_server_secrets
   validate_client_database "$database"
+  validate_hy2_obfs_mode "$HY2_OBFS_MODE"
 
   vless_users_json="$(jq '[.clients[] | {
     name: .name,
@@ -1633,6 +1720,16 @@ build_sing_box_config() {
     name: .name,
     password: .hy2_password
   }]' "$database")"
+
+  if [[ "$HY2_OBFS_MODE" == "salamander" ]]; then
+    hy2_obfs_block="$(cat <<EOF
+      "obfs": {
+        "type": "salamander",
+        "password": "${HY2_OBFS_PASSWORD}"
+      },
+EOF
+)"
+  fi
 
   cat >"$output" <<EOF
 {
@@ -1680,6 +1777,7 @@ build_sing_box_config() {
       "tag": "hysteria2-in",
       "listen": "0.0.0.0",
       "listen_port": 443,
+${hy2_obfs_block}
       "users": ${hy2_users_json},
       "tls": {
         "enabled": true,
@@ -1862,6 +1960,52 @@ apply_client_database() {
   finish_mutation_commit
 }
 
+reconcile_managed_runtime() {
+  local candidate_config candidate_subscriptions config_backup subscriptions_backup
+  local failed=0 restore_failed=0
+
+  TMP_DIR="$(mktemp -d)"
+  candidate_config="${TMP_DIR}/config.candidate.json"
+  candidate_subscriptions="${TMP_DIR}/subscriptions.candidate"
+  config_backup="${TMP_DIR}/config.before.json"
+  subscriptions_backup="${TMP_DIR}/subscriptions.before"
+
+  build_sing_box_config "$CLIENTS_FILE" "$candidate_config"
+  render_subscription_tree "$CLIENTS_FILE" "$candidate_subscriptions"
+  install -o root -g root -m 0600 "$CONFIG_FILE" "$config_backup"
+  install -d -o root -g root -m 0700 "$subscriptions_backup"
+  cp -a -- "${SUBSCRIPTION_ROOT}/." "${subscriptions_backup}/"
+
+  install -o root -g sing-box -m 0640 "$candidate_config" "${CONFIG_FILE}.new"
+  begin_mutation_commit
+  mv -f -- "${CONFIG_FILE}.new" "$CONFIG_FILE" || failed=1
+  if (( failed == 0 )); then
+    activate_subscription_tree "$candidate_subscriptions" || failed=1
+  fi
+  if (( failed == 0 )); then
+    systemctl restart sing-box.service || failed=1
+    systemctl is-active --quiet sing-box.service || failed=1
+    sing-box check -c "$CONFIG_FILE" >/dev/null 2>&1 || failed=1
+    subscription_service_healthy || failed=1
+  fi
+
+  if (( failed == 1 )); then
+    install -o root -g sing-box -m 0640 "$config_backup" "${CONFIG_FILE}.rollback" || restore_failed=1
+    mv -f -- "${CONFIG_FILE}.rollback" "$CONFIG_FILE" || restore_failed=1
+    activate_subscription_tree "$subscriptions_backup" || restore_failed=1
+    systemctl restart sing-box.service || restore_failed=1
+    systemctl is-active --quiet sing-box.service || restore_failed=1
+    if (( restore_failed == 1 )); then
+      die "Managed runtime migration and its rollback both failed; recovery files are preserved in ${TMP_DIR}."
+    fi
+    finish_mutation_commit
+    die 'Managed runtime migration failed; the previous server configuration and subscriptions were restored.'
+  fi
+
+  finish_mutation_commit
+  log 'Managed sing-box configuration and all subscription formats were reconciled with this installer release.'
+}
+
 client_add() {
   local candidate uuid hy2 token client
   require_client_runtime
@@ -1900,15 +2044,20 @@ client_add() {
 }
 
 build_client_uris() {
-  local client="$1" uuid hy2 reality_label hy2_label
+  local client="$1" uuid hy2 reality_label hy2_label hy2_query
   generate_or_load_server_secrets
+  validate_hy2_obfs_mode "$HY2_OBFS_MODE"
   EXPORTED_CLIENT_NAME="$(jq -r '.name' <<<"$client")"
   uuid="$(jq -r '.vless_uuid' <<<"$client")"
   hy2="$(jq -r '.hy2_password' <<<"$client")"
   reality_label="$(jq -rn --arg value "${COUNTRY_EMOJI} Reality" '$value | @uri')"
   hy2_label="$(jq -rn --arg value "${COUNTRY_EMOJI} Hysteria2" '$value | @uri')"
+  hy2_query="sni=${TLS_DOMAIN}"
+  if [[ "$HY2_OBFS_MODE" == "salamander" ]]; then
+    hy2_query+="&obfs=salamander&obfs-password=${HY2_OBFS_PASSWORD}"
+  fi
   VLESS_URI="vless://${uuid}@${SERVER_IPV4}:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_TARGET}&fp=${CLIENT_FINGERPRINT}&pbk=${REALITY_PUBLIC_KEY}&sid=${REALITY_SHORT_ID}&type=tcp#${reality_label}"
-  HY2_URI="hysteria2://${hy2}@${TLS_DOMAIN}:443/?sni=${TLS_DOMAIN}#${hy2_label}"
+  HY2_URI="hysteria2://${hy2}@${TLS_DOMAIN}:443/?${hy2_query}#${hy2_label}"
 }
 
 render_client_subscription_files() {
@@ -1937,6 +2086,8 @@ render_client_subscription_files() {
     --arg short_id "$REALITY_SHORT_ID" \
     --arg tls_domain "$TLS_DOMAIN" \
     --arg hy2_password "$(jq -r '.hy2_password' <<<"$client")" \
+    --arg hy2_obfs_mode "$HY2_OBFS_MODE" \
+    --arg hy2_obfs_password "$HY2_OBFS_PASSWORD" \
     '{
       "mixed-port": 7890,
       "allow-lan": false,
@@ -1962,7 +2113,7 @@ render_client_subscription_files() {
             "short-id": $short_id
           }
         },
-        {
+        ({
           name: $hy2_name,
           type: "hysteria2",
           server: $tls_domain,
@@ -1970,7 +2121,10 @@ render_client_subscription_files() {
           password: $hy2_password,
           sni: $tls_domain,
           "skip-cert-verify": false
-        }
+        } + if $hy2_obfs_mode == "salamander" then {
+          obfs: "salamander",
+          "obfs-password": $hy2_obfs_password
+        } else {} end)
       ],
       "proxy-groups": [
         {
@@ -2124,13 +2278,25 @@ subscription_service_healthy() {
   grep -Fq 'vless://' <<<"$decoded_links" || return 1
   grep -Fq 'hysteria2://' <<<"$decoded_links" || return 1
   grep -Fq "&fp=${CLIENT_FINGERPRINT}&" <<<"$decoded_links" || return 1
+  if [[ "$HY2_OBFS_MODE" == "salamander" ]]; then
+    grep -Fq '&obfs=salamander&obfs-password=' <<<"$decoded_links" || return 1
+  elif grep -Fq '&obfs=' <<<"$decoded_links"; then
+    return 1
+  fi
   mihomo_payload="$(printf 'url = "%s"\n' "$url" | curl --noproxy '*' \
     --fail --silent --show-error --connect-timeout 10 \
     --resolve "${TLS_DOMAIN}:${SUBSCRIPTION_PORT}:${SERVER_IPV4}" \
     --user-agent 'FlClash' --config -)" || return 1
-  jq -e --arg fingerprint "$CLIENT_FINGERPRINT" \
+  jq -e --arg fingerprint "$CLIENT_FINGERPRINT" --arg hy2_obfs_mode "$HY2_OBFS_MODE" \
     '(.proxies | length == 2) and
-     (any(.proxies[]; .type == "vless" and .["client-fingerprint"] == $fingerprint))' \
+     (any(.proxies[]; .type == "vless" and .["client-fingerprint"] == $fingerprint)) and
+     (if $hy2_obfs_mode == "salamander" then
+        any(.proxies[]; .type == "hysteria2" and .obfs == "salamander" and
+          ((.["obfs-password"] // "") | length > 0))
+      else
+        all(.proxies[]; .type != "hysteria2" or
+          ((has("obfs") or has("obfs-password")) | not))
+      end)' \
     <<<"$mihomo_payload" >/dev/null || \
     return 1
 }
@@ -2378,6 +2544,99 @@ set_client_fingerprint() {
   printf 'If REALITY still fails, run "sudo vpn diagnostic" before changing other settings.\n'
 }
 
+restore_hy2_obfs_transaction() {
+  local settings_backup="$1" config_backup="$2" subscriptions_backup="$3" old_mode="$4"
+  warn 'Hysteria2 obfuscation change failed; restoring the previous server and subscriptions.'
+  HY2_OBFS_MODE="$old_mode"
+  install -o root -g root -m 0600 "$settings_backup" "${SETTINGS_FILE}.rollback"
+  install -o root -g sing-box -m 0640 "$config_backup" "${CONFIG_FILE}.rollback"
+  mv -f -- "${SETTINGS_FILE}.rollback" "$SETTINGS_FILE"
+  mv -f -- "${CONFIG_FILE}.rollback" "$CONFIG_FILE"
+  activate_subscription_tree "$subscriptions_backup" || die 'Subscription rollback failed.'
+  sing-box check -c "$CONFIG_FILE" || die 'Restored sing-box configuration validation failed.'
+  systemctl restart sing-box.service || die 'Restored sing-box service could not be restarted.'
+  systemctl is-active --quiet sing-box.service || die 'Restored sing-box service is inactive.'
+  subscription_service_healthy || die 'Restored subscriptions failed their health check.'
+}
+
+set_hy2_obfs() {
+  local old_mode candidate_settings candidate_config candidate_subscriptions old_subscriptions
+  local settings_backup config_backup failed=0
+  require_client_runtime
+
+  if [[ -z "$NEW_HY2_OBFS_MODE" ]]; then
+    select_hy2_obfs_mode NEW_HY2_OBFS_MODE
+  fi
+  NEW_HY2_OBFS_MODE="${NEW_HY2_OBFS_MODE,,}"
+  validate_hy2_obfs_mode "$NEW_HY2_OBFS_MODE"
+  old_mode="$HY2_OBFS_MODE"
+  if [[ "$NEW_HY2_OBFS_MODE" == "$old_mode" ]]; then
+    printf 'Hysteria2 obfuscation is already %s; nothing changed.\n' "$old_mode"
+    return
+  fi
+
+  printf 'Hysteria2 obfuscation change: %s -> %s\n' "$old_mode" "$NEW_HY2_OBFS_MODE"
+  printf 'The Hysteria2 service will restart and all client subscriptions will be regenerated.\n'
+  printf 'Subscription URLs will stay unchanged, but every Hysteria2 client must refresh.\n'
+  require_confirmation
+
+  acquire_operation_lock
+  load_settings
+  require_client_runtime
+  old_mode="$HY2_OBFS_MODE"
+  if [[ "$NEW_HY2_OBFS_MODE" == "$old_mode" ]]; then
+    printf 'Hysteria2 obfuscation became %s while waiting; nothing changed.\n' "$old_mode"
+    return
+  fi
+  exec 9>"$CLIENT_LOCK_FILE"
+  flock -x 9
+  TMP_DIR="$(mktemp -d)"
+  candidate_settings="${TMP_DIR}/settings.candidate.json"
+  candidate_config="${TMP_DIR}/config.candidate.json"
+  candidate_subscriptions="${TMP_DIR}/subscriptions.candidate"
+  old_subscriptions="${TMP_DIR}/subscriptions.before"
+  settings_backup="${TMP_DIR}/settings.before.json"
+  config_backup="${TMP_DIR}/config.before.json"
+
+  render_subscription_tree "$CLIENTS_FILE" "$old_subscriptions"
+  install -o root -g root -m 0600 "$SETTINGS_FILE" "$settings_backup"
+  install -o root -g root -m 0600 "$CONFIG_FILE" "$config_backup"
+
+  HY2_OBFS_MODE="$NEW_HY2_OBFS_MODE"
+  render_settings "$candidate_settings"
+  build_sing_box_config "$CLIENTS_FILE" "$candidate_config"
+  render_subscription_tree "$CLIENTS_FILE" "$candidate_subscriptions"
+
+  install -o root -g root -m 0600 "$candidate_settings" "${SETTINGS_FILE}.new"
+  install -o root -g sing-box -m 0640 "$candidate_config" "${CONFIG_FILE}.new"
+  begin_mutation_commit
+  mv -f -- "${SETTINGS_FILE}.new" "$SETTINGS_FILE" || failed=1
+  if (( failed == 0 )); then
+    mv -f -- "${CONFIG_FILE}.new" "$CONFIG_FILE" || failed=1
+  fi
+  if (( failed == 0 )); then
+    activate_subscription_tree "$candidate_subscriptions" || failed=1
+  fi
+  if (( failed == 0 )); then
+    systemctl restart sing-box.service || failed=1
+    systemctl is-active --quiet sing-box.service || failed=1
+  fi
+  if (( failed == 0 )); then
+    sing-box check -c "$CONFIG_FILE" >/dev/null 2>&1 || failed=1
+    subscription_service_healthy || failed=1
+  fi
+
+  if (( failed == 1 )); then
+    restore_hy2_obfs_transaction "$settings_backup" "$config_backup" "$old_subscriptions" "$old_mode"
+    finish_mutation_commit
+    die 'Hysteria2 obfuscation was not changed; the previous state was restored.'
+  fi
+
+  finish_mutation_commit
+  log "Hysteria2 obfuscation changed transactionally: ${old_mode} -> ${HY2_OBFS_MODE}."
+  printf 'Subscription URLs are unchanged. Refresh the subscription on each device.\n'
+}
+
 install_helper() {
   local self version timestamp backup=""
   LAST_HELPER_BACKUP=""
@@ -2523,17 +2782,38 @@ stop_pending_firewall_rollback() {
 }
 
 cancel_pending_firewall_rollback_strict() {
-  local unit_base
-  unit_base="$(cat "$FIREWALL_UNIT_STATE" 2>/dev/null || true)"
+  local state_file="${1:-$FIREWALL_UNIT_STATE}"
+  local unit_base timer_state service_state
+  unit_base="$(cat "$state_file" 2>/dev/null || true)"
   [[ -n "$unit_base" ]] || return 1
+  [[ "$unit_base" =~ ^vpn-nft-rollback-[0-9]+-[0-9]+$ ]] || return 1
 
-  systemctl stop "${unit_base}.timer" "${unit_base}.service" >/dev/null 2>&1 || return 1
-  if systemctl is-active --quiet "${unit_base}.timer" ||
-     systemctl is-active --quiet "${unit_base}.service"; then
+  # The transient service is normally not loaded until its timer fires.  Some
+  # systemd versions return a failure when asked to stop that absent service,
+  # even though stopping the timer succeeded.  Treat unit state, rather than a
+  # combined stop exit code, as the security invariant.
+  service_state="$(systemctl show --property=ActiveState --value "${unit_base}.service" 2>/dev/null || true)"
+  case "$service_state" in
+    active|activating|reloading|deactivating)
+      return 1
+      ;;
+  esac
+
+  systemctl stop "${unit_base}.timer" >/dev/null 2>&1 || true
+  timer_state="$(systemctl show --property=ActiveState --value "${unit_base}.timer" 2>/dev/null || true)"
+  service_state="$(systemctl show --property=ActiveState --value "${unit_base}.service" 2>/dev/null || true)"
+  case "$timer_state" in
+    active|activating|reloading|deactivating) return 1 ;;
+  esac
+  case "$service_state" in
+    active|activating|reloading|deactivating) return 1 ;;
+  esac
+  if systemctl is-active --quiet "${unit_base}.timer" 2>/dev/null ||
+     systemctl is-active --quiet "${unit_base}.service" 2>/dev/null; then
     return 1
   fi
   systemctl reset-failed "${unit_base}.timer" "${unit_base}.service" >/dev/null 2>&1 || true
-  rm -f -- "$FIREWALL_UNIT_STATE"
+  rm -f -- "$state_file"
 }
 
 schedule_firewall_rollback() {
@@ -2627,21 +2907,41 @@ confirm_firewall() {
   [[ -f "${STATE_DIR}/firewall.managed" ]] || die 'No pending managed firewall exists.'
   nft --check --file "$NFT_CONFIG"
   [[ -n "$(port_is_listening tcp "$SSH_PORT" || true)" ]] || die 'SSH is not listening; refusing confirmation.'
-  systemctl enable nftables.service >/dev/null
+  systemctl enable --now nftables.service >/dev/null
+  systemctl is-active --quiet nftables.service || \
+    die 'nftables persistence service did not become active; firewall confirmation was not recorded.'
   cancel_pending_firewall_rollback_strict || \
     die 'Could not prove that the automatic rollback timer was cancelled; firewall confirmation was not recorded.'
+  # Re-check the live rules after cancelling the timer so a timer firing at the
+  # boundary can never be recorded as a successful confirmation.
+  nft list chain inet vpn_filter input >/dev/null 2>&1 || \
+    die 'The managed firewall disappeared while cancelling rollback; confirmation was not recorded.'
+  [[ -n "$(port_is_listening tcp "$SSH_PORT" || true)" ]] || \
+    die 'SSH stopped listening while cancelling rollback; confirmation was not recorded.'
   printf '%s\n' "confirmed $(date --iso-8601=seconds)" >"$confirmed_candidate"
   chmod 0600 "$confirmed_candidate"
   mv -f -- "$confirmed_candidate" "${STATE_DIR}/firewall.confirmed"
   log 'Firewall persistence confirmed; automatic rollback cancelled.'
 }
 
+first_login_ssh_rc_path() {
+  printf '/home/%s/.ssh/%s\n' "$ADMIN_USER" "$FIRST_LOGIN_SSH_RC_NAME"
+}
+
+first_login_ssh_rc_original_path() {
+  printf '/home/%s/.ssh/%s\n' "$ADMIN_USER" "$FIRST_LOGIN_SSH_RC_ORIGINAL_NAME"
+}
+
 render_first_login_hook() {
   local candidate="$1"
   cat >"$candidate" <<EOF
 #!/bin/sh
-# Managed by VPN setup. Removed after one verified administrator SSH login.
-if [ "\${USER:-}" = "${ADMIN_USER}" ] && [ -n "\${SSH_CONNECTION:-}" ] && [ -x "${INSTALLED_HELPER}" ]; then
+# Managed by vpn-setup first-login finalization.
+if [ -f "$(first_login_ssh_rc_original_path)" ]; then
+  . "$(first_login_ssh_rc_original_path)"
+fi
+
+if [ -n "\${SSH_CONNECTION:-}" ] && [ -n "\${SSH_TTY:-}" ] && [ -x "${INSTALLED_HELPER}" ]; then
   printf '%s\n' 'Completing one-time VPN server security setup...'
   if ! sudo -n "${INSTALLED_HELPER}" finalize --yes; then
     printf '%s\n' 'Automatic finalization failed. Keep this SSH session open and review the error above.' >&2
@@ -2651,16 +2951,45 @@ EOF
 }
 
 configure_first_login_hook() {
-  local candidate
+  local candidate rc_path original_path admin_group
+  rc_path="$(first_login_ssh_rc_path)"
+  original_path="$(first_login_ssh_rc_original_path)"
+  rm -f -- "$LEGACY_FIRST_LOGIN_HOOK"
   if [[ -f "${STATE_DIR}/firewall.confirmed" && -f "$SSH_DROPIN" ]]; then
-    rm -f -- "$FIRST_LOGIN_HOOK"
+    restore_first_login_hook
     return
+  fi
+
+  admin_group="$(id -gn "$ADMIN_USER")"
+  install -d -o "$ADMIN_USER" -g "$admin_group" -m 0700 "/home/${ADMIN_USER}/.ssh"
+  if [[ -e "$rc_path" ]] && ! grep -Fq '# Managed by vpn-setup first-login finalization.' "$rc_path" 2>/dev/null; then
+    [[ -f "$rc_path" && ! -L "$rc_path" ]] || \
+      die "Refusing to replace unexpected administrator SSH rc path: ${rc_path}"
+    [[ ! -e "$original_path" ]] || \
+      die "Both administrator SSH rc and its preserved original already exist: ${rc_path}"
+    mv -- "$rc_path" "$original_path"
   fi
   candidate="$(mktemp)"
   render_first_login_hook "$candidate"
   sh -n "$candidate"
-  write_atomic "$FIRST_LOGIN_HOOK" root root 0644 "$candidate"
+  write_atomic "$rc_path" "$ADMIN_USER" "$admin_group" 0600 "$candidate"
   rm -f -- "$candidate"
+}
+
+restore_first_login_hook() {
+  local rc_path original_path
+  rc_path="$(first_login_ssh_rc_path)"
+  original_path="$(first_login_ssh_rc_original_path)"
+  rm -f -- "$LEGACY_FIRST_LOGIN_HOOK"
+
+  if [[ -e "$rc_path" ]] && ! grep -Fq '# Managed by vpn-setup first-login finalization.' "$rc_path" 2>/dev/null; then
+    warn "Administrator SSH rc changed while finalization was pending; leaving it and the preserved original untouched."
+    return
+  fi
+  rm -f -- "$rc_path"
+  if [[ -f "$original_path" && ! -L "$original_path" ]]; then
+    mv -- "$original_path" "$rc_path"
+  fi
 }
 
 lockdown_ssh() {
@@ -2739,7 +3068,7 @@ EOF
   # Re-render and validate the drop-in even when it already exists. This keeps
   # finalization idempotent and proves the effective sshd policy before reload.
   lockdown_ssh
-  rm -f -- "$FIRST_LOGIN_HOOK"
+  restore_first_login_hook
   log 'VPN server setup finalized automatically: firewall persistent and SSH key-only.'
   printf '%s\n' 'One-time security setup complete. Future SSH logins require the configured key.'
 }
@@ -2833,7 +3162,7 @@ EOF
 diagnostic_report() {
   local config_result dns_one dns_two cert_status target_status service_status
   local timer_enabled timer_active hook_status renewal_status sync_status keypair_status
-  local health_status=0
+  local health_status=0 default_interface link_stats
   require_root
   printf '### Health summary\n'
   health_check || health_status=$?
@@ -2841,11 +3170,12 @@ diagnostic_report() {
   printf 'VPN diagnostic report (share-safe)\n'
   printf 'Generated: %s\n' "$(date --iso-8601=seconds)"
   printf 'Installer: %s\n\n' "$SCRIPT_VERSION"
+  printf 'Managed runtime release: %s\n\n' "$(cat "$RUNTIME_VERSION_FILE" 2>/dev/null || printf missing)"
 
   printf '### Client profiles\n'
   printf 'REALITY fingerprint: %s\n' "$CLIENT_FINGERPRINT"
-  printf 'Hysteria2 obfuscation: disabled (native HTTP/3 camouflage)\n'
-  printf 'Subscription URLs: stable across target/fingerprint changes\n\n'
+  printf 'Hysteria2 obfuscation: %s\n' "$HY2_OBFS_MODE"
+  printf 'Subscription URLs: stable across target/fingerprint/obfuscation changes\n\n'
 
   printf '### System\n'
   sed -n 's/^PRETTY_NAME=//p' /etc/os-release 2>/dev/null | tr -d '"'
@@ -2890,6 +3220,32 @@ diagnostic_report() {
     '$5 ~ (":" ssh_port "$") || $5 ~ (":" subscription_port "$") || $5 ~ /:(80|443)$/ {print}' | redact_diagnostic_stream
   printf 'UDP receive ceiling: %s\n' "$(sysctl -n net.core.rmem_max 2>/dev/null || printf unknown)"
   printf 'UDP send ceiling: %s\n' "$(sysctl -n net.core.wmem_max 2>/dev/null || printf unknown)"
+  default_interface="$(ip -4 route show default 2>/dev/null | awk '
+    !found {
+      for (i = 1; i <= NF; i++) {
+        if ($i == "dev" && (i + 1) <= NF) {
+          interface=$(i + 1)
+          found=1
+          break
+        }
+      }
+    }
+    END { if (found) print interface }
+  ')"
+  if [[ -n "$default_interface" ]]; then
+    printf 'Default interface counters (%s):\n' "$default_interface"
+    link_stats="$(ip -s -j link show dev "$default_interface" 2>/dev/null || true)"
+    if jq -e 'type == "array" and length == 1' <<<"$link_stats" >/dev/null 2>&1; then
+      jq -r '.[0] |
+        "  RX bytes=\(.stats64.rx.bytes // .stats.rx.bytes // 0) packets=\(.stats64.rx.packets // .stats.rx.packets // 0) errors=\(.stats64.rx.errors // .stats.rx.errors // 0) dropped=\(.stats64.rx.dropped // .stats.rx.dropped // 0)",
+        "  TX bytes=\(.stats64.tx.bytes // .stats.tx.bytes // 0) packets=\(.stats64.tx.packets // .stats.tx.packets // 0) errors=\(.stats64.tx.errors // .stats.tx.errors // 0) dropped=\(.stats64.tx.dropped // .stats.tx.dropped // 0)"' \
+        <<<"$link_stats"
+    else
+      printf '  unavailable\n'
+    fi
+    printf 'Queue discipline counters:\n'
+    tc -s qdisc show dev "$default_interface" 2>/dev/null || true
+  fi
 
   printf '\n'
   print_fragmentation_guidance
@@ -2940,10 +3296,15 @@ diagnostic_report() {
   printf 'Deployed certificate/key pair: %s\n' "$keypair_status"
 
   printf '\n### Firewall and services\n'
-  if nft list table inet vpn_filter >/dev/null 2>&1; then
-    printf 'nftables vpn_filter: PASS\n'
+  if managed_firewall_is_healthy; then
+    printf 'nftables persistence and managed policy: PASS\n'
   else
-    printf 'nftables vpn_filter: FAIL\n'
+    printf 'nftables persistence and managed policy: FAIL\n'
+  fi
+  if ssh_lockdown_is_effective; then
+    printf 'SSH key-only lockdown: PASS\n'
+  else
+    printf 'SSH key-only lockdown: FAIL\n'
   fi
   systemctl --failed --no-pager --no-legend 2>/dev/null || true
   journalctl --disk-usage 2>/dev/null || true
@@ -2955,13 +3316,46 @@ diagnostic_report() {
   return "$health_status"
 }
 
+managed_firewall_is_healthy() {
+  local firewall_input
+  [[ -s "${STATE_DIR}/firewall.confirmed" ]] || return 1
+  [[ -s "${STATE_DIR}/firewall.managed" ]] || return 1
+  systemctl is-enabled --quiet nftables.service 2>/dev/null || return 1
+  systemctl is-active --quiet nftables.service 2>/dev/null || return 1
+  nft --check --file "$NFT_CONFIG" >/dev/null 2>&1 || return 1
+  firewall_input="$(nft list chain inet vpn_filter input 2>/dev/null || true)"
+  grep -Eq 'tcp dport.*443.*accept' <<<"$firewall_input" || return 1
+  grep -Eq "tcp dport.*${SUBSCRIPTION_PORT}.*accept" <<<"$firewall_input" || return 1
+  grep -Eq 'udp dport 443.*accept' <<<"$firewall_input" || return 1
+}
+
+ssh_lockdown_is_effective() {
+  local effective
+  [[ -f "$SSH_DROPIN" && ! -L "$SSH_DROPIN" ]] || return 1
+  /usr/sbin/sshd -t >/dev/null 2>&1 || return 1
+  effective="$(/usr/sbin/sshd -T 2>/dev/null)" || return 1
+  grep -Fxq 'permitrootlogin no' <<<"$effective" || return 1
+  grep -Fxq 'passwordauthentication no' <<<"$effective" || return 1
+  grep -Fxq 'kbdinteractiveauthentication no' <<<"$effective" || return 1
+  grep -Fxq 'authenticationmethods publickey' <<<"$effective" || return 1
+  grep -Eq "^allowusers([[:space:]].*)?[[:space:]]${ADMIN_USER}([[:space:]]|$)" <<<"$effective" || return 1
+}
+
 health_check() {
-  local failures=0 dns_one dns_two firewall_input
+  local failures=0 dns_one dns_two
 
   require_root
   printf 'VPN health check (read-only)\n'
   printf 'Generated: %s\n' "$(date --iso-8601=seconds)"
   printf 'INFO  client REALITY fingerprint: %s\n' "$CLIENT_FINGERPRINT"
+  printf 'INFO  Hysteria2 obfuscation: %s\n' "$HY2_OBFS_MODE"
+
+  if [[ "$(cat "$RUNTIME_VERSION_FILE" 2>/dev/null || true)" == "$SCRIPT_VERSION" ]]; then
+    printf 'PASS  managed runtime and subscriptions match installer %s\n' "$SCRIPT_VERSION"
+  else
+    printf 'FAIL  managed runtime migration marker is missing or stale\n'
+    (( failures += 1 ))
+  fi
 
   if systemctl is-active --quiet sing-box.service; then
     printf 'PASS  sing-box service is active\n'
@@ -3046,13 +3440,17 @@ health_check() {
     (( failures += 1 ))
   fi
 
-  firewall_input="$(nft list chain inet vpn_filter input 2>/dev/null || true)"
-  if grep -Eq 'tcp dport.*443.*accept' <<<"$firewall_input" &&
-     grep -Eq "tcp dport.*${SUBSCRIPTION_PORT}.*accept" <<<"$firewall_input" &&
-     grep -Eq 'udp dport 443.*accept' <<<"$firewall_input"; then
-    printf 'PASS  nftables permits TCP/443, UDP/443, and TCP/%s\n' "$SUBSCRIPTION_PORT"
+  if managed_firewall_is_healthy; then
+    printf 'PASS  nftables is confirmed, persistent, active, and permits all managed ports\n'
   else
-    printf 'FAIL  a managed VPN or subscription firewall rule is missing\n'
+    printf 'FAIL  nftables confirmation, persistence, service state, or a managed rule is missing\n'
+    (( failures += 1 ))
+  fi
+
+  if ssh_lockdown_is_effective; then
+    printf 'PASS  SSH key-only lockdown is installed and effective\n'
+  else
+    printf 'FAIL  SSH key-only lockdown is absent or ineffective\n'
     (( failures += 1 ))
   fi
 
@@ -3073,6 +3471,7 @@ show_status() {
       "$CONFIG_FILE" 2>/dev/null || printf unknown)"
   fi
   printf 'VPN setup version: %s\n' "$SCRIPT_VERSION"
+  printf 'Managed runtime version: %s\n' "$(cat "$RUNTIME_VERSION_FILE" 2>/dev/null || printf missing)"
   printf 'sing-box package: '
   dpkg-query -W -f='${Version}\n' sing-box 2>/dev/null || printf 'not installed\n'
   printf 'sing-box APT hold: '
@@ -3092,9 +3491,10 @@ show_status() {
     printf 'not confirmed\n'
   fi
   printf 'SSH lockdown: '
-  [[ -f "$SSH_DROPIN" ]] && printf 'installed\n' || printf 'not installed\n'
+  ssh_lockdown_is_effective && printf 'installed and effective\n' || printf 'not installed or ineffective\n'
   printf 'REALITY target: %s\n' "$configured_target"
   printf 'Client fingerprint: %s\n' "$CLIENT_FINGERPRINT"
+  printf 'Hysteria2 obfuscation: %s\n' "$HY2_OBFS_MODE"
   printf 'Profile labels: %s Reality / %s Hysteria2\n' "$COUNTRY_EMOJI" "$COUNTRY_EMOJI"
   printf 'TCP congestion control: %s\n' "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || printf unknown)"
   printf 'Default qdisc: %s\n' "$(sysctl -n net.core.default_qdisc 2>/dev/null || printf unknown)"
@@ -3139,6 +3539,12 @@ write_install_completion_marker() {
   mv -f -- "${INSTALL_COMPLETE_FILE}.new" "$INSTALL_COMPLETE_FILE"
 }
 
+write_runtime_version_marker() {
+  printf '%s\n' "$SCRIPT_VERSION" >"${RUNTIME_VERSION_FILE}.new"
+  chmod 0600 "${RUNTIME_VERSION_FILE}.new"
+  mv -f -- "${RUNTIME_VERSION_FILE}.new" "$RUNTIME_VERSION_FILE"
+}
+
 backup_upgrade_file() {
   local source="$1" label="$2" mode="$3"
   if [[ -e "$source" ]]; then
@@ -3162,6 +3568,7 @@ restore_upgrade_file() {
 }
 
 prepare_upgrade_transaction() {
+  local rc_path original_path
   UPGRADE_BACKUP_DIR="$(mktemp -d)"
   chmod 0700 "$UPGRADE_BACKUP_DIR"
   UPGRADE_ORIGINAL_RMEM="$(sysctl -n net.core.rmem_max)"
@@ -3169,22 +3576,33 @@ prepare_upgrade_transaction() {
   backup_upgrade_file "$UDP_SYSCTL_FILE" udp-sysctl 0644
   backup_upgrade_file "$CERT_HOOK" certificate-hook 0750
   backup_upgrade_file "$INSTALLED_HELPER" vpn-helper 0750
-  backup_upgrade_file "$FIRST_LOGIN_HOOK" first-login-hook 0644
+  backup_upgrade_file "$LEGACY_FIRST_LOGIN_HOOK" legacy-first-login-hook 0644
+  rc_path="$(first_login_ssh_rc_path)"
+  original_path="$(first_login_ssh_rc_original_path)"
+  backup_upgrade_file "$rc_path" first-login-ssh-rc 0600
+  backup_upgrade_file "$original_path" first-login-ssh-rc-original 0600
   backup_upgrade_file "$INSTALL_COMPLETE_FILE" completion-marker 0600
+  backup_upgrade_file "$RUNTIME_VERSION_FILE" runtime-version-marker 0600
   UPGRADE_ROLLBACK_FAILED=0
   UPGRADE_ROLLBACK_ACTIVE=1
 }
 
 rollback_upgrade_transaction() {
-  local restore_failed=0
+  local restore_failed=0 admin_group rc_path original_path
   (( UPGRADE_ROLLBACK_ACTIVE == 1 )) || return 0
   printf '[WARN] Overlay update did not complete; restoring its previous managed files and runtime UDP ceilings.\n' >&2
   set +e
   restore_upgrade_file "$UDP_SYSCTL_FILE" udp-sysctl root root 0644 || restore_failed=1
   restore_upgrade_file "$CERT_HOOK" certificate-hook root root 0750 || restore_failed=1
   restore_upgrade_file "$INSTALLED_HELPER" vpn-helper root root 0750 || restore_failed=1
-  restore_upgrade_file "$FIRST_LOGIN_HOOK" first-login-hook root root 0644 || restore_failed=1
+  restore_upgrade_file "$LEGACY_FIRST_LOGIN_HOOK" legacy-first-login-hook root root 0644 || restore_failed=1
+  admin_group="$(id -gn "$ADMIN_USER" 2>/dev/null || printf '%s' "$ADMIN_USER")"
+  rc_path="$(first_login_ssh_rc_path)"
+  original_path="$(first_login_ssh_rc_original_path)"
+  restore_upgrade_file "$rc_path" first-login-ssh-rc "$ADMIN_USER" "$admin_group" 0600 || restore_failed=1
+  restore_upgrade_file "$original_path" first-login-ssh-rc-original "$ADMIN_USER" "$admin_group" 0600 || restore_failed=1
   restore_upgrade_file "$INSTALL_COMPLETE_FILE" completion-marker root root 0600 || restore_failed=1
+  restore_upgrade_file "$RUNTIME_VERSION_FILE" runtime-version-marker root root 0600 || restore_failed=1
   if [[ "$UPGRADE_ORIGINAL_RMEM" =~ ^[0-9]+$ ]]; then
     sysctl -q -w "net.core.rmem_max=${UPGRADE_ORIGINAL_RMEM}" >/dev/null 2>&1 || restore_failed=1
   fi
@@ -3203,7 +3621,7 @@ rollback_upgrade_transaction() {
 }
 
 upgrade_existing_installation() {
-  local current_helper_version current_state_version helper_backup=""
+  local current_helper_version current_state_version current_runtime_version helper_backup=""
   require_command dpkg
   require_command sysctl
   require_client_runtime
@@ -3213,6 +3631,7 @@ upgrade_existing_installation() {
 
   current_helper_version="$(installed_helper_version)"
   current_state_version="$(installed_state_version)"
+  current_runtime_version="$(cat "$RUNTIME_VERSION_FILE" 2>/dev/null || true)"
   [[ -n "$current_helper_version" ]] || die 'Installed management helper version is unavailable.'
   [[ -n "$current_state_version" ]] || die 'Installed state version is unavailable.'
   dpkg --validate-version "$current_helper_version" >/dev/null 2>&1 || die 'Installed helper reports an invalid version.'
@@ -3222,7 +3641,9 @@ upgrade_existing_installation() {
   dpkg --compare-versions "$SCRIPT_VERSION" ge "$current_state_version" || \
     die "Refusing state downgrade from ${current_state_version} to ${SCRIPT_VERSION}."
 
-  if [[ "$current_helper_version" == "$SCRIPT_VERSION" && "$current_state_version" == "$SCRIPT_VERSION" ]]; then
+  if [[ "$current_helper_version" == "$SCRIPT_VERSION" &&
+        "$current_state_version" == "$SCRIPT_VERSION" &&
+        "$current_runtime_version" == "$SCRIPT_VERSION" ]]; then
     log "Installer and managed state are already at ${SCRIPT_VERSION}; no overlay update is required."
     return
   fi
@@ -3263,6 +3684,10 @@ EOF
   configure_first_login_hook
   set_step 'managed state version marker'
   write_install_completion_marker
+  set_step 'managed server configuration and subscription migration'
+  reconcile_managed_runtime
+  set_step 'managed runtime version marker'
+  write_runtime_version_marker
   UPGRADE_ROLLBACK_ACTIVE=0
   log "Overlay update completed: ${current_state_version} -> ${SCRIPT_VERSION}."
   [[ -z "$helper_backup" ]] || log "Previous helper backup: ${helper_backup}"
@@ -3394,6 +3819,7 @@ EOF
   apply_firewall
   set_step 'installation completion marker'
   write_install_completion_marker
+  write_runtime_version_marker
 
   cat <<EOF
 
@@ -3479,6 +3905,9 @@ main() {
       ;;
     set-fingerprint)
       set_client_fingerprint
+      ;;
+    set-obfs)
+      set_hy2_obfs
       ;;
     help)
       usage

@@ -31,12 +31,19 @@ apt-cache() {
 # Subscription rendering only needs already-generated server secrets. Replacing
 # this loader keeps the test entirely inside its temporary directory.
 generate_or_load_server_secrets() { :; }
+sing-box() {
+  [[ "$1" == "check" && "$2" == "-c" ]]
+  jq -e . "$3" >/dev/null
+}
 
 SERVER_IPV4="203.0.113.10"
 TLS_DOMAIN="vpn.example.com"
 REALITY_TARGET="www.example.com"
 COUNTRY_EMOJI="🇩🇪"
 CLIENT_FINGERPRINT="firefox"
+HY2_OBFS_MODE="off"
+HY2_OBFS_PASSWORD="1234567890abcdef1234567890abcdef1234567890abcdef"
+REALITY_PRIVATE_KEY="testPrivateKey"
 REALITY_PUBLIC_KEY="testPublicKey"
 REALITY_SHORT_ID="deadbeef"
 
@@ -88,6 +95,32 @@ for fingerprint in chrome firefox safari ios android edge 360 qq random; do
     '.proxies[0]["client-fingerprint"] == $fingerprint' \
     "${work}/${token}.mihomo" >/dev/null
 done
+
+# Salamander is an explicit global opt-in. It must update the server inbound
+# and both portable subscription representations with the same shared secret.
+HY2_OBFS_MODE="salamander"
+render_client_subscription_files "$client" "$work"
+openssl base64 -d -A -in "${work}/${token}.links" >"${work}/decoded.links"
+grep -Fq '&obfs=salamander&obfs-password=1234567890abcdef1234567890abcdef1234567890abcdef' \
+  "${work}/decoded.links"
+jq -e '
+  .proxies[1].obfs == "salamander" and
+  .proxies[1]["obfs-password"] == "1234567890abcdef1234567890abcdef1234567890abcdef"
+' "${work}/${token}.mihomo" >/dev/null
+
+client_database="${work}/clients.json"
+jq -n --argjson client "$client" '{schema_version: 2, clients: [$client]}' >"$client_database"
+build_sing_box_config "$client_database" "${work}/sing-box.json"
+jq -e '
+  (.inbounds[] | select(.tag == "hysteria2-in") | .obfs.type) == "salamander" and
+  (.inbounds[] | select(.tag == "hysteria2-in") | .obfs.password) ==
+    "1234567890abcdef1234567890abcdef1234567890abcdef"
+' "${work}/sing-box.json" >/dev/null
+HY2_OBFS_MODE="off"
+build_sing_box_config "$client_database" "${work}/sing-box-off.json"
+jq -e '
+  (.inbounds[] | select(.tag == "hysteria2-in") | has("obfs")) | not
+' "${work}/sing-box-off.json" >/dev/null
 
 render_nginx_subscription_site "${work}/nginx.conf"
 grep -Fq 'default links;' "${work}/nginx.conf"
