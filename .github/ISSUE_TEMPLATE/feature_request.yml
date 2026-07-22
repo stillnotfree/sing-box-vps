@@ -1,0 +1,39 @@
+name: Feature request
+description: Suggest a focused improvement to the server installer.
+title: "[Feature]: "
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Keep proposals focused on the server installer. Client applications and personal routing profiles are outside this repository.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem to solve
+      description: Describe the practical problem before proposing an implementation.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Explain the smallest useful change and its expected benefit.
+    validations:
+      required: true
+
+  - type: textarea
+    id: risks
+    attributes:
+      label: Risks and alternatives
+      description: Mention compatibility, security, maintenance, or migration costs if known.
+
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope check
+      options:
+        - label: This request applies to the server installer, not a client application.
+          required: true

@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate installer
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install test dependencies
+        run: sudo apt-get update && sudo apt-get install -y jq shellcheck
+
+      - name: Check Bash syntax
+        run: bash -n install-sing-box-server.sh
+
+      - name: Run ShellCheck
+        run: shellcheck --severity=style install-sing-box-server.sh
+
+      - name: Run static smoke tests
+        run: bash tests/static-smoke.sh
+
+      - name: Run state smoke tests
+        run: bash tests/fingerprint-smoke.sh

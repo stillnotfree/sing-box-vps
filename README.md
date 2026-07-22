@@ -1,5 +1,11 @@
 # sing-box-vps
 
+[![CI](https://github.com/stillnotfree/sing-box-vps/actions/workflows/ci.yml/badge.svg)](https://github.com/stillnotfree/sing-box-vps/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/stillnotfree/sing-box-vps?display_name=tag&sort=semver)](https://github.com/stillnotfree/sing-box-vps/releases/latest)
+[![License](https://img.shields.io/github/license/stillnotfree/sing-box-vps)](LICENSE)
+
+**English** · [Русский](README_RU.md)
+
 A minimal interactive installer for a private sing-box server on a clean VPS.
 It is designed for a small personal server that should be easy to install,
 update, and manage without a web panel.
