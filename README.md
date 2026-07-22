@@ -30,7 +30,7 @@ a CDN or DNS proxy because Certbot uses the HTTP-01 standalone challenge.
 Connect to the VPS as `root`, then run:
 
 ```bash
-wget -qO vpn-install.sh https://raw.githubusercontent.com/stillnotfree/sing-box-vps/v1.0.3/install-sing-box-server.sh && chmod 700 vpn-install.sh && ./vpn-install.sh install
+wget -qO vpn-install.sh https://raw.githubusercontent.com/stillnotfree/sing-box-vps/v1.0.4/install-sing-box-server.sh && chmod 700 vpn-install.sh && ./vpn-install.sh install
 ```
 
 The installer asks for:
@@ -56,15 +56,14 @@ session using the administrator and private key configured during installation:
 
 ```bash
 ssh ADMIN_USER@SERVER_IP
+sudo vpn finalize --yes
 ```
 
-That verified key login automatically confirms the managed firewall, enables
-key-only SSH, and removes the one-time SSH hook. The hook is run directly by
-`sshd`, so it does not depend on Bash profile loading; an existing user SSH rc
-file is preserved and restored. No post-install command is required. If the
-safety window expired first, the login reapplies the firewall with a new
-rollback timer and asks for one more SSH login. Keep the earlier session open
-until finalization reports success.
+`finalize` confirms the managed firewall and enables key-only SSH as one
+explicit transaction. If the rollback window already expired, the same command
+reapplies and confirms the firewall; a second mandatory authorization cycle is
+not required. Keep the original session open, then test one additional SSH
+login before closing it.
 
 If an interrupted installation saved an ACME address that Let's Encrypt rejects,
 resume it with a real address instead of reinstalling the VPS:
@@ -171,8 +170,8 @@ native Hysteria2 is filtered or throttled.
 
 ### Updates and recovery
 
-The following finalization commands are recovery tools; a normal fresh install
-runs them automatically on the first administrator SSH login.
+Run this once from the newly created administrator account after a fresh
+installation:
 
 ```bash
 sudo vpn finalize --yes

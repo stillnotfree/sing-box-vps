@@ -27,7 +27,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly SCRIPT_VERSION="1.0.3"
+readonly SCRIPT_VERSION="1.0.4"
 readonly PROJECT_NAME="vpn-setup"
 readonly SAGERNET_KEY_URL="https://sing-box.app/gpg.key"
 readonly SAGERNET_KEY_FILE="/etc/apt/keyrings/sagernet.asc"
@@ -827,7 +827,7 @@ Target:
   Minimum free disk:    2.5 GiB
   Init/runtime:         real systemd boot; containers without systemd and WSL unsupported
   Admin account:        ${plan_admin}
-  SSH:                  TCP/${plan_ssh_port}, key-only after first verified admin login
+  SSH:                  TCP/${plan_ssh_port}, key-only after explicit finalization
   Server IPv4:          ${plan_ip}
   Server core:          latest stable sing-box from its signed official APT repository
   Primary inbound:      VLESS + REALITY + Vision, TCP/443
@@ -865,7 +865,7 @@ Package commands:
 Account and SSH commands:
   useradd/usermod/chpasswd/install/visudo
   sshd -t
-  systemctl reload ssh (automatically after the first verified admin login)
+  systemctl reload ssh (during explicit "sudo vpn finalize --yes")
 
 Certificate commands:
   dig A ${plan_domain} using 1.1.1.1 and 8.8.8.8
@@ -897,8 +897,6 @@ Files changed by install:
   /etc/fstab and /swapfile (only if swap is absent)
   /home/${plan_admin}/.ssh/authorized_keys
   /etc/sudoers.d/90-${plan_admin}
-  /home/${plan_admin}/.ssh/${FIRST_LOGIN_SSH_RC_NAME} (one-time finalization hook;
-    any existing file is restored after successful finalization)
   ${INSTALLED_HELPER}
   ${SETTINGS_FILE}
   ${CLIENTS_FILE} (root-only client database)
@@ -929,10 +927,10 @@ Safety gates:
     are verified and reused instead of being recreated;
   * each installation attempt writes a detailed root-only log with the failed
     step, exit code, command, source location, and shell call stack;
-  * firewall automatically rolls back after five minutes unless the first SSH
-    login as the new administrator proves that the managed policy and key work;
-  * that verified login automatically confirms firewall persistence, applies
-    key-only SSH hardening, and removes its one-time login hook.
+  * firewall automatically rolls back after five minutes unless the new
+    administrator explicitly runs "sudo vpn finalize --yes";
+  * finalization verifies the live policy and SSH listener, confirms firewall
+    persistence, and applies key-only SSH hardening as one transaction.
 EOF
 }
 
@@ -2932,50 +2930,6 @@ first_login_ssh_rc_original_path() {
   printf '/home/%s/.ssh/%s\n' "$ADMIN_USER" "$FIRST_LOGIN_SSH_RC_ORIGINAL_NAME"
 }
 
-render_first_login_hook() {
-  local candidate="$1"
-  cat >"$candidate" <<EOF
-#!/bin/sh
-# Managed by vpn-setup first-login finalization.
-if [ -f "$(first_login_ssh_rc_original_path)" ]; then
-  . "$(first_login_ssh_rc_original_path)"
-fi
-
-if [ -n "\${SSH_CONNECTION:-}" ] && [ -n "\${SSH_TTY:-}" ] && [ -x "${INSTALLED_HELPER}" ]; then
-  printf '%s\n' 'Completing one-time VPN server security setup...'
-  if ! sudo -n "${INSTALLED_HELPER}" finalize --yes; then
-    printf '%s\n' 'Automatic finalization failed. Keep this SSH session open and review the error above.' >&2
-  fi
-fi
-EOF
-}
-
-configure_first_login_hook() {
-  local candidate rc_path original_path admin_group
-  rc_path="$(first_login_ssh_rc_path)"
-  original_path="$(first_login_ssh_rc_original_path)"
-  rm -f -- "$LEGACY_FIRST_LOGIN_HOOK"
-  if [[ -f "${STATE_DIR}/firewall.confirmed" && -f "$SSH_DROPIN" ]]; then
-    restore_first_login_hook
-    return
-  fi
-
-  admin_group="$(id -gn "$ADMIN_USER")"
-  install -d -o "$ADMIN_USER" -g "$admin_group" -m 0700 "/home/${ADMIN_USER}/.ssh"
-  if [[ -e "$rc_path" ]] && ! grep -Fq '# Managed by vpn-setup first-login finalization.' "$rc_path" 2>/dev/null; then
-    [[ -f "$rc_path" && ! -L "$rc_path" ]] || \
-      die "Refusing to replace unexpected administrator SSH rc path: ${rc_path}"
-    [[ ! -e "$original_path" ]] || \
-      die "Both administrator SSH rc and its preserved original already exist: ${rc_path}"
-    mv -- "$rc_path" "$original_path"
-  fi
-  candidate="$(mktemp)"
-  render_first_login_hook "$candidate"
-  sh -n "$candidate"
-  write_atomic "$rc_path" "$ADMIN_USER" "$admin_group" 0600 "$candidate"
-  rm -f -- "$candidate"
-}
-
 restore_first_login_hook() {
   local rc_path original_path
   rc_path="$(first_login_ssh_rc_path)"
@@ -3040,6 +2994,9 @@ finalize_installation() {
   local invoking_user
   require_root
   require_confirmation
+  # Finalization is the single user-approved transaction. Nested firewall and
+  # SSH operations must not ask for two additional confirmations.
+  ASSUME_YES=1
   load_settings
   invoking_user="${SUDO_USER:-}"
   [[ "$invoking_user" == "$ADMIN_USER" ]] || \
@@ -3051,26 +3008,24 @@ finalize_installation() {
   load_settings
 
   if [[ ! -f "${STATE_DIR}/firewall.confirmed" ]]; then
-    if [[ -f "${STATE_DIR}/firewall.managed" ]]; then
-      confirm_firewall
-    else
+    if [[ ! -f "${STATE_DIR}/firewall.managed" ]]; then
       warn 'The previous firewall safety window expired before a verified administrator login.'
       apply_firewall
-      cat <<EOF
-The managed firewall was reapplied with a new five-minute safety window.
-Open one more new SSH session as ${ADMIN_USER}; it will finish automatically.
-Keep this session open until the new login succeeds.
-EOF
-      return
     fi
+    # The caller has already reached the administrator account and authorized
+    # this transaction. Check the live SSH listener and explicit accept rule,
+    # persist the policy, and cancel rollback in the same transaction. Keep
+    # this session alive so the user can independently test a second login.
+    confirm_firewall
   fi
 
   # Re-render and validate the drop-in even when it already exists. This keeps
   # finalization idempotent and proves the effective sshd policy before reload.
   lockdown_ssh
   restore_first_login_hook
-  log 'VPN server setup finalized automatically: firewall persistent and SSH key-only.'
+  log 'VPN server setup finalized: firewall persistent and SSH key-only.'
   printf '%s\n' 'One-time security setup complete. Future SSH logins require the configured key.'
+  printf '%s\n' 'Keep this session open until one additional SSH login has been tested.'
 }
 
 update_sing_box() {
@@ -3627,7 +3582,7 @@ upgrade_existing_installation() {
   require_client_runtime
   [[ -f "$INSTALL_COMPLETE_FILE" ]] || die 'Installation completion marker is missing; resume the install command instead of upgrading.'
   [[ -f "${STATE_DIR}/firewall.confirmed" ]] || \
-    die 'Firewall is not confirmed; run the install command to reapply it, then confirm it from a second SSH session before upgrading.'
+    die 'Firewall is not confirmed; log in as the administrator and run "sudo vpn finalize --yes" before upgrading.'
 
   current_helper_version="$(installed_helper_version)"
   current_state_version="$(installed_state_version)"
@@ -3680,8 +3635,8 @@ EOF
     restore_installed_helper "$helper_backup" || die 'New helper failed its post-install check and automatic helper rollback also failed.'
     die 'New helper failed its post-install check; the previous helper was restored.'
   fi
-  set_step 'first-login security finalization hook migration'
-  configure_first_login_hook
+  set_step 'obsolete first-login hook cleanup'
+  restore_first_login_hook
   set_step 'managed state version marker'
   write_install_completion_marker
   set_step 'managed server configuration and subscription migration'
@@ -3731,14 +3686,15 @@ run_install() {
       require_command systemd-run
       set_step 'management helper recovery update'
       install_helper >/dev/null
-      set_step 'first-login security finalization hook recovery'
-      configure_first_login_hook
+      set_step 'obsolete first-login hook cleanup'
+      restore_first_login_hook
       set_step 'nftables firewall recovery deployment'
       apply_firewall
       cat <<EOF
 
 Firewall reapplied with automatic rollback in five minutes.
-Open a new SSH session as ${ADMIN_USER}; finalization will run automatically.
+Open a new SSH session as ${ADMIN_USER}, then run:
+  sudo vpn finalize --yes
 EOF
       return
     fi
@@ -3813,8 +3769,8 @@ EOF
   smoke_test_certificate_hook
   set_step 'management command installation'
   install_helper >/dev/null
-  set_step 'first-login security finalization hook'
-  configure_first_login_hook
+  set_step 'obsolete first-login hook cleanup'
+  restore_first_login_hook
   set_step 'nftables firewall deployment'
   apply_firewall
   set_step 'installation completion marker'
@@ -3828,9 +3784,13 @@ Installation payload completed.
 Within five minutes, keep this session open and use a new local terminal to run:
   ssh -p ${SSH_PORT} ${ADMIN_USER}@${SERVER_IPV4}
 
-That verified key login automatically confirms firewall persistence and enables
-key-only SSH. No post-install command is required. If the five-minute safety
-window has already expired, follow the prompt and reconnect once more.
+From that administrator session, complete the one-time security transaction:
+  sudo vpn finalize --yes
+
+This confirms firewall persistence and enables key-only SSH. If the five-minute
+safety window has expired, finalization safely reapplies and confirms the
+firewall in the same command. Keep the original session open until a subsequent
+SSH login has also been tested.
 
 An independent ${INITIAL_CLIENT_NAME} VPN profile was created. Its credentials
 were NOT printed. Manage profiles from the verified ${ADMIN_USER} session:

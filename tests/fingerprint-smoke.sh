@@ -9,7 +9,7 @@ repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck disable=SC1091
 source "${repo_root}/install-sing-box-server.sh"
 
-[[ "$SCRIPT_VERSION" == "1.0.3" ]]
+[[ "$SCRIPT_VERSION" == "1.0.4" ]]
 (( ${#SUPPORTED_CLIENT_FINGERPRINTS[@]} == 9 ))
 (( ${#SUPPORTED_HY2_OBFS_MODES[@]} == 2 ))
 
@@ -118,12 +118,18 @@ done
   [[ "$ACME_EMAIL" == "admin@vpn-mail.net" ]]
 )
 
-render_first_login_hook "${work}/first-login.sh"
-sh -n "${work}/first-login.sh"
-grep -Fq '[ -n "${SSH_CONNECTION:-}" ]' "${work}/first-login.sh"
-grep -Fq '[ -n "${SSH_TTY:-}" ]' "${work}/first-login.sh"
-grep -Fq 'vpn" finalize --yes' "${work}/first-login.sh"
-grep -Fq '. "/home/vpnadmin/.ssh/rc.vpn-setup-original"' "${work}/first-login.sh"
+if declare -F configure_first_login_hook >/dev/null || declare -F render_first_login_hook >/dev/null; then
+  printf 'Obsolete automatic first-login finalization hook is still present.\n' >&2
+  exit 1
+fi
+finalize_body="$(declare -f finalize_installation)"
+grep -Fq 'ASSUME_YES=1' <<<"$finalize_body"
+grep -Fq 'apply_firewall' <<<"$finalize_body"
+grep -Fq 'confirm_firewall' <<<"$finalize_body"
+if grep -Fq 'Open one more new SSH session' <<<"$finalize_body"; then
+  printf 'Finalization still requires a second authorization cycle.\n' >&2
+  exit 1
+fi
 
 # Firewall confirmation must verify transient unit state instead of trusting a
 # combined `systemctl stop timer service` exit code.  The service is commonly
