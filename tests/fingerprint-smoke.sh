@@ -9,7 +9,7 @@ repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck disable=SC1091
 source "${repo_root}/install-sing-box-server.sh"
 
-[[ "$SCRIPT_VERSION" == "1.0.5" ]]
+[[ "$SCRIPT_VERSION" == "1.0.6" ]]
 (( ${#SUPPORTED_CLIENT_FINGERPRINTS[@]} == 9 ))
 (( ${#SUPPORTED_HY2_OBFS_MODES[@]} == 2 ))
 
@@ -35,6 +35,30 @@ parse_args set-fingerprint firefox --yes
   [[ "$COMMAND" == "finalize" ]]
   (( ASSUME_YES == 1 ))
 )
+
+(
+  COMMAND="plan"
+  VERBOSE=0
+  parse_args health --verbose
+  [[ "$COMMAND" == "health" ]]
+  (( VERBOSE == 1 ))
+)
+
+if declare -F show_status >/dev/null; then
+  printf 'Removed status implementation is still present.\n' >&2
+  exit 1
+fi
+if declare -F diagnostic_report >/dev/null ||
+   declare -F redact_diagnostic_stream >/dev/null; then
+  printf 'Removed diagnostic implementation is still present.\n' >&2
+  exit 1
+fi
+
+help_output="$(usage)"
+if grep -Eq 'vpn (status|diagnostic)([[:space:]]|$)' <<<"$help_output"; then
+  printf 'Removed management command is still advertised.\n' >&2
+  exit 1
+fi
 
 for fingerprint in chrome firefox safari ios android edge 360 qq random; do
   client_fingerprint_is_supported "$fingerprint"
@@ -68,6 +92,9 @@ HY2_OBFS_MODE="salamander"
 
 work="$(mktemp -d)"
 trap 'rm -rf -- "$work"' EXIT
+render_user_command_wrapper "${work}/vpn-command"
+sh -n "${work}/vpn-command"
+grep -Fxq 'exec sudo -n "$helper" "$@"' "${work}/vpn-command"
 render_settings "${work}/settings.json"
 jq -e '
   .schema_version == 1 and

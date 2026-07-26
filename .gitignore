@@ -8,6 +8,9 @@
 /INSTALLATION_REVIEW.md
 /deep-research-report.md
 
+# Generated local analysis artifacts may contain excerpts from private exports.
+/outputs/
+
 # Local client experiments that are not part of the server release.
 /SHADOWROCKET_IOS_ROUTING.md
 /shadowrocket-ios-optimized.conf

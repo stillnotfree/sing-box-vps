@@ -48,13 +48,14 @@ for it, and do not add an `AAAA` record unless IPv6 is deliberately configured.
 Connect to the VPS as `root` and run:
 
 ```bash
-wget -qO vpn-install.sh https://raw.githubusercontent.com/stillnotfree/sing-box-vps/v1.0.5/install-sing-box-server.sh && chmod 700 vpn-install.sh && ./vpn-install.sh install
+wget -qO vpn-install.sh https://raw.githubusercontent.com/stillnotfree/sing-box-vps/v1.0.6/install-sing-box-server.sh && chmod 700 vpn-install.sh && ./vpn-install.sh install
 ```
 
 The installer asks for the administrator, public SSH key, VPS address, domain,
 email, current SSH port, REALITY target, VPS country, and client fingerprint. It
-shows the complete plan before making changes and waits for an explicit `YES`.
-An interrupted installation can normally be resumed with the same command.
+shows a short summary and asks for confirmation with `[Y/n]`; pressing Enter
+accepts. An interrupted installation can normally be resumed with the same
+command.
 
 ## First login
 
@@ -73,7 +74,7 @@ The first independent client is named `default`. Display its private
 subscription, direct links, and QR codes with:
 
 ```bash
-sudo vpn show default
+vpn show default
 ```
 
 Do not share this output: the links contain client credentials.
@@ -82,19 +83,22 @@ Do not share this output: the links contain client credentials.
 
 | Task | Command |
 | --- | --- |
-| Show server state | `sudo vpn status` |
-| Run share-safe diagnostics | `sudo vpn diagnostic` |
-| Check installation compatibility | `sudo vpn check` |
-| List clients | `sudo vpn list` |
-| Show links and QR codes | `sudo vpn show NAME` |
-| Add an independent client | `sudo vpn add NAME` |
-| Revoke a client | `sudo vpn delete NAME --yes` |
-| Update sing-box safely | `sudo vpn update` |
-| Change the REALITY target | `sudo vpn set-target DOMAIN` |
-| Select a client fingerprint | `sudo vpn set-fingerprint` |
-| Use native Hysteria2/QUIC | `sudo vpn set-obfs off` |
-| Enable Salamander | `sudo vpn set-obfs salamander` |
-| Show built-in help | `sudo vpn help` |
+| Check server health | `vpn health` |
+| Show detailed share-safe health data | `vpn health --verbose` |
+| Check installation compatibility | `vpn check` |
+| List clients | `vpn list` |
+| Show links and QR codes | `vpn show NAME` |
+| Add an independent client | `vpn add NAME` |
+| Revoke a client | `vpn delete NAME --yes` |
+| Update sing-box safely | `vpn update` |
+| Change the REALITY target | `vpn set-target DOMAIN` |
+| Select a client fingerprint | `vpn set-fingerprint` |
+| Use native Hysteria2/QUIC | `vpn set-obfs off` |
+| Enable Salamander | `vpn set-obfs salamander` |
+| Show built-in help | `vpn help` |
+
+The installed `vpn` command obtains its required administrative privileges
+automatically. You do not need to prefix it with `sudo`.
 
 Target, fingerprint, obfuscation, client, and update changes are validated and
 applied transactionally. Existing subscription URLs remain stable; refresh the
@@ -107,8 +111,8 @@ Normal operating-system updates are supported:
 ```bash
 sudo apt update
 sudo apt upgrade
-sudo vpn update
-sudo vpn status
+vpn update
+vpn health
 ```
 
 OS security updates are enabled automatically without automatic reboot.
@@ -152,14 +156,14 @@ the subscription threat model.
 <summary><strong>Recovery commands</strong></summary>
 
 Fresh installations finalize automatically. Use these only when installation
-or diagnostics explicitly report a recovery condition.
+or the health check explicitly reports a recovery condition.
 
 ```bash
-sudo vpn finalize --yes
-sudo vpn confirm-firewall --yes
-sudo vpn rollback-firewall --yes
-sudo vpn lockdown-ssh --yes
-sudo vpn self-update /root/install-sing-box-server.sh
+vpn finalize --yes
+vpn confirm-firewall --yes
+vpn rollback-firewall --yes
+vpn lockdown-ssh --yes
+vpn self-update /root/install-sing-box-server.sh
 ```
 
 If Let's Encrypt rejected an email saved during an interrupted installation:

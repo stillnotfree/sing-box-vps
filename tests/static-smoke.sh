@@ -152,16 +152,16 @@ payload="$(printf 'url = "file://%s/curl-source"\n' "$work" | \
   curl --silent --show-error --config -)"
 [[ "$payload" == "payload" ]]
 
-# A diagnostics report is intended for sharing after review. Cover the two
+# Verbose health output is intended for sharing after review. Cover the two
 # generated secret lengths and bracketed IPv6 endpoints in addition to UUIDs
 # and IPv4 addresses.
 hy2_secret="abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdef"
-diagnostic_sample="$(printf '%s\n' \
+health_sample="$(printf '%s\n' \
   "password=${hy2_secret} from [2001:db8::10]:443 via 203.0.113.10" | \
-  redact_diagnostic_stream)"
-[[ "$diagnostic_sample" != *"$hy2_secret"* ]]
-[[ "$diagnostic_sample" != *"2001:db8::10"* ]]
-[[ "$diagnostic_sample" != *"203.0.113.10"* ]]
+  redact_health_stream)"
+[[ "$health_sample" != *"$hy2_secret"* ]]
+[[ "$health_sample" != *"2001:db8::10"* ]]
+[[ "$health_sample" != *"203.0.113.10"* ]]
 
 # Public addresses assigned through provider-managed 1:1 NAT need not appear
 # on a local interface. DNS and ACME remain the authoritative external gates.

@@ -10,14 +10,14 @@
 #   sudo ./install-sing-box-server.sh install
 #
 # Management after installation:
-#   sudo vpn add WorkPC
-#   sudo vpn show WorkPC
-#   sudo vpn set-target example.com
-#   sudo vpn set-fingerprint
-#   sudo vpn set-obfs off|salamander
-#   sudo vpn update
-#   sudo vpn self-update /path/to/new/install-sing-box-server.sh
-#   sudo vpn diagnostic
+#   vpn health
+#   vpn add WorkPC
+#   vpn show WorkPC
+#   vpn set-target example.com
+#   vpn set-fingerprint
+#   vpn set-obfs off|salamander
+#   vpn update
+#   vpn self-update /path/to/new/install-sing-box-server.sh
 #
 # This script intentionally does not install a web panel, Docker, Xray, UFW,
 # fail2ban, or experimental sing-box builds. nginx-light serves only private,
@@ -27,7 +27,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly SCRIPT_VERSION="1.0.5"
+readonly SCRIPT_VERSION="1.0.6"
 readonly PROJECT_NAME="vpn-setup"
 readonly SAGERNET_KEY_URL="https://sing-box.app/gpg.key"
 readonly SAGERNET_KEY_FILE="/etc/apt/keyrings/sagernet.asc"
@@ -70,10 +70,8 @@ readonly SSH_DROPIN="/etc/ssh/sshd_config.d/00-vpn-hardening.conf"
 readonly AUTO_FINALIZE_SSH_DROPIN="/etc/ssh/sshd_config.d/99-vpn-auto-finalize.conf"
 readonly AUTO_FINALIZE_WRAPPER="/usr/local/libexec/vpn-auto-finalize-login"
 readonly AUTO_FINALIZE_REMOVAL_STAGE="${STATE_DIR}/vpn-auto-finalize.conf.removing"
-readonly LEGACY_FIRST_LOGIN_HOOK="/etc/profile.d/90-vpn-first-login.sh"
-readonly FIRST_LOGIN_SSH_RC_NAME="rc"
-readonly FIRST_LOGIN_SSH_RC_ORIGINAL_NAME="rc.vpn-setup-original"
 readonly INSTALLED_HELPER="/usr/local/sbin/vpn"
+readonly USER_COMMAND="/usr/local/bin/vpn"
 readonly CERT_HOOK="/etc/letsencrypt/renewal-hooks/deploy/50-vpn-sing-box"
 readonly FIREWALL_UNIT_STATE="${STATE_DIR}/firewall.rollback.unit"
 readonly LOG_DIR="/var/log/${PROJECT_NAME}"
@@ -90,6 +88,7 @@ CLIENT_FINGERPRINT=""
 HY2_OBFS_MODE=""
 ASSUME_YES=0
 AUTOMATIC=0
+VERBOSE=0
 COMMAND="plan"
 TMP_DIR=""
 CLIENT_NAME=""
@@ -258,21 +257,16 @@ Usage:
   sudo ./install-sing-box-server.sh check
   sudo ./install-sing-box-server.sh install
   sudo ./install-sing-box-server.sh upgrade
-  sudo vpn status
-  sudo vpn add NAME
-  sudo vpn show NAME
-  sudo vpn delete NAME
-  sudo vpn list
-  sudo vpn set-target DOMAIN
-  sudo vpn set-fingerprint [VALUE]
-  sudo vpn set-obfs [off|salamander]
-  sudo vpn update
-  sudo vpn self-update /path/to/new/install-sing-box-server.sh
-  sudo vpn diagnostic
-  sudo vpn finalize --yes
-  sudo vpn confirm-firewall --yes
-  sudo vpn rollback-firewall --yes
-  sudo vpn lockdown-ssh --yes
+  vpn health [--verbose]
+  vpn add NAME
+  vpn show NAME
+  vpn delete NAME
+  vpn list
+  vpn set-target DOMAIN
+  vpn set-fingerprint [VALUE]
+  vpn set-obfs [off|salamander]
+  vpn update
+  vpn self-update /path/to/new/install-sing-box-server.sh
 
 Install options (missing values are requested interactively):
   --admin-user NAME        Administrative account to create.
@@ -285,6 +279,7 @@ Install options (missing values are requested interactively):
   --fingerprint VALUE      Initial client TLS fingerprint (default: chrome).
   --emoji EMOJI            Server/country emoji for non-interactive installs.
   --yes                    Confirm a mutating operation non-interactively.
+  --verbose                Show the detailed share-safe health report.
   --automatic              Internal use by the firewall rollback timer.
   -h, --help               Show this help.
 
@@ -393,6 +388,10 @@ parse_args() {
         ASSUME_YES=1
         shift
         ;;
+      --verbose)
+        VERBOSE=1
+        shift
+        ;;
       --automatic)
         AUTOMATIC=1
         shift
@@ -416,8 +415,16 @@ require_confirmation() {
   local answer
   (( ASSUME_YES == 1 )) && return
   [[ -t 0 ]] || die 'Mutating non-interactive commands require --yes.'
-  read -r -p 'Type YES to continue: ' answer
-  [[ "$answer" == "YES" ]] || die 'Cancelled.'
+  read -r -p 'Continue? [y/N] ' answer
+  [[ "$answer" =~ ^[Yy]$ ]] || die 'Cancelled.'
+}
+
+require_install_confirmation() {
+  local answer
+  (( ASSUME_YES == 1 )) && return
+  [[ -t 0 ]] || die 'Non-interactive installation requires --yes.'
+  read -r -p 'Install now? [Y/n] ' answer
+  [[ -z "$answer" || "$answer" =~ ^[Yy]$ ]] || die 'Cancelled.'
 }
 
 require_command() {
@@ -822,121 +829,26 @@ show_plan() {
   local plan_hy2_obfs="${HY2_OBFS_MODE:-$DEFAULT_HY2_OBFS_MODE}"
   local plan_ssh_port="${SSH_PORT:-22}"
   cat <<EOF
-VPN installer ${SCRIPT_VERSION} — reviewed plan (no changes performed)
+VPN installer ${SCRIPT_VERSION}
 
-Target:
-  OS/arch:              Debian 13, Ubuntu 24.04 LTS, or Ubuntu 26.04 LTS / amd64
-  Minimum RAM:          1 GB VPS plan (at least 900 MiB visible)
-  Minimum free disk:    2.5 GiB
-  Init/runtime:         real systemd boot; containers without systemd and WSL unsupported
-  Admin account:        ${plan_admin}
-  SSH:                  TCP/${plan_ssh_port}, automatically finalized on first admin login
-  Server IPv4:          ${plan_ip}
-  Server core:          latest stable sing-box from its signed official APT repository
-  Primary inbound:      VLESS + REALITY + Vision, TCP/443
-  Reserve inbound:      Hysteria2 + TLS, UDP/443
-  Hysteria2 obfs:       ${plan_hy2_obfs} (off keeps the native QUIC/HTTP/3 appearance)
-  TLS hostname:         ${plan_domain}
-  REALITY target:       ${plan_target}
-  Client fingerprint:   ${plan_fingerprint} (selectable; stored in subscriptions)
-  Profile labels:       ${plan_emoji} Reality / ${plan_emoji} Hysteria2
-  Firewall:             native nftables
-  Swap:                 1 GiB only when no swap exists
-  TCP optimization:     BBR + fq only when tcp_bbr is available
-  UDP optimization:     raise QUIC socket-buffer ceilings to 7 MiB only when lower
-  Subscription:         private HTTPS URL per client on TCP/${SUBSCRIPTION_PORT}
-  Subscription formats: URI/Base64 fallback and Mihomo profile, selected per client
-  Web panel:            none; nginx-light serves static read-only files only
-  Client management:    sudo vpn add/show/delete/list
-  REALITY target change: sudo vpn set-target DOMAIN (transactional)
-  Fingerprint change:   sudo vpn set-fingerprint [VALUE] (transactional)
-  Hysteria2 obfs:       sudo vpn set-obfs [off|salamander] (transactional)
-  Core update:          sudo vpn update (validated with package rollback)
-  Installer update:     local verified file; atomic replacement with previous-version backup
-  Diagnostics:          sudo vpn diagnostic (health summary plus redacted details)
-  Compatibility check: sudo vpn check (read-only)
-  Install error log:    detailed root-only file under ${LOG_DIR}
-  Initial client:       ${INITIAL_CLIENT_NAME}
+  System       Debian 13 / Ubuntu 24.04 or 26.04, amd64
+  Server       ${plan_ip}
+  Admin        ${plan_admin}
+  SSH          TCP/${plan_ssh_port}, key-only after first admin login
+  Core         latest stable sing-box from the signed official repository
+  Protocols    VLESS + REALITY + Vision (TCP/443)
+               Hysteria2 + TLS (UDP/443, obfs: ${plan_hy2_obfs})
+  TLS domain   ${plan_domain}
+  REALITY      ${plan_target}
+  Fingerprint  ${plan_fingerprint}
+  Labels       ${plan_emoji} Reality / ${plan_emoji} Hysteria2
+  Subscription private HTTPS URL per client on TCP/${SUBSCRIPTION_PORT}
+  Security     nftables, SSH hardening, automatic security updates
+  Tuning       BBR + fq when supported, conservative QUIC buffers
 
-Package commands:
-  apt-get update
-  apt-get install ca-certificates curl jq openssl nftables sudo certbot dnsutils qrencode nginx-light unattended-upgrades
-  configure the official signed SagerNet APT repository
-  apt-get download and install the latest stable sing-box package
-  apt-mark hold sing-box (updates only through "sudo vpn update")
-
-Account and SSH commands:
-  useradd/usermod/chpasswd/install/visudo
-  sshd -t
-  systemctl reload ssh (one-time automatic finalization on first admin login)
-
-Certificate commands:
-  dig A ${plan_domain} using 1.1.1.1 and 8.8.8.8
-  certbot certonly --standalone --preferred-challenges http
-  install certificate copies readable only by root:sing-box
-
-Network and service commands:
-  nft -c -f, nft -f
-  modprobe tcp_bbr, sysctl -p <project file>
-  systemctl restart systemd-journald
-  systemctl daemon-reload/enable/start/reload
-  sing-box check
-
-Files changed by install:
-  ${CONFIG_FILE}
-  ${SYSTEMD_DROPIN}
-  ${JOURNAL_DROPIN}
-  ${NFT_CONFIG}
-  ${NGINX_SITE}
-  ${NGINX_SITE_ENABLED}
-  ${SUBSCRIPTION_ROOT} (static tokenized client profiles)
-  /etc/letsencrypt/* for ${plan_domain}
-  /etc/apt/apt.conf.d/52-vpn-unattended-upgrades
-  ${SAGERNET_KEY_FILE}
-  ${SAGERNET_SOURCE_FILE}
-  /etc/modules-load.d/90-vpn-bbr.conf (only if supported)
-  /etc/sysctl.d/90-vpn-network.conf (only if BBR is supported)
-  ${UDP_SYSCTL_FILE} (7 MiB floor; higher existing ceilings are retained)
-  /etc/fstab and /swapfile (only if swap is absent)
-  /home/${plan_admin}/.ssh/authorized_keys
-  /etc/sudoers.d/90-${plan_admin}
-  ${AUTO_FINALIZE_SSH_DROPIN} (removed after the first successful admin login)
-  ${AUTO_FINALIZE_WRAPPER} (removed after the first successful admin login)
-  ${INSTALLED_HELPER}
-  ${SETTINGS_FILE}
-  ${CLIENTS_FILE} (root-only client database)
-  ${INSTALL_COMPLETE_FILE}
-  ${RUNTIME_VERSION_FILE}
-
-Files changed only by lockdown-ssh:
-  ${SSH_DROPIN}
-
-Secret handling:
-  Each client receives an independent VLESS UUID, Hysteria2 password, and
-  256-bit subscription bearer token. Shared REALITY credentials are generated
-  locally on the VPS. Private material is shown only by
-  an explicit "sudo vpn show NAME" command. nginx cannot list directories or
-  write subscription files, and access logging is disabled.
-
-Safety gates:
-  * install refuses unreviewed OS releases, non-amd64 hosts, non-systemd boots,
-    insufficient memory/disk, implausible system time, and read-only paths;
-  * DNS must resolve the requested TLS domain to the requested VPS IPv4;
-  * occupied TCP/443, UDP/443, or TCP/${SUBSCRIPTION_PORT} aborts installation
-    unless owned by the expected managed service;
-  * an unknown non-empty nftables ruleset aborts installation;
-  * configs are validated before replacement;
-  * interrupted installs save their validated settings and can be resumed by
-    running the same install command again;
-  * existing accounts, packages, certificates, secrets, and client databases
-    are verified and reused instead of being recreated;
-  * each installation attempt writes a detailed root-only log with the failed
-    step, exit code, command, source location, and shell call stack;
-  * firewall automatically rolls back after five minutes unless a successful
-    interactive login with the new administrator key finalizes the setup;
-  * the first administrator login verifies the live policy and SSH listener,
-    confirms firewall persistence, applies key-only SSH hardening, removes its
-    temporary ForceCommand, and then opens the normal login shell.
+The installer validates the host, DNS, target, ports, certificates and
+generated configuration. Existing valid state is reused on a repeated run.
+No web panel, Docker, telemetry, statistics or access logging is installed.
 EOF
 }
 
@@ -1207,7 +1119,7 @@ install_sing_box() {
   installed_version="$(dpkg-query -W -f='${Version}' sing-box 2>/dev/null || true)"
   [[ "$installed_version" == "$candidate" ]] || die "Unexpected installed sing-box version: ${installed_version:-missing}"
   apt-mark hold sing-box >/dev/null
-  log "Installed and held stable sing-box ${installed_version}; use 'sudo vpn update' for reviewed updates."
+  log "Installed and held stable sing-box ${installed_version}; use 'vpn update' for reviewed updates."
 }
 
 create_admin_account() {
@@ -2547,7 +2459,7 @@ set_client_fingerprint() {
   finish_mutation_commit
   log "Client fingerprint changed transactionally: ${old_fingerprint} -> ${CLIENT_FINGERPRINT}."
   printf 'Subscription URLs are unchanged. Refresh the subscription on each device.\n'
-  printf 'If REALITY still fails, run "sudo vpn diagnostic" before changing other settings.\n'
+  printf 'If REALITY still fails, run "vpn health --verbose" before changing other settings.\n'
 }
 
 restore_hy2_obfs_transaction() {
@@ -2665,6 +2577,7 @@ install_helper() {
   }
   mv -f -- "${INSTALLED_HELPER}.new" "$INSTALLED_HELPER"
   [[ "$(installed_helper_version)" == "$SCRIPT_VERSION" ]] || die 'Installed management helper reports an unexpected version.'
+  install_user_command_wrapper
 
   if [[ -n "$backup" ]]; then
     find "$INSTALLER_BACKUP_DIR" -maxdepth 1 -type f -name 'vpn-*' -printf '%T@ %p\n' \
@@ -2673,6 +2586,39 @@ install_helper() {
         done
   fi
   LAST_HELPER_BACKUP="$backup"
+}
+
+render_user_command_wrapper() {
+  local output="$1"
+  cat >"$output" <<'EOF'
+#!/bin/sh
+set -eu
+
+helper=/usr/local/sbin/vpn
+if [ "$(id -u)" -eq 0 ]; then
+  exec "$helper" "$@"
+fi
+
+if ! command -v sudo >/dev/null 2>&1; then
+  printf 'vpn: sudo is unavailable\n' >&2
+  exit 1
+fi
+
+exec sudo -n "$helper" "$@"
+EOF
+}
+
+install_user_command_wrapper() {
+  TMP_DIR="${TMP_DIR:-$(mktemp -d)}"
+  render_user_command_wrapper "${TMP_DIR}/vpn-command"
+  sh -n "${TMP_DIR}/vpn-command"
+  install -d -o root -g root -m 0755 "$(dirname "$USER_COMMAND")"
+  if [[ -e "$USER_COMMAND" ]]; then
+    [[ -f "$USER_COMMAND" && ! -L "$USER_COMMAND" ]] || \
+      die "Refusing to replace unexpected command path: $USER_COMMAND"
+  fi
+  install -o root -g root -m 0755 "${TMP_DIR}/vpn-command" "${USER_COMMAND}.new"
+  mv -f -- "${USER_COMMAND}.new" "$USER_COMMAND"
 }
 
 restore_installed_helper() {
@@ -2934,30 +2880,6 @@ confirm_firewall() {
   log 'Firewall persistence confirmed; automatic rollback cancelled.'
 }
 
-first_login_ssh_rc_path() {
-  printf '/home/%s/.ssh/%s\n' "$ADMIN_USER" "$FIRST_LOGIN_SSH_RC_NAME"
-}
-
-first_login_ssh_rc_original_path() {
-  printf '/home/%s/.ssh/%s\n' "$ADMIN_USER" "$FIRST_LOGIN_SSH_RC_ORIGINAL_NAME"
-}
-
-restore_first_login_hook() {
-  local rc_path original_path
-  rc_path="$(first_login_ssh_rc_path)"
-  original_path="$(first_login_ssh_rc_original_path)"
-  rm -f -- "$LEGACY_FIRST_LOGIN_HOOK"
-
-  if [[ -e "$rc_path" ]] && ! grep -Fq '# Managed by vpn-setup first-login finalization.' "$rc_path" 2>/dev/null; then
-    warn "Administrator SSH rc changed while finalization was pending; leaving it and the preserved original untouched."
-    return
-  fi
-  rm -f -- "$rc_path"
-  if [[ -f "$original_path" && ! -L "$original_path" ]]; then
-    mv -- "$original_path" "$rc_path"
-  fi
-}
-
 render_auto_finalize_wrapper() {
   local candidate="$1"
   cat >"$candidate" <<EOF
@@ -2971,7 +2893,7 @@ if [ -n "\${SSH_ORIGINAL_COMMAND:-}" ]; then
 fi
 
 if ! /usr/bin/sudo -n "${INSTALLED_HELPER}" finalize --yes; then
-  printf '%s\n' 'Automatic VPN security finalization failed. This login remains available for diagnostics.' >&2
+  printf '%s\n' 'Automatic VPN security finalization failed. This login remains available for health checks.' >&2
 fi
 
 login_shell="\${SHELL:-/bin/bash}"
@@ -3171,7 +3093,6 @@ finalize_installation() {
   # finalization idempotent and proves the effective sshd policy before reload.
   lockdown_ssh
   remove_auto_finalization
-  restore_first_login_hook
   log 'VPN server setup finalized: firewall persistent and SSH key-only.'
   printf '%s\n' 'One-time security setup complete. Future SSH logins require the configured key.'
   printf '%s\n' 'No further setup command or reconnect is required.'
@@ -3235,7 +3156,7 @@ update_sing_box() {
   log "sing-box updated successfully: ${installed} -> ${candidate}."
 }
 
-redact_diagnostic_stream() {
+redact_health_stream() {
   sed -E \
     -e 's#(vless|hysteria2)://[^[:space:]]+#\1://[REDACTED]#g' \
     -e 's/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/[UUID-REDACTED]/g' \
@@ -3254,7 +3175,7 @@ Subscription-enforced fragmentation: disabled (client syntax is not portable)
 
 Leave fragmentation disabled while REALITY works. If Hysteria2 works but
 REALITY repeatedly times out on one network, first test another supported TLS
-fingerprint with "sudo vpn set-fingerprint" and refresh the subscription.
+fingerprint with "vpn set-fingerprint" and refresh the subscription.
 Only then, in one affected client, temporarily test TLS-record/TLSHello
 fragmentation if that client explicitly supports it. Do not enable ordinary
 packet fragmentation globally: it can increase latency, battery use, and
@@ -3263,7 +3184,7 @@ Record the client name/version, access network, and result before keeping it.
 EOF
 }
 
-diagnostic_report() {
+health_details() {
   local config_result dns_one dns_two cert_status target_status service_status
   local timer_enabled timer_active hook_status renewal_status sync_status keypair_status
   local health_status=0 default_interface link_stats
@@ -3271,7 +3192,7 @@ diagnostic_report() {
   printf '### Health summary\n'
   health_check || health_status=$?
   printf '\n'
-  printf 'VPN diagnostic report (share-safe)\n'
+  printf 'VPN health details (share-safe)\n'
   printf 'Generated: %s\n' "$(date --iso-8601=seconds)"
   printf 'Installer: %s\n\n' "$SCRIPT_VERSION"
   printf 'Managed runtime release: %s\n\n' "$(cat "$RUNTIME_VERSION_FILE" 2>/dev/null || printf missing)"
@@ -3298,7 +3219,7 @@ diagnostic_report() {
   if config_result="$(sing-box check -c "$CONFIG_FILE" 2>&1)"; then
     printf 'Config validation: PASS\n'
   else
-    printf 'Config validation: FAIL\n%s\n' "$config_result" | redact_diagnostic_stream
+    printf 'Config validation: FAIL\n%s\n' "$config_result" | redact_health_stream
   fi
   jq -r '.inbounds[] | "Inbound: \(.type) tag=\(.tag) port=\(.listen_port) users=\(.users | length)"' \
     "$CONFIG_FILE" 2>/dev/null || true
@@ -3321,7 +3242,7 @@ diagnostic_report() {
   printf 'REALITY target TLS reachability: %s\n' "$target_status"
   printf 'Listeners (addresses redacted):\n'
   ss -H -lntup 2>/dev/null | awk -v ssh_port="$SSH_PORT" -v subscription_port="$SUBSCRIPTION_PORT" \
-    '$5 ~ (":" ssh_port "$") || $5 ~ (":" subscription_port "$") || $5 ~ /:(80|443)$/ {print}' | redact_diagnostic_stream
+    '$5 ~ (":" ssh_port "$") || $5 ~ (":" subscription_port "$") || $5 ~ /:(80|443)$/ {print}' | redact_health_stream
   printf 'UDP receive ceiling: %s\n' "$(sysctl -n net.core.rmem_max 2>/dev/null || printf unknown)"
   printf 'UDP send ceiling: %s\n' "$(sysctl -n net.core.wmem_max 2>/dev/null || printf unknown)"
   default_interface="$(ip -4 route show default 2>/dev/null | awk '
@@ -3415,7 +3336,7 @@ diagnostic_report() {
 
   printf '\n### Recent sing-box warnings/errors (redacted)\n'
   journalctl -u sing-box.service --since '-30 minutes' -p warning..alert -n 80 \
-    --no-pager --output=short-iso 2>/dev/null | redact_diagnostic_stream || true
+    --no-pager --output=short-iso 2>/dev/null | redact_health_stream || true
   printf '\nSecrets, client UUIDs, connection URIs, and IP addresses are redacted. Review before sharing.\n'
   return "$health_status"
 }
@@ -3446,203 +3367,98 @@ ssh_lockdown_is_effective() {
 }
 
 health_check() {
-  local failures=0 dns_one dns_two
+  local failures=0 dns_one dns_two core_state=OK protocol_state=OK
+  local subscription_state=OK tls_state=OK security_state=OK target_state=OK
+  local core_version client_count
+  local -a problems=()
 
   require_root
-  printf 'VPN health check (read-only)\n'
-  printf 'Generated: %s\n' "$(date --iso-8601=seconds)"
-  printf 'INFO  client REALITY fingerprint: %s\n' "$CLIENT_FINGERPRINT"
-  printf 'INFO  Hysteria2 obfuscation: %s\n' "$HY2_OBFS_MODE"
+  core_version="$(dpkg-query -W -f='${Version}' sing-box 2>/dev/null || printf missing)"
+  client_count="$(jq -r '.clients | length' "$CLIENTS_FILE" 2>/dev/null || printf unknown)"
 
-  if [[ "$(cat "$RUNTIME_VERSION_FILE" 2>/dev/null || true)" == "$SCRIPT_VERSION" ]]; then
-    printf 'PASS  managed runtime and subscriptions match installer %s\n' "$SCRIPT_VERSION"
-  else
-    printf 'FAIL  managed runtime migration marker is missing or stale\n'
+  if [[ "$(cat "$RUNTIME_VERSION_FILE" 2>/dev/null || true)" != "$SCRIPT_VERSION" ]] ||
+     ! systemctl is-active --quiet sing-box.service ||
+     ! sing-box check -c "$CONFIG_FILE" >/dev/null 2>&1; then
+    core_state=FAIL
     (( failures += 1 ))
+    problems+=('sing-box service, configuration or managed version is unhealthy')
   fi
 
-  if systemctl is-active --quiet sing-box.service; then
-    printf 'PASS  sing-box service is active\n'
-  else
-    printf 'FAIL  sing-box service is not active\n'
-    (( failures += 1 ))
-  fi
-
-  if sing-box check -c "$CONFIG_FILE" >/dev/null 2>&1; then
-    printf 'PASS  sing-box configuration is valid\n'
-  else
-    printf 'FAIL  sing-box configuration is invalid\n'
-    (( failures += 1 ))
-  fi
-
-  if jq -e '
+  if ! jq -e '
       any(.inbounds[];
         .type == "vless" and .listen_port == 443 and
         .tls.enabled == true and .tls.reality.enabled == true and
-        ((.users | length) > 0))' "$CONFIG_FILE" >/dev/null 2>&1 &&
-     ss -H -lntp 2>/dev/null |
-       awk '$4 ~ /:443$/ && $0 ~ /sing-box/ { found=1 } END { exit !found }'; then
-    printf 'PASS  VLESS/REALITY is configured and owns TCP/443\n'
-  else
-    printf 'FAIL  VLESS/REALITY configuration or TCP/443 listener is unhealthy\n'
-    (( failures += 1 ))
-  fi
-
-  if subscription_service_healthy; then
-    printf 'PASS  HTTPS subscription returns URI and Mihomo profiles\n'
-  else
-    printf 'FAIL  HTTPS subscription service or generated profiles are unhealthy\n'
-    (( failures += 1 ))
-  fi
-
-  if jq -e '
+        ((.users | length) > 0))' "$CONFIG_FILE" >/dev/null 2>&1 ||
+     ! ss -H -lntp 2>/dev/null |
+       awk '$4 ~ /:443$/ && $0 ~ /sing-box/ { found=1 } END { exit !found }' ||
+     ! jq -e '
       any(.inbounds[];
         .type == "hysteria2" and .listen_port == 443 and
         .tls.enabled == true and ((.users | length) > 0))' \
-      "$CONFIG_FILE" >/dev/null 2>&1 &&
-     ss -H -lnup 2>/dev/null |
+       "$CONFIG_FILE" >/dev/null 2>&1 ||
+     ! ss -H -lnup 2>/dev/null |
        awk '$4 ~ /:443$/ && $0 ~ /sing-box/ { found=1 } END { exit !found }'; then
-    printf 'PASS  Hysteria2 is configured and owns UDP/443\n'
-  else
-    printf 'FAIL  Hysteria2 configuration or UDP/443 listener is unhealthy\n'
+    protocol_state=FAIL
     (( failures += 1 ))
+    problems+=('one or both VPN listeners on TCP/443 and UDP/443 are unhealthy')
+  fi
+
+  if ! subscription_service_healthy; then
+    subscription_state=FAIL
+    (( failures += 1 ))
+    problems+=('the private subscription service is unhealthy')
   fi
 
   dns_one="$(dig +short A "$TLS_DOMAIN" @1.1.1.1 2>/dev/null | sed '/^$/d' || true)"
   dns_two="$(dig +short A "$TLS_DOMAIN" @8.8.8.8 2>/dev/null | sed '/^$/d' || true)"
-  if grep -Fxq "$SERVER_IPV4" <<<"$dns_one" && grep -Fxq "$SERVER_IPV4" <<<"$dns_two"; then
-    printf 'PASS  public DNS resolvers return the configured IPv4\n'
-  else
-    printf 'FAIL  public DNS resolvers do not consistently return the configured IPv4\n'
+  if ! grep -Fxq "$SERVER_IPV4" <<<"$dns_one" ||
+     ! grep -Fxq "$SERVER_IPV4" <<<"$dns_two" ||
+     [[ ! -r "${CERT_DIR}/fullchain.pem" ]] ||
+     ! openssl x509 -in "${CERT_DIR}/fullchain.pem" -noout -checkend 604800 >/dev/null 2>&1 ||
+     ! certificate_key_pair_matches "${CERT_DIR}/fullchain.pem" "${CERT_DIR}/privkey.pem" ||
+     ! systemctl is-enabled --quiet certbot.timer 2>/dev/null ||
+     ! systemctl is-active --quiet certbot.timer 2>/dev/null ||
+     [[ ! -x "$CERT_HOOK" ]] ||
+     ! sh -n "$CERT_HOOK" >/dev/null 2>&1; then
+    tls_state=FAIL
     (( failures += 1 ))
+    problems+=('DNS, TLS certificate or automatic renewal is unhealthy')
   fi
 
-  if [[ -r "${CERT_DIR}/fullchain.pem" ]] &&
-     openssl x509 -in "${CERT_DIR}/fullchain.pem" -noout -checkend 604800 >/dev/null 2>&1 &&
-     certificate_key_pair_matches "${CERT_DIR}/fullchain.pem" "${CERT_DIR}/privkey.pem"; then
-    printf 'PASS  TLS certificate is valid for more than seven days and matches its key\n'
-  else
-    printf 'FAIL  TLS certificate is missing, mismatched, expired, or expires within seven days\n'
-    (( failures += 1 ))
-  fi
-
-  if systemctl is-enabled --quiet certbot.timer 2>/dev/null &&
-     systemctl is-active --quiet certbot.timer 2>/dev/null &&
-     [[ -x "$CERT_HOOK" ]] && sh -n "$CERT_HOOK" >/dev/null 2>&1; then
-    printf 'PASS  certificate renewal timer and deploy hook are ready\n'
-  else
-    printf 'FAIL  certificate renewal timer or deploy hook is unhealthy\n'
-    (( failures += 1 ))
-  fi
-
-  if timeout 15 openssl s_client -connect "${REALITY_TARGET}:443" \
+  if ! timeout 15 openssl s_client -connect "${REALITY_TARGET}:443" \
       -servername "$REALITY_TARGET" -tls1_3 -alpn h2 -verify_return_error \
       </dev/null >/dev/null 2>&1; then
-    printf 'PASS  REALITY target is reachable with verified TLS 1.3 and h2\n'
-  else
-    printf 'FAIL  REALITY target TLS probe failed\n'
+    target_state=FAIL
     (( failures += 1 ))
+    problems+=('the REALITY target failed its TLS 1.3/h2 probe')
   fi
 
-  if managed_firewall_is_healthy; then
-    printf 'PASS  nftables is confirmed, persistent, active, and permits all managed ports\n'
-  else
-    printf 'FAIL  nftables confirmation, persistence, service state, or a managed rule is missing\n'
+  if ! managed_firewall_is_healthy || ! ssh_lockdown_is_effective; then
+    security_state=FAIL
     (( failures += 1 ))
+    problems+=('nftables persistence or SSH key-only lockdown is unhealthy')
   fi
 
-  if ssh_lockdown_is_effective; then
-    printf 'PASS  SSH key-only lockdown is installed and effective\n'
-  else
-    printf 'FAIL  SSH key-only lockdown is absent or ineffective\n'
-    (( failures += 1 ))
-  fi
+  printf 'VPN health\n'
+  printf '  %-14s %-4s %s\n' Core "$core_state" "sing-box ${core_version}"
+  printf '  %-14s %-4s %s\n' Protocols "$protocol_state" 'REALITY tcp/443 · Hysteria2 udp/443'
+  printf '  %-14s %-4s %s\n' Subscription "$subscription_state" "${client_count} client(s)"
+  printf '  %-14s %-4s %s\n' DNS/TLS "$tls_state" "$TLS_DOMAIN"
+  printf '  %-14s %-4s %s\n' REALITY "$target_state" "$REALITY_TARGET"
+  printf '  %-14s %-4s %s\n' Security "$security_state" 'nftables · SSH key-only'
+  printf '  %-14s %s\n' Profiles "${CLIENT_FINGERPRINT} · Hysteria2 obfs ${HY2_OBFS_MODE}"
+  printf '  %-14s %s\n' Network \
+    "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || printf unknown) · $(sysctl -n net.core.default_qdisc 2>/dev/null || printf unknown)"
 
   if (( failures == 0 )); then
-    printf 'RESULT: HEALTHY\n'
+    printf '\nResult: HEALTHY\n'
     return 0
   fi
-  printf 'RESULT: UNHEALTHY (%d failed checks)\n' "$failures"
-  return 1
-}
 
-show_status() {
-  local configured_target="unknown" timer_enabled timer_active
-  require_root
-  if [[ -r "$CONFIG_FILE" ]]; then
-    configured_target="$(jq -r \
-      '[.inbounds[] | select(.tag == "vless-reality-in") | .tls.reality.handshake.server][0] // "unknown"' \
-      "$CONFIG_FILE" 2>/dev/null || printf unknown)"
-  fi
-  printf 'VPN setup version: %s\n' "$SCRIPT_VERSION"
-  printf 'Managed runtime version: %s\n' "$(cat "$RUNTIME_VERSION_FILE" 2>/dev/null || printf missing)"
-  printf 'sing-box package: '
-  dpkg-query -W -f='${Version}\n' sing-box 2>/dev/null || printf 'not installed\n'
-  printf 'sing-box APT hold: '
-  if apt-mark showhold 2>/dev/null | grep -Fxq sing-box; then
-    printf 'active (use vpn update)\n'
-  else
-    printf 'missing\n'
-  fi
-  printf 'sing-box service: '
-  systemctl is-active sing-box.service 2>/dev/null || true
-  printf 'subscription service: '
-  systemctl is-active nginx.service 2>/dev/null || true
-  printf 'nftables persistent: '
-  if [[ -f "${STATE_DIR}/firewall.confirmed" ]]; then
-    printf 'confirmed\n'
-  else
-    printf 'not confirmed\n'
-  fi
-  printf 'Automatic security finalization: '
-  if [[ -f "$AUTO_FINALIZE_SSH_DROPIN" && -x "$AUTO_FINALIZE_WRAPPER" ]]; then
-    printf 'armed for first interactive admin login\n'
-  elif [[ -f "${STATE_DIR}/firewall.confirmed" ]] && ssh_lockdown_is_effective; then
-    printf 'complete\n'
-  else
-    printf 'not armed or incomplete\n'
-  fi
-  printf 'SSH lockdown: '
-  ssh_lockdown_is_effective && printf 'installed and effective\n' || printf 'not installed or ineffective\n'
-  printf 'REALITY target: %s\n' "$configured_target"
-  printf 'Client fingerprint: %s\n' "$CLIENT_FINGERPRINT"
-  printf 'Hysteria2 obfuscation: %s\n' "$HY2_OBFS_MODE"
-  printf 'Profile labels: %s Reality / %s Hysteria2\n' "$COUNTRY_EMOJI" "$COUNTRY_EMOJI"
-  printf 'TCP congestion control: %s\n' "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || printf unknown)"
-  printf 'Default qdisc: %s\n' "$(sysctl -n net.core.default_qdisc 2>/dev/null || printf unknown)"
-  printf 'UDP receive ceiling: %s\n' "$(sysctl -n net.core.rmem_max 2>/dev/null || printf unknown)"
-  printf 'UDP send ceiling: %s\n' "$(sysctl -n net.core.wmem_max 2>/dev/null || printf unknown)"
-  timer_enabled="$(systemctl is-enabled certbot.timer 2>/dev/null || true)"
-  timer_active="$(systemctl is-active certbot.timer 2>/dev/null || true)"
-  printf 'Certbot timer: %s / %s\n' "${timer_enabled:-unknown}" "${timer_active:-unknown}"
-  printf 'Active qdisc(s):\n'
-  tc qdisc show 2>/dev/null || true
-  printf 'Swap:\n'
-  swapon --show || true
-  printf 'Journal disk usage:\n'
-  journalctl --disk-usage 2>/dev/null || true
-  printf 'Failed systemd units:\n'
-  if ! systemctl --failed --no-pager --no-legend; then
-    warn 'systemctl could not query failed units.'
-  fi
-  printf 'Running systemd services:\n'
-  if ! systemctl list-units --type=service --state=running --no-pager --no-legend; then
-    warn 'systemctl could not query running services.'
-  fi
-  printf 'Listeners on SSH/80/443/%s:\n' "$SUBSCRIPTION_PORT"
-  ss -H -lntup | awk -v ssh_port="$SSH_PORT" -v subscription_port="$SUBSCRIPTION_PORT" \
-    '$5 ~ (":" ssh_port "$") || $5 ~ (":" subscription_port "$") || $5 ~ /:(80|443)$/ {print}' || true
-  printf 'DNS A record:\n'
-  dig +short A "$TLS_DOMAIN" @1.1.1.1 || true
-  if command -v sing-box >/dev/null 2>&1 && [[ -r "$CONFIG_FILE" ]]; then
-    sing-box check -c "$CONFIG_FILE"
-  fi
-  printf 'VPN clients: '
-  if [[ -r "$CLIENTS_FILE" ]]; then
-    jq '.clients | length' "$CLIENTS_FILE"
-  else
-    printf 'database unavailable\n'
-  fi
+  printf '\nProblems:\n'
+  printf '  - %s\n' "${problems[@]}"
+  printf 'Result: UNHEALTHY (%d)\n' "$failures"
+  return 1
 }
 
 write_install_completion_marker() {
@@ -3680,7 +3496,6 @@ restore_upgrade_file() {
 }
 
 prepare_upgrade_transaction() {
-  local rc_path original_path
   UPGRADE_BACKUP_DIR="$(mktemp -d)"
   chmod 0700 "$UPGRADE_BACKUP_DIR"
   UPGRADE_ORIGINAL_RMEM="$(sysctl -n net.core.rmem_max)"
@@ -3688,11 +3503,7 @@ prepare_upgrade_transaction() {
   backup_upgrade_file "$UDP_SYSCTL_FILE" udp-sysctl 0644
   backup_upgrade_file "$CERT_HOOK" certificate-hook 0750
   backup_upgrade_file "$INSTALLED_HELPER" vpn-helper 0750
-  backup_upgrade_file "$LEGACY_FIRST_LOGIN_HOOK" legacy-first-login-hook 0644
-  rc_path="$(first_login_ssh_rc_path)"
-  original_path="$(first_login_ssh_rc_original_path)"
-  backup_upgrade_file "$rc_path" first-login-ssh-rc 0600
-  backup_upgrade_file "$original_path" first-login-ssh-rc-original 0600
+  backup_upgrade_file "$USER_COMMAND" vpn-command 0755
   backup_upgrade_file "$INSTALL_COMPLETE_FILE" completion-marker 0600
   backup_upgrade_file "$RUNTIME_VERSION_FILE" runtime-version-marker 0600
   UPGRADE_ROLLBACK_FAILED=0
@@ -3700,19 +3511,14 @@ prepare_upgrade_transaction() {
 }
 
 rollback_upgrade_transaction() {
-  local restore_failed=0 admin_group rc_path original_path
+  local restore_failed=0
   (( UPGRADE_ROLLBACK_ACTIVE == 1 )) || return 0
   printf '[WARN] Overlay update did not complete; restoring its previous managed files and runtime UDP ceilings.\n' >&2
   set +e
   restore_upgrade_file "$UDP_SYSCTL_FILE" udp-sysctl root root 0644 || restore_failed=1
   restore_upgrade_file "$CERT_HOOK" certificate-hook root root 0750 || restore_failed=1
   restore_upgrade_file "$INSTALLED_HELPER" vpn-helper root root 0750 || restore_failed=1
-  restore_upgrade_file "$LEGACY_FIRST_LOGIN_HOOK" legacy-first-login-hook root root 0644 || restore_failed=1
-  admin_group="$(id -gn "$ADMIN_USER" 2>/dev/null || printf '%s' "$ADMIN_USER")"
-  rc_path="$(first_login_ssh_rc_path)"
-  original_path="$(first_login_ssh_rc_original_path)"
-  restore_upgrade_file "$rc_path" first-login-ssh-rc "$ADMIN_USER" "$admin_group" 0600 || restore_failed=1
-  restore_upgrade_file "$original_path" first-login-ssh-rc-original "$ADMIN_USER" "$admin_group" 0600 || restore_failed=1
+  restore_upgrade_file "$USER_COMMAND" vpn-command root root 0755 || restore_failed=1
   restore_upgrade_file "$INSTALL_COMPLETE_FILE" completion-marker root root 0600 || restore_failed=1
   restore_upgrade_file "$RUNTIME_VERSION_FILE" runtime-version-marker root root 0600 || restore_failed=1
   if [[ "$UPGRADE_ORIGINAL_RMEM" =~ ^[0-9]+$ ]]; then
@@ -3761,16 +3567,8 @@ upgrade_existing_installation() {
   fi
 
   cat <<EOF
-VPN installer overlay update
-
-  Installed helper: ${current_helper_version}
-  Managed state:    ${current_state_version}
-  Candidate:        ${SCRIPT_VERSION}
-
-The update preserves settings, clients, UUIDs, passwords, REALITY keys,
-certificates, SSH configuration, and firewall policy. It applies only reviewed
-managed migrations, smoke-tests certificate deployment, then atomically replaces
-the vpn helper while retaining the previous helper backup.
+VPN update ${current_state_version} -> ${SCRIPT_VERSION}
+Settings, clients, credentials, certificates, SSH and firewall are preserved.
 EOF
   require_confirmation
 
@@ -3788,12 +3586,10 @@ EOF
   set_step 'management helper atomic replacement'
   install_helper
   helper_backup="$LAST_HELPER_BACKUP"
-  if ! "$INSTALLED_HELPER" status >/dev/null 2>&1; then
+  if ! "$INSTALLED_HELPER" health >/dev/null 2>&1; then
     restore_installed_helper "$helper_backup" || die 'New helper failed its post-install check and automatic helper rollback also failed.'
     die 'New helper failed its post-install check; the previous helper was restored.'
   fi
-  set_step 'obsolete first-login hook cleanup'
-  restore_first_login_hook
   remove_auto_finalization
   set_step 'managed state version marker'
   write_install_completion_marker
@@ -3838,14 +3634,12 @@ run_install() {
     if [[ -f "$INSTALL_COMPLETE_FILE" ]]; then
       warn 'The installation payload is complete, but the firewall is not confirmed; reapplying it and restarting the five-minute rollback window.'
       show_plan
-      require_confirmation
+      require_install_confirmation
       require_command nft
       require_command systemctl
       require_command systemd-run
       set_step 'management helper recovery update'
       install_helper >/dev/null
-      set_step 'obsolete first-login hook cleanup'
-      restore_first_login_hook
       set_step 'automatic first-login security finalization'
       configure_auto_finalization
       set_step 'nftables firewall recovery deployment'
@@ -3864,7 +3658,7 @@ EOF
     collect_install_settings
   fi
   show_plan
-  require_confirmation
+  require_install_confirmation
 
   set_step 'required command availability'
   require_command apt-get
@@ -3929,8 +3723,6 @@ EOF
   smoke_test_certificate_hook
   set_step 'management command installation'
   install_helper >/dev/null
-  set_step 'obsolete first-login hook cleanup'
-  restore_first_login_hook
   set_step 'nftables firewall deployment'
   apply_firewall
   set_step 'installation completion marker'
@@ -3941,21 +3733,15 @@ EOF
 
   cat <<EOF
 
-Installation payload completed.
+Installation complete.
 
-Keep this session open and use a new local terminal to run:
+Keep this terminal open. In a new terminal, log in once:
   ssh -p ${SSH_PORT} ${ADMIN_USER}@${SERVER_IPV4}
 
-The first successful interactive login automatically confirms firewall
-persistence, enables key-only SSH, removes its temporary login rule, and opens
-the normal shell. No command or second login is required. If the five-minute
-safety window has expired, the same login safely reapplies the firewall first.
-
-An independent ${INITIAL_CLIENT_NAME} VPN profile was created. Its credentials
-were NOT printed. Manage profiles from the verified ${ADMIN_USER} session:
-  sudo vpn list
-  sudo vpn show ${INITIAL_CLIENT_NAME}
-  sudo vpn add WorkPC
+That login finalizes the firewall and key-only SSH automatically.
+Then run:
+  vpn health
+  vpn show ${INITIAL_CLIENT_NAME}
 EOF
 }
 
@@ -3987,13 +3773,12 @@ main() {
     self-update)
       self_update_from_file
       ;;
-    diagnostic)
-      if ! diagnostic_report; then
-        exit 1
+    health)
+      if (( VERBOSE == 1 )); then
+        health_details || exit 1
+      else
+        health_check || exit 1
       fi
-      ;;
-    status)
-      show_status
       ;;
     finalize)
       finalize_installation

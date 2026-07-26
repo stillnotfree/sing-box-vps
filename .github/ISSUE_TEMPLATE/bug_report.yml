@@ -12,8 +12,8 @@ body:
     id: version
     attributes:
       label: Installer version
-      description: Run `sudo vpn status` and copy only the version line.
-      placeholder: 1.0.5
+      description: Run `vpn health --verbose` and copy only the installer and runtime version lines.
+      placeholder: 1.0.6
     validations:
       required: true
 
@@ -50,10 +50,10 @@ body:
       required: true
 
   - type: textarea
-    id: diagnostics
+    id: health
     attributes:
-      label: Share-safe diagnostics
-      description: Paste the output of `sudo vpn diagnostic` after reviewing it once more for private data.
+      label: Share-safe health details
+      description: Paste the output of `vpn health --verbose` after reviewing it once more for private data.
       render: shell
 
   - type: checkboxes

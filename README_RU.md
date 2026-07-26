@@ -46,13 +46,13 @@ DNS-запись должна вести прямо на VPS. Не включа�
 Подключитесь к VPS как `root` и выполните:
 
 ```bash
-wget -qO vpn-install.sh https://raw.githubusercontent.com/stillnotfree/sing-box-vps/v1.0.5/install-sing-box-server.sh && chmod 700 vpn-install.sh && ./vpn-install.sh install
+wget -qO vpn-install.sh https://raw.githubusercontent.com/stillnotfree/sing-box-vps/v1.0.6/install-sing-box-server.sh && chmod 700 vpn-install.sh && ./vpn-install.sh install
 ```
 
 Установщик запросит администратора, публичный SSH-ключ, IPv4 сервера, домен,
 почту, текущий SSH-порт, REALITY target, страну VPS и fingerprint клиента.
-Перед изменениями он покажет полный план и попросит ввести `YES`. Прерванную
-установку обычно можно продолжить той же командой.
+Перед изменениями он покажет краткую сводку и спросит `[Y/n]`; достаточно
+нажать Enter. Прерванную установку обычно можно продолжить той же командой.
 
 ## Первый вход
 
@@ -70,7 +70,7 @@ ssh ADMIN_USER@SERVER_IP
 QR-коды:
 
 ```bash
-sudo vpn show default
+vpn show default
 ```
 
 Не публикуйте этот вывод: ссылки содержат данные доступа клиента.
@@ -79,19 +79,22 @@ sudo vpn show default
 
 | Действие | Команда |
 | --- | --- |
-| Состояние сервера | `sudo vpn status` |
-| Безопасная для публикации диагностика | `sudo vpn diagnostic` |
-| Проверка совместимости | `sudo vpn check` |
-| Список клиентов | `sudo vpn list` |
-| Ссылки и QR-коды клиента | `sudo vpn show NAME` |
-| Добавить независимого клиента | `sudo vpn add NAME` |
-| Отозвать клиента | `sudo vpn delete NAME --yes` |
-| Безопасно обновить sing-box | `sudo vpn update` |
-| Сменить REALITY target | `sudo vpn set-target DOMAIN` |
-| Выбрать fingerprint | `sudo vpn set-fingerprint` |
-| Нативный Hysteria2/QUIC | `sudo vpn set-obfs off` |
-| Включить Salamander | `sudo vpn set-obfs salamander` |
-| Встроенная справка | `sudo vpn help` |
+| Проверить состояние сервера | `vpn health` |
+| Показать подробный безопасный отчёт | `vpn health --verbose` |
+| Проверить совместимость установки | `vpn check` |
+| Показать клиентов | `vpn list` |
+| Показать ссылки и QR-коды | `vpn show NAME` |
+| Добавить независимого клиента | `vpn add NAME` |
+| Отозвать клиента | `vpn delete NAME --yes` |
+| Безопасно обновить sing-box | `vpn update` |
+| Сменить REALITY target | `vpn set-target DOMAIN` |
+| Выбрать fingerprint | `vpn set-fingerprint` |
+| Включить нативный Hysteria2/QUIC | `vpn set-obfs off` |
+| Включить Salamander | `vpn set-obfs salamander` |
+| Показать справку | `vpn help` |
+
+Установленная команда `vpn` сама получает необходимые административные права,
+поэтому добавлять `sudo` перед ней не нужно.
 
 Изменения target, fingerprint, обфускации, клиентов и sing-box проверяются и
 применяются транзакционно. Адреса подписок не меняются, но после изменения
@@ -104,8 +107,8 @@ sudo vpn show default
 ```bash
 sudo apt update
 sudo apt upgrade
-sudo vpn update
-sudo vpn status
+vpn update
+vpn health
 ```
 
 Обновления безопасности ОС устанавливаются автоматически без автоматической
@@ -153,11 +156,11 @@ Mihomo в зависимости от `User-Agent`; формат Mihomo такж
 команды только по прямому указанию диагностики:
 
 ```bash
-sudo vpn finalize --yes
-sudo vpn confirm-firewall --yes
-sudo vpn rollback-firewall --yes
-sudo vpn lockdown-ssh --yes
-sudo vpn self-update /root/install-sing-box-server.sh
+vpn finalize --yes
+vpn confirm-firewall --yes
+vpn rollback-firewall --yes
+vpn lockdown-ssh --yes
+vpn self-update /root/install-sing-box-server.sh
 ```
 
 </details>
