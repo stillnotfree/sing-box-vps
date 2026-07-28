@@ -12,7 +12,7 @@ update, and manage without a web panel.
 
 ## Features
 
-- Installs the latest stable sing-box from its official signed repository.
+- Installs the latest compatible stable sing-box from its official signed repository.
 - Runs VLESS + REALITY + Vision on TCP/443 and Hysteria2 + TLS on UDP/443.
 - No web panel, Docker, statistics, telemetry, or access logging.
 
@@ -48,7 +48,7 @@ for it, and do not add an `AAAA` record unless IPv6 is deliberately configured.
 Connect to the VPS as `root` and run:
 
 ```bash
-wget -qO vpn-install.sh https://raw.githubusercontent.com/stillnotfree/sing-box-vps/v1.0.6/install-sing-box-server.sh && chmod 700 vpn-install.sh && ./vpn-install.sh install
+wget -qO vpn-install.sh https://raw.githubusercontent.com/stillnotfree/sing-box-vps/v1.0.7/install-sing-box-server.sh && chmod 700 vpn-install.sh && ./vpn-install.sh install
 ```
 
 The installer asks for the administrator, public SSH key, VPS address, domain,
@@ -84,7 +84,7 @@ Do not share this output: the links contain client credentials.
 | Task | Command |
 | --- | --- |
 | Check server health | `vpn health` |
-| Show detailed share-safe health data | `vpn health --verbose` |
+| Show detailed redacted health data | `vpn health --verbose` |
 | Check installation compatibility | `vpn check` |
 | List clients | `vpn list` |
 | Show links and QR codes | `vpn show NAME` |
@@ -123,7 +123,7 @@ configuration and can restore the cached previous package if startup fails.
 
 | Component | Configuration |
 | --- | --- |
-| Core | Stable sing-box from the signed SagerNet repository |
+| Core | Compatible stable sing-box from the signed SagerNet repository |
 | Primary | VLESS + REALITY + Vision on TCP/443 |
 | Reserve | Hysteria2 + TLS on UDP/443; native QUIC by default, optional Salamander |
 | Clients | Independent credentials, HTTPS subscription, links, and QR codes |
@@ -131,7 +131,7 @@ configuration and can restore the cached previous package if startup fails.
 | Firewall | Native nftables with a temporary automatic rollback window |
 | TLS | Let's Encrypt certificate with tested automatic renewal |
 | Network | BBR + `fq` when supported and conservative UDP buffer ceilings |
-| Storage | 1 GiB swap when absent and a 200 MiB / 30-day journal limit |
+| Storage | 1 GiB swap when supported and absent, plus a 200 MiB / 30-day journal limit |
 | Updates | Automatic OS security updates and transactional sing-box updates |
 
 ## Subscriptions
@@ -148,6 +148,7 @@ the subscription threat model.
 
 - No protocol, REALITY target, or fingerprint is guaranteed to bypass every network filter.
 - Hysteria2 requires usable UDP and may be degraded by some networks.
+- The installer deliberately accepts only the tested sing-box 1.13 release line.
 - IPv6 profiles, CDN transports, port hopping, panels, and traffic statistics are not configured.
 - Client routing and TLS fragmentation are not forced by the server.
 - Test both transports on the actual Wi-Fi and mobile networks where they will be used.

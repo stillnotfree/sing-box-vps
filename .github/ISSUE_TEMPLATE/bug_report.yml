@@ -13,7 +13,7 @@ body:
     attributes:
       label: Installer version
       description: Run `vpn health --verbose` and copy only the installer and runtime version lines.
-      placeholder: 1.0.6
+      placeholder: 1.0.7
     validations:
       required: true
 
@@ -52,8 +52,8 @@ body:
   - type: textarea
     id: health
     attributes:
-      label: Share-safe health details
-      description: Paste the output of `vpn health --verbose` after reviewing it once more for private data.
+      label: Redacted health details
+      description: Paste the output of `vpn health --verbose` only after reviewing it for private data.
       render: shell
 
   - type: checkboxes

@@ -9,9 +9,17 @@ repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck disable=SC1091
 source "${repo_root}/install-sing-box-server.sh"
 
-[[ "$SCRIPT_VERSION" == "1.0.6" ]]
+[[ "$SCRIPT_VERSION" == "1.0.7" ]]
+[[ "$SING_BOX_MIN_VERSION" == "1.13.0" ]]
+[[ "$SING_BOX_MAX_EXCLUSIVE" == "1.14.0" ]]
 (( ${#SUPPORTED_CLIENT_FINGERPRINTS[@]} == 9 ))
 (( ${#SUPPORTED_HY2_OBFS_MODES[@]} == 2 ))
+
+validate_emoji "🇩🇪"
+if (validate_emoji $'\033[31m' >/dev/null 2>&1); then
+  printf 'Terminal control characters unexpectedly passed emoji validation.\n' >&2
+  exit 1
+fi
 
 parse_args set-fingerprint firefox --yes
 [[ "$COMMAND" == "set-fingerprint" ]]
@@ -173,9 +181,23 @@ configure_auto_body="$(declare -f configure_auto_finalization)"
 grep -Fq '/usr/sbin/sshd -t' <<<"$configure_auto_body"
 grep -Fq '/usr/sbin/sshd -T -C' <<<"$configure_auto_body"
 grep -Fq 'forcecommand ${AUTO_FINALIZE_WRAPPER}' <<<"$configure_auto_body"
-grep -Fq 'systemctl reload ssh.service' <<<"$configure_auto_body"
+grep -Fq 'reload_ssh_runtime' <<<"$configure_auto_body"
 create_admin_body="$(declare -f create_admin_account)"
 grep -Fq 'sudo -u "$ADMIN_USER" sudo -n /bin/true' <<<"$create_admin_body"
+grep -Fq 'path_has_symlink_component "$user_home"' <<<"$create_admin_body"
+lockdown_body="$(declare -f lockdown_ssh)"
+grep -Fq 'getent passwd "$ADMIN_USER"' <<<"$lockdown_body"
+if grep -Fq '/home/${ADMIN_USER}' <<<"$lockdown_body"; then
+  printf 'SSH lockdown still assumes that every account lives under /home.\n' >&2
+  exit 1
+fi
+
+temp_dir_body="$(declare -f new_temp_dir)"
+grep -Fq 'TMP_DIR="$(mktemp -d "${TEMP_ROOT}/operation.XXXXXX")"' <<<"$temp_dir_body"
+if grep -Fq '${ROLLBACK_DIR}/config.before.json' "${repo_root}/install-sing-box-server.sh"; then
+  printf 'Persistent configuration backup still duplicates live VPN secrets.\n' >&2
+  exit 1
+fi
 
 # Firewall confirmation must verify transient unit state instead of trusting a
 # combined `systemctl stop timer service` exit code.  The service is commonly
@@ -205,5 +227,17 @@ fi
 upgrade_body="$(declare -f upgrade_existing_installation)"
 grep -Fq 'reconcile_managed_runtime' <<<"$upgrade_body"
 grep -Fq 'write_runtime_version_marker' <<<"$upgrade_body"
+marker_line="$(grep -n 'write_runtime_version_marker' <<<"$upgrade_body" | head -n1 | cut -d: -f1)"
+health_line="$(grep -n '"$INSTALLED_HELPER" health' <<<"$upgrade_body" | head -n1 | cut -d: -f1)"
+[[ -n "$marker_line" && -n "$health_line" && "$marker_line" -lt "$health_line" ]]
+
+subscription_health_body="$(declare -f subscription_service_healthy)"
+grep -Fq -- '--resolve "${TLS_DOMAIN}:${SUBSCRIPTION_PORT}:127.0.0.1"' \
+  <<<"$subscription_health_body"
+if grep -Fq -- '--resolve "${TLS_DOMAIN}:${SUBSCRIPTION_PORT}:${SERVER_IPV4}"' \
+  <<<"$subscription_health_body"; then
+  printf 'Subscription self-test still depends on public-IP hairpin routing.\n' >&2
+  exit 1
+fi
 
 printf 'Fingerprint state smoke test: PASS\n'

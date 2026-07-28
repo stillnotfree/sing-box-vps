@@ -119,7 +119,13 @@ jq -e '
 HY2_OBFS_MODE="off"
 build_sing_box_config "$client_database" "${work}/sing-box-off.json"
 jq -e '
-  (.inbounds[] | select(.tag == "hysteria2-in") | has("obfs")) | not
+  ((.inbounds[] | select(.tag == "hysteria2-in") | has("obfs")) | not) and
+  any(.route.rules[]; .ip_is_private == true and .action == "reject") and
+  any(.route.rules[];
+    .action == "reject" and
+    (.ip_cidr | index("100.64.0.0/10")) != null and
+    (.ip_cidr | index("169.254.0.0/16")) != null and
+    (.ip_cidr | index("fe80::/10")) != null)
 ' "${work}/sing-box-off.json" >/dev/null
 
 render_nginx_subscription_site "${work}/nginx.conf"

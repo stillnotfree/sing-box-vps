@@ -27,7 +27,9 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly SCRIPT_VERSION="1.0.6"
+readonly SCRIPT_VERSION="1.0.7"
+readonly SING_BOX_MIN_VERSION="1.13.0"
+readonly SING_BOX_MAX_EXCLUSIVE="1.14.0"
 readonly PROJECT_NAME="vpn-setup"
 readonly SAGERNET_KEY_URL="https://sing-box.app/gpg.key"
 readonly SAGERNET_KEY_FILE="/etc/apt/keyrings/sagernet.asc"
@@ -91,6 +93,7 @@ AUTOMATIC=0
 VERBOSE=0
 COMMAND="plan"
 TMP_DIR=""
+TEMP_ROOT=""
 CLIENT_NAME=""
 NEW_REALITY_TARGET=""
 NEW_CLIENT_FINGERPRINT=""
@@ -230,12 +233,12 @@ cleanup() {
   if (( UPGRADE_ROLLBACK_ACTIVE == 1 )); then
     rollback_upgrade_transaction
   fi
-  if [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]]; then
+  if [[ -n "$TEMP_ROOT" && -d "$TEMP_ROOT" ]]; then
     if (( MUTATION_COMMIT_ACTIVE == 1 )); then
       printf '[FATAL] An unexpected exit occurred during a live state change. Preserving transaction backups for manual recovery: %s\n' \
-        "$TMP_DIR" >&2
+        "$TEMP_ROOT" >&2
     else
-      rm -rf -- "$TMP_DIR"
+      rm -rf -- "$TEMP_ROOT"
     fi
   fi
   if (( UPGRADE_ROLLBACK_FAILED == 0 )) && [[ -n "$UPGRADE_BACKUP_DIR" && -d "$UPGRADE_BACKUP_DIR" ]]; then
@@ -245,6 +248,15 @@ cleanup() {
       "$UPGRADE_BACKUP_DIR" >&2
   fi
   finish_install_log
+}
+
+new_temp_dir() {
+  if [[ -z "$TEMP_ROOT" ]]; then
+    TEMP_ROOT="$(mktemp -d)"
+    chmod 0700 "$TEMP_ROOT"
+  fi
+  TMP_DIR="$(mktemp -d "${TEMP_ROOT}/operation.XXXXXX")"
+  chmod 0700 "$TMP_DIR"
 }
 
 trap on_error ERR
@@ -279,7 +291,7 @@ Install options (missing values are requested interactively):
   --fingerprint VALUE      Initial client TLS fingerprint (default: chrome).
   --emoji EMOJI            Server/country emoji for non-interactive installs.
   --yes                    Confirm a mutating operation non-interactively.
-  --verbose                Show the detailed share-safe health report.
+  --verbose                Show a redacted report; review it before sharing.
   --automatic              Internal use by the firewall rollback timer.
   -h, --help               Show this help.
 
@@ -482,7 +494,7 @@ validate_ssh_port() {
 }
 
 validate_emoji() {
-  [[ -n "$1" && "$1" != *$'\n'* && "$1" != *$'\r'* && ${#1} -le 16 ]] || \
+  [[ -n "$1" && ${#1} -le 16 && "$1" != *[[:cntrl:]]* ]] || \
     die 'Provide a short emoji/flag without control characters.'
 }
 
@@ -807,6 +819,19 @@ installed_state_version() {
   fi
 }
 
+sing_box_version_is_supported() {
+  local version="$1"
+  [[ -n "$version" ]] &&
+    dpkg --compare-versions "$version" ge "$SING_BOX_MIN_VERSION" &&
+    dpkg --compare-versions "$version" lt "$SING_BOX_MAX_EXCLUSIVE"
+}
+
+require_supported_sing_box_version() {
+  local version="$1"
+  sing_box_version_is_supported "$version" || \
+    die "Unsupported sing-box version ${version:-missing}. This installer supports >= ${SING_BOX_MIN_VERSION} and < ${SING_BOX_MAX_EXCLUSIVE}; upgrade the installer before crossing a core compatibility boundary."
+}
+
 validate_installer_file() {
   local file="$1" version project
   [[ -f "$file" && ! -L "$file" && -r "$file" ]] || die "Installer candidate is not a readable regular file: $file"
@@ -835,7 +860,7 @@ VPN installer ${SCRIPT_VERSION}
   Server       ${plan_ip}
   Admin        ${plan_admin}
   SSH          TCP/${plan_ssh_port}, key-only after first admin login
-  Core         latest stable sing-box from the signed official repository
+  Core         latest supported sing-box (${SING_BOX_MIN_VERSION} <= version < ${SING_BOX_MAX_EXCLUSIVE})
   Protocols    VLESS + REALITY + Vision (TCP/443)
                Hysteria2 + TLS (UDP/443, obfs: ${plan_hy2_obfs})
   TLS domain   ${plan_domain}
@@ -1097,11 +1122,13 @@ install_sing_box() {
   apt-get update
   candidate="$(sing_box_candidate_version)"
   [[ -n "$candidate" && "$candidate" != "(none)" ]] || die 'No stable sing-box candidate is available from the official repository.'
+  require_supported_sing_box_version "$candidate"
 
   installed_version="$(dpkg-query -W -f='${Version}' sing-box 2>/dev/null || true)"
   if [[ "$installed_version" == "$candidate" ]]; then
+    require_supported_sing_box_version "$installed_version"
     if ! find_cached_sing_box_package "$installed_version" >/dev/null; then
-      TMP_DIR="$(mktemp -d)"
+      new_temp_dir
       package_path="$(download_sing_box_package "$candidate" "$TMP_DIR")"
       archive_sing_box_package "$package_path" >/dev/null
     fi
@@ -1110,7 +1137,7 @@ install_sing_box() {
     return
   fi
 
-  TMP_DIR="$(mktemp -d)"
+  new_temp_dir
   package_path="$(download_sing_box_package "$candidate" "$TMP_DIR")"
   package_path="$(archive_sing_box_package "$package_path")"
 
@@ -1120,6 +1147,19 @@ install_sing_box() {
   [[ "$installed_version" == "$candidate" ]] || die "Unexpected installed sing-box version: ${installed_version:-missing}"
   apt-mark hold sing-box >/dev/null
   log "Installed and held stable sing-box ${installed_version}; use 'vpn update' for reviewed updates."
+}
+
+path_has_symlink_component() {
+  local path="$1" current="/" component
+  local -a components=()
+  [[ "$path" == /* ]] || return 0
+  IFS='/' read -r -a components <<<"${path#/}"
+  for component in "${components[@]}"; do
+    [[ -n "$component" ]] || continue
+    current="${current%/}/${component}"
+    [[ -L "$current" ]] && return 0
+  done
+  return 1
 }
 
 create_admin_account() {
@@ -1137,6 +1177,8 @@ create_admin_account() {
   user_home="$(getent passwd "$ADMIN_USER" | cut -d: -f6)"
   user_shell="$(getent passwd "$ADMIN_USER" | cut -d: -f7)"
   [[ -n "$user_home" && -d "$user_home" ]] || die "Home directory for ${ADMIN_USER} is unavailable."
+  path_has_symlink_component "$user_home" && \
+    die "Home path for ${ADMIN_USER} contains a symbolic link: ${user_home}"
   [[ "$user_shell" != */nologin && "$user_shell" != */false ]] || \
     die "Existing account ${ADMIN_USER} has a non-login shell (${user_shell})."
   primary_group="$(id -gn "$ADMIN_USER")"
@@ -1146,8 +1188,13 @@ create_admin_account() {
     usermod --append --groups sudo "$ADMIN_USER"
   fi
 
+  [[ ! -L "${user_home}/.ssh" ]] || die "${user_home}/.ssh must not be a symbolic link."
   install -d -o "$ADMIN_USER" -g "$primary_group" -m 0700 "${user_home}/.ssh"
+  path_has_symlink_component "${user_home}/.ssh" && \
+    die "${user_home}/.ssh contains a symbolic-link path component."
   authorized_keys="${user_home}/.ssh/authorized_keys"
+  [[ ! -L "$authorized_keys" ]] || die "${authorized_keys} must not be a symbolic link."
+  [[ ! -L "${authorized_keys}.new" ]] || die "${authorized_keys}.new must not be a symbolic link."
   [[ ! -e "$authorized_keys" || -f "$authorized_keys" ]] || \
     die "${authorized_keys} exists but is not a regular file."
   if [[ -f "$authorized_keys" ]]; then
@@ -1207,7 +1254,8 @@ configure_swap() {
     chmod 0600 "$staged_swap"
     if ! mkswap "$staged_swap" >/dev/null; then
       rm -f -- "$staged_swap"
-      die 'Could not format the staged swap file.'
+      warn 'Could not format the optional swap file; continuing without swap.'
+      return
     fi
     mv -f -- "$staged_swap" /swapfile
     created_swap=1
@@ -1221,14 +1269,15 @@ configure_swap() {
     if (( created_swap == 1 )); then
       rm -f -- /swapfile
     fi
-    die 'Could not activate /swapfile; the filesystem or VPS kernel may not support swap files.'
+    warn 'Could not activate the optional swap file; continuing without swap. Some COW filesystems and VPS kernels do not support ordinary swap files.'
+    return
   fi
   grep -Eq '^[[:space:]]*/swapfile[[:space:]]' /etc/fstab || \
     printf '%s\n' '/swapfile none swap sw 0 0' >>/etc/fstab
 }
 
 configure_bbr_if_available() {
-  local available
+  local available modules_candidate sysctl_candidate
   if ! modprobe tcp_bbr 2>/dev/null; then
     warn 'tcp_bbr module is unavailable; retaining CUBIC + fq_codel.'
     return
@@ -1241,12 +1290,19 @@ configure_bbr_if_available() {
   fi
 
   log 'Enabling BBR and making fq the default qdisc for new/recreated interfaces.'
-  printf '%s\n' 'tcp_bbr' >/etc/modules-load.d/90-vpn-bbr.conf
-  cat >/etc/sysctl.d/90-vpn-network.conf <<'EOF'
+  modules_candidate="$(mktemp)"
+  printf '%s\n' 'tcp_bbr' >"$modules_candidate"
+  write_atomic /etc/modules-load.d/90-vpn-bbr.conf root root 0644 "$modules_candidate"
+  rm -f -- "$modules_candidate"
+
+  sysctl_candidate="$(mktemp)"
+  cat >"$sysctl_candidate" <<'EOF'
 # VPN setup: only the reviewed TCP settings. No buffer or MTU tuning.
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 EOF
+  write_atomic /etc/sysctl.d/90-vpn-network.conf root root 0644 "$sysctl_candidate"
+  rm -f -- "$sysctl_candidate"
   sysctl -p /etc/sysctl.d/90-vpn-network.conf >/dev/null
 }
 
@@ -1296,12 +1352,16 @@ EOF
 }
 
 configure_unattended_upgrades() {
-  cat >/etc/apt/apt.conf.d/52-vpn-unattended-upgrades <<'EOF'
+  local candidate
+  candidate="$(mktemp)"
+  cat >"$candidate" <<'EOF'
 // VPN setup: security updates without automatic reboot.
 APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
 Unattended-Upgrade::Automatic-Reboot "false";
 EOF
+  write_atomic /etc/apt/apt.conf.d/52-vpn-unattended-upgrades root root 0644 "$candidate"
+  rm -f -- "$candidate"
   systemctl enable --now apt-daily.timer apt-daily-upgrade.timer >/dev/null
 }
 
@@ -1729,6 +1789,24 @@ ${hy2_obfs_block}
       "server": "local",
       "strategy": "ipv4_only"
     },
+    "rules": [
+      {
+        "ip_is_private": true,
+        "action": "reject"
+      },
+      {
+        "ip_cidr": [
+          "0.0.0.0/8",
+          "100.64.0.0/10",
+          "127.0.0.0/8",
+          "169.254.0.0/16",
+          "::/128",
+          "::1/128",
+          "fe80::/10"
+        ],
+        "action": "reject"
+      }
+    ],
     "final": "direct"
   }
 }
@@ -1742,9 +1820,6 @@ write_sing_box_config() {
   install -d -o root -g sing-box -m 0750 "$CONFIG_DIR"
   candidate="$(mktemp)"
   build_sing_box_config "$CLIENTS_FILE" "$candidate"
-  if [[ -f "$CONFIG_FILE" && ! -f "${ROLLBACK_DIR}/config.before.json" ]]; then
-    install -o root -g root -m 0600 "$CONFIG_FILE" "${ROLLBACK_DIR}/config.before.json"
-  fi
   write_atomic "$CONFIG_FILE" root sing-box 0640 "$candidate"
   rm -f -- "$candidate"
 }
@@ -1788,6 +1863,7 @@ EOF
 }
 
 require_client_runtime() {
+  local installed_core
   require_root
   require_command base64
   require_command curl
@@ -1800,6 +1876,8 @@ require_client_runtime() {
   [[ -f "$CLIENTS_FILE" ]] || die 'Client database is unavailable; install the server first.'
   [[ -f "$SECRETS_FILE" ]] || die 'Server secrets are unavailable; install the server first.'
   [[ -f "$CONFIG_FILE" ]] || die 'sing-box configuration is unavailable; install the server first.'
+  installed_core="$(dpkg-query -W -f='${Version}' sing-box 2>/dev/null || true)"
+  require_supported_sing_box_version "$installed_core"
   validate_client_database "$CLIENTS_FILE"
 }
 
@@ -1882,7 +1960,7 @@ reconcile_managed_runtime() {
   local candidate_config candidate_subscriptions config_backup subscriptions_backup
   local failed=0 restore_failed=0
 
-  TMP_DIR="$(mktemp -d)"
+  new_temp_dir
   candidate_config="${TMP_DIR}/config.candidate.json"
   candidate_subscriptions="${TMP_DIR}/subscriptions.candidate"
   config_backup="${TMP_DIR}/config.before.json"
@@ -1937,7 +2015,7 @@ client_add() {
     die "Client ${CLIENT_NAME} already exists (names are case-insensitive)."
   fi
 
-  TMP_DIR="$(mktemp -d)"
+  new_temp_dir
   candidate="${TMP_DIR}/clients.candidate.json"
   uuid="$(cat /proc/sys/kernel/random/uuid)"
   hy2="$(openssl rand -hex 24)"
@@ -2190,7 +2268,7 @@ subscription_service_healthy() {
   # in the process argument list visible to other local users.
   links_payload="$(printf 'url = "%s"\n' "$url" | curl --noproxy '*' \
     --fail --silent --show-error --connect-timeout 10 \
-    --resolve "${TLS_DOMAIN}:${SUBSCRIPTION_PORT}:${SERVER_IPV4}" \
+    --resolve "${TLS_DOMAIN}:${SUBSCRIPTION_PORT}:127.0.0.1" \
     --user-agent 'Shadowrocket' --config -)" || return 1
   decoded_links="$(printf '%s' "$links_payload" | base64 --decode 2>/dev/null)" || return 1
   grep -Fq 'vless://' <<<"$decoded_links" || return 1
@@ -2203,7 +2281,7 @@ subscription_service_healthy() {
   fi
   mihomo_payload="$(printf 'url = "%s"\n' "$url" | curl --noproxy '*' \
     --fail --silent --show-error --connect-timeout 10 \
-    --resolve "${TLS_DOMAIN}:${SUBSCRIPTION_PORT}:${SERVER_IPV4}" \
+    --resolve "${TLS_DOMAIN}:${SUBSCRIPTION_PORT}:127.0.0.1" \
     --user-agent 'FlClash' --config -)" || return 1
   jq -e --arg fingerprint "$CLIENT_FINGERPRINT" --arg hy2_obfs_mode "$HY2_OBFS_MODE" \
     '(.proxies | length == 2) and
@@ -2278,7 +2356,7 @@ client_delete() {
   count="$(jq '.clients | length' "$CLIENTS_FILE")"
   (( count > 1 )) || die 'Refusing to delete the last VPN client. Add a replacement client first.'
 
-  TMP_DIR="$(mktemp -d)"
+  new_temp_dir
   candidate="${TMP_DIR}/clients.candidate.json"
   jq --arg name "$stored_name" \
     '.clients |= map(select((.name | ascii_downcase) != ($name | ascii_downcase)))' \
@@ -2334,7 +2412,7 @@ set_reality_target() {
   fi
   exec 9>"$CLIENT_LOCK_FILE"
   flock -x 9
-  TMP_DIR="$(mktemp -d)"
+  new_temp_dir
   candidate_settings="${TMP_DIR}/settings.candidate.json"
   candidate_config="${TMP_DIR}/config.candidate.json"
   candidate_subscriptions="${TMP_DIR}/subscriptions.candidate"
@@ -2425,7 +2503,7 @@ set_client_fingerprint() {
   fi
   exec 9>"$CLIENT_LOCK_FILE"
   flock -x 9
-  TMP_DIR="$(mktemp -d)"
+  new_temp_dir
   candidate_settings="${TMP_DIR}/settings.candidate.json"
   candidate_subscriptions="${TMP_DIR}/subscriptions.candidate"
   old_subscriptions="${TMP_DIR}/subscriptions.before"
@@ -2508,7 +2586,7 @@ set_hy2_obfs() {
   fi
   exec 9>"$CLIENT_LOCK_FILE"
   flock -x 9
-  TMP_DIR="$(mktemp -d)"
+  new_temp_dir
   candidate_settings="${TMP_DIR}/settings.candidate.json"
   candidate_config="${TMP_DIR}/config.candidate.json"
   candidate_subscriptions="${TMP_DIR}/subscriptions.candidate"
@@ -2609,7 +2687,9 @@ EOF
 }
 
 install_user_command_wrapper() {
-  TMP_DIR="${TMP_DIR:-$(mktemp -d)}"
+  if [[ -z "$TMP_DIR" || ! -d "$TMP_DIR" ]]; then
+    new_temp_dir
+  fi
   render_user_command_wrapper "${TMP_DIR}/vpn-command"
   sh -n "${TMP_DIR}/vpn-command"
   install -d -o root -g root -m 0755 "$(dirname "$USER_COMMAND")"
@@ -2636,7 +2716,7 @@ self_update_from_file() {
   source_path="$(readlink -f "$SELF_UPDATE_SOURCE" 2>/dev/null || true)"
   [[ -n "$source_path" ]] || die 'Unable to resolve the installer candidate path.'
 
-  TMP_DIR="$(mktemp -d)"
+  new_temp_dir
   candidate="${TMP_DIR}/installer-candidate"
   install -o root -g root -m 0700 "$source_path" "$candidate"
   candidate_version="$(validate_installer_file "$candidate")"
@@ -2915,6 +2995,16 @@ Match all
 EOF
 }
 
+reload_ssh_runtime() {
+  if systemctl is-active --quiet ssh.service; then
+    systemctl reload ssh.service
+  elif systemctl is-active --quiet ssh.socket; then
+    systemctl restart ssh.socket
+  else
+    systemctl reload-or-restart ssh.service
+  fi
+}
+
 remove_auto_finalization() {
   local restore_required=0
   require_root
@@ -2943,11 +3033,11 @@ remove_auto_finalization() {
     fi
     die 'sshd validation failed while removing automatic first-login finalization.'
   fi
-  if ! systemctl reload ssh.service; then
+  if ! reload_ssh_runtime; then
     if (( restore_required == 1 )); then
       mv -- "$AUTO_FINALIZE_REMOVAL_STAGE" "$AUTO_FINALIZE_SSH_DROPIN"
       if /usr/sbin/sshd -t >/dev/null 2>&1; then
-        systemctl reload ssh.service >/dev/null 2>&1 || true
+        reload_ssh_runtime >/dev/null 2>&1 || true
       fi
     fi
     die 'SSH reload failed while removing automatic first-login finalization.'
@@ -3006,10 +3096,10 @@ configure_auto_finalization() {
     rm -f -- "$AUTO_FINALIZE_SSH_DROPIN" "$AUTO_FINALIZE_WRAPPER"
     die 'The effective administrator SSH policy did not activate automatic finalization; temporary files were removed.'
   fi
-  if ! systemctl reload ssh.service; then
+  if ! reload_ssh_runtime; then
     rm -f -- "$AUTO_FINALIZE_SSH_DROPIN" "$AUTO_FINALIZE_WRAPPER"
     if /usr/sbin/sshd -t >/dev/null 2>&1; then
-      systemctl reload ssh.service >/dev/null 2>&1 || true
+      reload_ssh_runtime >/dev/null 2>&1 || true
     fi
     die 'SSH could not load the temporary automatic-finalization rule; it was removed.'
   fi
@@ -3017,13 +3107,19 @@ configure_auto_finalization() {
 }
 
 lockdown_ssh() {
-  local candidate invoking_user effective
+  local candidate invoking_user effective admin_home authorized_keys
   require_root
   require_confirmation
   invoking_user="${SUDO_USER:-}"
   [[ "$invoking_user" == "$ADMIN_USER" ]] || die "Run this command from a verified ${ADMIN_USER} session using sudo."
-  [[ -s "/home/${ADMIN_USER}/.ssh/authorized_keys" ]] || die 'Admin authorized_keys is missing.'
-  ssh-keygen -l -f "/home/${ADMIN_USER}/.ssh/authorized_keys" >/dev/null
+  admin_home="$(getent passwd "$ADMIN_USER" | cut -d: -f6)"
+  [[ -n "$admin_home" && -d "$admin_home" ]] || die "Home directory for ${ADMIN_USER} is unavailable."
+  path_has_symlink_component "$admin_home" && \
+    die "Home path for ${ADMIN_USER} contains a symbolic link: ${admin_home}"
+  authorized_keys="${admin_home}/.ssh/authorized_keys"
+  [[ ! -L "${admin_home}/.ssh" && ! -L "$authorized_keys" && -s "$authorized_keys" ]] || \
+    die 'Admin authorized_keys is missing or unsafe.'
+  ssh-keygen -l -f "$authorized_keys" >/dev/null
 
   candidate="$(mktemp)"
   cat >"$candidate" <<EOF
@@ -3056,7 +3152,7 @@ EOF
     rm -f -- "$SSH_DROPIN"
     die 'Effective SSH security settings did not match the required key-only policy; drop-in removed.'
   fi
-  systemctl reload ssh.service
+  reload_ssh_runtime
   log 'SSH lockdown applied: key-only, no root login, no password login.'
 }
 
@@ -3118,13 +3214,14 @@ update_sing_box() {
   apt-get update
   candidate="$(sing_box_candidate_version)"
   [[ -n "$candidate" && "$candidate" != "(none)" ]] || die 'No stable sing-box update candidate is available.'
+  require_supported_sing_box_version "$candidate"
   if [[ "$candidate" == "$installed" ]]; then
-    log "sing-box ${installed} is already the latest stable release."
+    log "sing-box ${installed} is already the latest supported stable release."
     return
   fi
   dpkg --compare-versions "$candidate" gt "$installed" || die "Refusing non-upgrade candidate ${candidate} over ${installed}."
 
-  TMP_DIR="$(mktemp -d)"
+  new_temp_dir
   new_package="$(download_sing_box_package "$candidate" "${TMP_DIR}/download")"
   candidate_root="${TMP_DIR}/candidate-root"
   mkdir -p "$candidate_root"
@@ -3192,7 +3289,7 @@ health_details() {
   printf '### Health summary\n'
   health_check || health_status=$?
   printf '\n'
-  printf 'VPN health details (share-safe)\n'
+  printf 'VPN health details (redacted; review before sharing)\n'
   printf 'Generated: %s\n' "$(date --iso-8601=seconds)"
   printf 'Installer: %s\n\n' "$SCRIPT_VERSION"
   printf 'Managed runtime release: %s\n\n' "$(cat "$RUNTIME_VERSION_FILE" 2>/dev/null || printf missing)"
@@ -3377,6 +3474,7 @@ health_check() {
   client_count="$(jq -r '.clients | length' "$CLIENTS_FILE" 2>/dev/null || printf unknown)"
 
   if [[ "$(cat "$RUNTIME_VERSION_FILE" 2>/dev/null || true)" != "$SCRIPT_VERSION" ]] ||
+     ! sing_box_version_is_supported "$core_version" ||
      ! systemctl is-active --quiet sing-box.service ||
      ! sing-box check -c "$CONFIG_FILE" >/dev/null 2>&1; then
     core_state=FAIL
@@ -3586,10 +3684,6 @@ EOF
   set_step 'management helper atomic replacement'
   install_helper
   helper_backup="$LAST_HELPER_BACKUP"
-  if ! "$INSTALLED_HELPER" health >/dev/null 2>&1; then
-    restore_installed_helper "$helper_backup" || die 'New helper failed its post-install check and automatic helper rollback also failed.'
-    die 'New helper failed its post-install check; the previous helper was restored.'
-  fi
   remove_auto_finalization
   set_step 'managed state version marker'
   write_install_completion_marker
@@ -3597,6 +3691,11 @@ EOF
   reconcile_managed_runtime
   set_step 'managed runtime version marker'
   write_runtime_version_marker
+  set_step 'upgraded runtime health validation'
+  if ! "$INSTALLED_HELPER" health >/dev/null 2>&1; then
+    restore_installed_helper "$helper_backup" || die 'New helper failed its post-migration check and automatic helper rollback also failed.'
+    die 'New helper failed its post-migration check; the previous helper and version markers will be restored.'
+  fi
   UPGRADE_ROLLBACK_ACTIVE=0
   log "Overlay update completed: ${current_state_version} -> ${SCRIPT_VERSION}."
   [[ -z "$helper_backup" ]] || log "Previous helper backup: ${helper_backup}"
