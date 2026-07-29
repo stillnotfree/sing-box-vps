@@ -48,7 +48,7 @@ for it, and do not add an `AAAA` record unless IPv6 is deliberately configured.
 Connect to the VPS as `root` and run:
 
 ```bash
-wget -qO vpn-install.sh https://raw.githubusercontent.com/stillnotfree/sing-box-vps/v1.0.8/install-sing-box-server.sh && chmod 700 vpn-install.sh && ./vpn-install.sh install
+wget -qO vpn-install.sh https://raw.githubusercontent.com/stillnotfree/sing-box-vps/main/install-sing-box-server.sh && chmod 700 vpn-install.sh && ./vpn-install.sh install
 ```
 
 The installer asks for the administrator, public SSH key, VPS address, domain,
