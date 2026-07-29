@@ -27,7 +27,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly SCRIPT_VERSION="1.0.7"
+readonly SCRIPT_VERSION="1.0.8"
 readonly SING_BOX_MIN_VERSION="1.13.0"
 readonly SING_BOX_MAX_EXCLUSIVE="1.14.0"
 readonly PROJECT_NAME="vpn-setup"
@@ -435,7 +435,7 @@ require_install_confirmation() {
   local answer
   (( ASSUME_YES == 1 )) && return
   [[ -t 0 ]] || die 'Non-interactive installation requires --yes.'
-  read -r -p 'Install now? [Y/n] ' answer
+  read -r -p '[Step 10 / 10] Install now? [Y/n] ' answer
   [[ -z "$answer" || "$answer" =~ ^[Yy]$ ]] || die 'Cancelled.'
 }
 
@@ -536,13 +536,18 @@ This is a global server setting. Every Hysteria2 client must refresh its
 subscription after a change. Use Salamander only when testing shows that native
 Hysteria2 is filtered or throttled on the affected network.
 EOF
-  read -r -p 'Hysteria2 obfuscation [1]: ' answer
-  answer="${answer:-1}"
-  case "$answer" in
-    1|off) selected="off" ;;
-    2|salamander) selected="salamander" ;;
-    *) die 'Choose 1/off or 2/salamander.' ;;
-  esac
+  while true; do
+    read -r -p 'Hysteria2 obfuscation [1]: ' answer
+    answer="${answer:-1}"
+    answer="${answer#"${answer%%[![:space:]]*}"}"
+    answer="${answer%"${answer##*[![:space:]]}"}"
+    answer="${answer,,}"
+    case "$answer" in
+      1|off) selected="off"; break ;;
+      2|salamander) selected="salamander"; break ;;
+      *) warn 'Choose 1/off or 2/salamander.' ;;
+    esac
+  done
   printf -v "$variable" '%s' "$selected"
 }
 
@@ -565,20 +570,25 @@ There is no universally best value. Change it only when testing indicates that
 the current profile is failing. "randomized" is deliberately excluded because
 current Mihomo profiles do not support it consistently.
 EOF
-  read -r -p 'Fingerprint [1]: ' answer
-  answer="${answer:-1}"
-  case "$answer" in
-    1|chrome) selected="chrome" ;;
-    2|firefox) selected="firefox" ;;
-    3|safari) selected="safari" ;;
-    4|ios) selected="ios" ;;
-    5|android) selected="android" ;;
-    6|edge) selected="edge" ;;
-    7|360) selected="360" ;;
-    8|qq) selected="qq" ;;
-    9|random) selected="random" ;;
-    *) die 'Choose a number from 1 to 9 or enter one of the displayed names.' ;;
-  esac
+  while true; do
+    read -r -p '[Step 9 / 10] Fingerprint [1]: ' answer
+    answer="${answer:-1}"
+    answer="${answer#"${answer%%[![:space:]]*}"}"
+    answer="${answer%"${answer##*[![:space:]]}"}"
+    answer="${answer,,}"
+    case "$answer" in
+      1|chrome) selected="chrome"; break ;;
+      2|firefox) selected="firefox"; break ;;
+      3|safari) selected="safari"; break ;;
+      4|ios) selected="ios"; break ;;
+      5|android) selected="android"; break ;;
+      6|edge) selected="edge"; break ;;
+      7|360) selected="360"; break ;;
+      8|qq) selected="qq"; break ;;
+      9|random) selected="random"; break ;;
+      *) warn 'Choose a number from 1 to 9 or enter one of the displayed names.' ;;
+    esac
+  done
   printf -v "$variable" '%s' "$selected"
 }
 
@@ -587,30 +597,34 @@ select_country_emoji() {
   [[ -t 0 ]] || die 'A country emoji is required in non-interactive mode.'
   cat <<'EOF'
 Select the VPS location used in generated profile names:
-  1) 🇩🇪 Germany
-  2) 🇳🇱 Netherlands
-  3) 🇫🇮 Finland
-  4) 🇸🇪 Sweden
-  5) 🇱🇻 Latvia
-  6) 🇱🇹 Lithuania
-  7) 🇫🇷 France
-  8) 🇺🇸 United States
-  9) 🌐 Other / neutral
+  1) 🇩🇪  Germany
+  2) 🇳🇱  Netherlands
+  3) 🇫🇮  Finland
+  4) 🇸🇪  Sweden
+  5) 🇱🇻  Latvia
+  6) 🇱🇹  Lithuania
+  7) 🇫🇷  France
+  8) 🇺🇸  United States
+  9) 🌐  Other / neutral
 EOF
-  read -r -p 'Location [9]: ' answer
-  answer="${answer:-9}"
-  case "$answer" in
-    1) selected="🇩🇪" ;;
-    2) selected="🇳🇱" ;;
-    3) selected="🇫🇮" ;;
-    4) selected="🇸🇪" ;;
-    5) selected="🇱🇻" ;;
-    6) selected="🇱🇹" ;;
-    7) selected="🇫🇷" ;;
-    8) selected="🇺🇸" ;;
-    9) selected="🌐" ;;
-    *) die 'Choose a location number from 1 to 9.' ;;
-  esac
+  while true; do
+    read -r -p '[Step 8 / 10] Location [9]: ' answer
+    answer="${answer:-9}"
+    answer="${answer#"${answer%%[![:space:]]*}"}"
+    answer="${answer%"${answer##*[![:space:]]}"}"
+    case "$answer" in
+      1) selected="🇩🇪"; break ;;
+      2) selected="🇳🇱"; break ;;
+      3) selected="🇫🇮"; break ;;
+      4) selected="🇸🇪"; break ;;
+      5) selected="🇱🇻"; break ;;
+      6) selected="🇱🇹"; break ;;
+      7) selected="🇫🇷"; break ;;
+      8) selected="🇺🇸"; break ;;
+      9) selected="🌐"; break ;;
+      *) warn 'Choose a location number from 1 to 9.' ;;
+    esac
+  done
   printf -v "$variable" '%s' "$selected"
 }
 
@@ -639,19 +653,19 @@ collect_install_settings() {
   if command -v ip >/dev/null 2>&1; then
     detected_ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}')"
   fi
-  prompt_value ADMIN_USER 'Administrative user' 'vpnadmin'
-  prompt_value ADMIN_PUBLIC_KEY 'OpenSSH public key (one line)'
-  prompt_value SERVER_IPV4 'Public VPS IPv4' "$detected_ip"
-  prompt_value TLS_DOMAIN 'TLS domain whose A record points to this VPS'
-  prompt_value ACME_EMAIL 'ACME email'
-  prompt_value SSH_PORT 'Current SSH port' '22'
+  prompt_value ADMIN_USER '[Step 1 / 10] Administrative user' 'vpnadmin'
+  prompt_value ADMIN_PUBLIC_KEY '[Step 2 / 10] OpenSSH public key (one line)'
+  prompt_value SERVER_IPV4 '[Step 3 / 10] Public VPS IPv4' "$detected_ip"
+  prompt_value TLS_DOMAIN '[Step 4 / 10] TLS domain whose A record points to this VPS'
+  prompt_value ACME_EMAIL '[Step 5 / 10] ACME email'
+  prompt_value SSH_PORT '[Step 6 / 10] Current SSH port' '22'
   if [[ -z "$REALITY_TARGET" ]]; then
     printf '%s\n' \
       'No REALITY target is universally safe. Prefer a TLS 1.3 / HTTP/2 hostname' \
       'reachable from this VPS and, where practical, topologically close to it.' \
       'The installer checks TLS properties, not resistance to a specific censor.'
   fi
-  prompt_value REALITY_TARGET 'REALITY target (explicit choice required)'
+  prompt_value REALITY_TARGET '[Step 7 / 10] REALITY target (explicit choice required)'
   if [[ -z "$COUNTRY_EMOJI" ]]; then
     if [[ -t 0 ]]; then
       select_country_emoji COUNTRY_EMOJI
@@ -3754,6 +3768,7 @@ EOF
     log 'Found an interrupted installation; resuming with its validated saved settings.'
   else
     [[ ! -e "$SETTINGS_FILE" ]] || die "${SETTINGS_FILE} exists but is not a readable regular file."
+    set_step 'interactive installation settings'
     collect_install_settings
   fi
   show_plan

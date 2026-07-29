@@ -9,7 +9,7 @@ repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck disable=SC1091
 source "${repo_root}/install-sing-box-server.sh"
 
-[[ "$SCRIPT_VERSION" == "1.0.7" ]]
+[[ "$SCRIPT_VERSION" == "1.0.8" ]]
 [[ "$SING_BOX_MIN_VERSION" == "1.13.0" ]]
 [[ "$SING_BOX_MAX_EXCLUSIVE" == "1.14.0" ]]
 (( ${#SUPPORTED_CLIENT_FINGERPRINTS[@]} == 9 ))
