@@ -330,7 +330,7 @@ select_audited_reality_target_for_install() {
       printf 'The target is technically usable, but the audit found a post-handshake comparison signal.\n'
       printf 'Keep %s anyway, or choose another target now.\n' "$REALITY_TARGET"
       while true; do
-        read -r -p 'Keep this target? [Y/n]: ' answer
+        read_prompt 'Keep this target? [Y/n]: ' answer
         answer="${answer:-y}"
         answer="$(printf '%s' "$answer" | tr '[:upper:]' '[:lower:]')"
         case "$answer" in

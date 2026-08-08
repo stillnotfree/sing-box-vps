@@ -99,6 +99,20 @@ set_step() {
   log "STEP: ${CURRENT_STEP}"
 }
 
+read_prompt() {
+  local prompt="$1"
+  shift
+  if (( INSTALL_LOG_ACTIVE == 1 )) && [[ -t 6 ]]; then
+    # Interactive prompts must bypass the line-oriented redaction pipe. A
+    # Bash read prompt has no trailing newline, so forwarding it through that
+    # pipe would hide it until the user had already entered an answer.
+    printf '%s' "$prompt" >&6
+    read -r "$@"
+  else
+    read -r -p "$prompt" "$@"
+  fi
+}
+
 redact_install_stream() {
   local escape_sequence=$'\033'
   sed -E \

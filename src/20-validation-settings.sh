@@ -6,7 +6,7 @@ require_confirmation() {
   local answer
   (( ASSUME_YES == 1 )) && return
   [[ -t 0 ]] || die 'Mutating non-interactive commands require --yes.'
-  read -r -p 'Continue? [y/N] ' answer
+  read_prompt 'Continue? [y/N] ' answer
   [[ "$answer" =~ ^[Yy]$ ]] || die 'Cancelled.'
 }
 
@@ -14,7 +14,7 @@ require_install_confirmation() {
   local answer
   (( ASSUME_YES == 1 )) && return
   [[ -t 0 ]] || die 'Non-interactive installation requires --yes.'
-  read -r -p '[Step 10 / 10] Install now? [Y/n] ' answer
+  read_prompt '[Step 10 / 10] Install now? [Y/n] ' answer
   [[ -z "$answer" || "$answer" =~ ^[Yy]$ ]] || die 'Cancelled.'
 }
 
@@ -134,7 +134,7 @@ subscription after a change. Use Salamander only when testing shows that native
 Hysteria2 is filtered or throttled on the affected network.
 EOF
   while true; do
-    read -r -p 'Hysteria2 obfuscation [1]: ' answer
+    read_prompt 'Hysteria2 obfuscation [1]: ' answer
     answer="${answer:-1}"
     answer="${answer#"${answer%%[![:space:]]*}"}"
     answer="${answer%"${answer##*[![:space:]]}"}"
@@ -168,7 +168,7 @@ the current profile is failing. "randomized" is deliberately excluded because
 current Mihomo profiles do not support it consistently.
 EOF
   while true; do
-    read -r -p '[Step 9 / 10] Fingerprint [1]: ' answer
+    read_prompt '[Step 9 / 10] Fingerprint [1]: ' answer
     answer="${answer:-1}"
     answer="${answer#"${answer%%[![:space:]]*}"}"
     answer="${answer%"${answer##*[![:space:]]}"}"
@@ -205,7 +205,7 @@ Select the VPS location used in generated profile names:
   9) 🌐  Other / neutral
 EOF
   while true; do
-    read -r -p '[Step 8 / 10] Location [9]: ' answer
+    read_prompt '[Step 8 / 10] Location [9]: ' answer
     answer="${answer:-9}"
     answer="${answer#"${answer%%[![:space:]]*}"}"
     answer="${answer%"${answer##*[![:space:]]}"}"
@@ -246,10 +246,10 @@ prompt_value() {
   interactive_stdin || die "Missing required option: ${prompt}"
   while true; do
     if [[ -n "$default_value" ]]; then
-      read -r -p "${prompt} [${default_value}]: " answer
+      read_prompt "${prompt} [${default_value}]: " answer
       answer="${answer:-$default_value}"
     else
-      read -r -p "${prompt}: " answer
+      read_prompt "${prompt}: " answer
     fi
     if "$validator" "$answer"; then
       printf -v "$variable" '%s' "$answer"

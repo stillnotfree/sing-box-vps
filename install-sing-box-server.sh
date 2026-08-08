@@ -230,6 +230,20 @@ set_step() {
   log "STEP: ${CURRENT_STEP}"
 }
 
+read_prompt() {
+  local prompt="$1"
+  shift
+  if (( INSTALL_LOG_ACTIVE == 1 )) && [[ -t 6 ]]; then
+    # Interactive prompts must bypass the line-oriented redaction pipe. A
+    # Bash read prompt has no trailing newline, so forwarding it through that
+    # pipe would hide it until the user had already entered an answer.
+    printf '%s' "$prompt" >&6
+    read -r "$@"
+  else
+    read -r -p "$prompt" "$@"
+  fi
+}
+
 redact_install_stream() {
   local escape_sequence=$'\033'
   sed -E \
@@ -588,7 +602,7 @@ require_confirmation() {
   local answer
   (( ASSUME_YES == 1 )) && return
   [[ -t 0 ]] || die 'Mutating non-interactive commands require --yes.'
-  read -r -p 'Continue? [y/N] ' answer
+  read_prompt 'Continue? [y/N] ' answer
   [[ "$answer" =~ ^[Yy]$ ]] || die 'Cancelled.'
 }
 
@@ -596,7 +610,7 @@ require_install_confirmation() {
   local answer
   (( ASSUME_YES == 1 )) && return
   [[ -t 0 ]] || die 'Non-interactive installation requires --yes.'
-  read -r -p '[Step 10 / 10] Install now? [Y/n] ' answer
+  read_prompt '[Step 10 / 10] Install now? [Y/n] ' answer
   [[ -z "$answer" || "$answer" =~ ^[Yy]$ ]] || die 'Cancelled.'
 }
 
@@ -716,7 +730,7 @@ subscription after a change. Use Salamander only when testing shows that native
 Hysteria2 is filtered or throttled on the affected network.
 EOF
   while true; do
-    read -r -p 'Hysteria2 obfuscation [1]: ' answer
+    read_prompt 'Hysteria2 obfuscation [1]: ' answer
     answer="${answer:-1}"
     answer="${answer#"${answer%%[![:space:]]*}"}"
     answer="${answer%"${answer##*[![:space:]]}"}"
@@ -750,7 +764,7 @@ the current profile is failing. "randomized" is deliberately excluded because
 current Mihomo profiles do not support it consistently.
 EOF
   while true; do
-    read -r -p '[Step 9 / 10] Fingerprint [1]: ' answer
+    read_prompt '[Step 9 / 10] Fingerprint [1]: ' answer
     answer="${answer:-1}"
     answer="${answer#"${answer%%[![:space:]]*}"}"
     answer="${answer%"${answer##*[![:space:]]}"}"
@@ -787,7 +801,7 @@ Select the VPS location used in generated profile names:
   9) 🌐  Other / neutral
 EOF
   while true; do
-    read -r -p '[Step 8 / 10] Location [9]: ' answer
+    read_prompt '[Step 8 / 10] Location [9]: ' answer
     answer="${answer:-9}"
     answer="${answer#"${answer%%[![:space:]]*}"}"
     answer="${answer%"${answer##*[![:space:]]}"}"
@@ -828,10 +842,10 @@ prompt_value() {
   interactive_stdin || die "Missing required option: ${prompt}"
   while true; do
     if [[ -n "$default_value" ]]; then
-      read -r -p "${prompt} [${default_value}]: " answer
+      read_prompt "${prompt} [${default_value}]: " answer
       answer="${answer:-$default_value}"
     else
-      read -r -p "${prompt}: " answer
+      read_prompt "${prompt}: " answer
     fi
     if "$validator" "$answer"; then
       printf -v "$variable" '%s' "$answer"
@@ -1719,7 +1733,7 @@ select_audited_reality_target_for_install() {
       printf 'The target is technically usable, but the audit found a post-handshake comparison signal.\n'
       printf 'Keep %s anyway, or choose another target now.\n' "$REALITY_TARGET"
       while true; do
-        read -r -p 'Keep this target? [Y/n]: ' answer
+        read_prompt 'Keep this target? [Y/n]: ' answer
         answer="${answer:-y}"
         answer="$(printf '%s' "$answer" | tr '[:upper:]' '[:lower:]')"
         case "$answer" in
