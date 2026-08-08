@@ -12,6 +12,14 @@ repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck disable=SC1091,SC2034
 source "${repo_root}/install-sing-box-server.sh"
 
+generated_fixture="$(mktemp)"
+"${repo_root}/scripts/build-standalone.sh" "$generated_fixture" >/dev/null
+cmp -s "$generated_fixture" "${repo_root}/install-sing-box-server.sh" || {
+  printf 'Committed standalone installer is out of sync with src modules.\n' >&2
+  exit 1
+}
+rm -f -- "$generated_fixture"
+
 # Candidate extraction must consume the complete producer stream. An early
 # awk exit makes pipefail report SIGPIPE (141) on apt-cache in some Ubuntu
 # installations.
@@ -19,14 +27,30 @@ apt-cache() {
   printf '%s\n' \
     'sing-box:' \
     '  Installed: (none)' \
-    '  Candidate: 1.13.14' \
+    '  Candidate: 1.13.16' \
     '  Version table:'
   local line
   for line in {1..4096}; do
-    printf '     1.13.14 500 source-%s\n' "$line"
+    printf '     1.13.16 500 source-%s\n' "$line"
   done
 }
-[[ "$(sing_box_candidate_version)" == "1.13.14" ]]
+[[ "$(sing_box_candidate_version)" == "1.13.16" ]]
+
+# Installer and state metadata parsing must also consume complete files rather
+# than hiding SIGPIPE behind `head -n1` under pipefail.
+metadata_fixture="$(mktemp)"
+{
+  printf '%s\n' 'readonly SCRIPT_VERSION="1.0.10"'
+  for line in {1..4096}; do
+    printf 'readonly SCRIPT_VERSION="9.9.%s"\n' "$line"
+  done
+} >"$metadata_fixture"
+[[ "$(script_version_from_file "$metadata_fixture")" == "1.0.10" ]]
+rm -f -- "$metadata_fixture"
+if grep -Eq '\|[[:space:]]*head([[:space:]]|$)' "${repo_root}/install-sing-box-server.sh"; then
+  printf 'Early-closing head pipeline remains in the installer.\n' >&2
+  exit 1
+fi
 
 # Subscription rendering only needs already-generated server secrets. Replacing
 # this loader keeps the test entirely inside its temporary directory.
@@ -49,6 +73,21 @@ REALITY_SHORT_ID="deadbeef"
 
 work="$(mktemp -d)"
 trap 'rm -rf -- "$work"' EXIT
+
+SSH_PORT="2222"
+write_firewall_candidate "${work}/vpn-filter.nft"
+grep -Fxq 'add table inet vpn_filter' "${work}/vpn-filter.nft"
+grep -Fxq 'flush table inet vpn_filter' "${work}/vpn-filter.nft"
+if grep -Fq 'flush ruleset' "${work}/vpn-filter.nft"; then
+  printf 'Managed firewall candidate still flushes the global nftables ruleset.\n' >&2
+  exit 1
+fi
+rollback_firewall_body="$(declare -f rollback_firewall)"
+if grep -Fq 'nft flush ruleset' <<<"$rollback_firewall_body"; then
+  printf 'Firewall rollback still flushes the global nftables ruleset.\n' >&2
+  exit 1
+fi
+grep -Fq 'nft delete table inet vpn_filter' <<<"$rollback_firewall_body"
 
 token="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 client="$(jq -cn \
@@ -163,11 +202,12 @@ payload="$(printf 'url = "file://%s/curl-source"\n' "$work" | \
 # and IPv4 addresses.
 hy2_secret="abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdef"
 health_sample="$(printf '%s\n' \
-  "password=${hy2_secret} from [2001:db8::10]:443 via 203.0.113.10" | \
+  "password=${hy2_secret} from [2001:db8::10]:443 via 203.0.113.10 vpn.example.com" | \
   redact_health_stream)"
 [[ "$health_sample" != *"$hy2_secret"* ]]
 [[ "$health_sample" != *"2001:db8::10"* ]]
 [[ "$health_sample" != *"203.0.113.10"* ]]
+[[ "$health_sample" != *"vpn.example.com"* ]]
 
 # Public addresses assigned through provider-managed 1:1 NAT need not appear
 # on a local interface. DNS and ACME remain the authoritative external gates.

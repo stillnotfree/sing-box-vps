@@ -13,7 +13,7 @@ body:
     attributes:
       label: Installer version
       description: Run `vpn health --verbose` and copy only the installer and runtime version lines.
-      placeholder: 1.0.7
+      placeholder: 1.0.10
     validations:
       required: true
 

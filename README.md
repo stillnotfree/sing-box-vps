@@ -57,6 +57,24 @@ shows a short summary and asks for confirmation with `[Y/n]`; pressing Enter
 accepts. An interrupted installation can normally be resumed with the same
 command.
 
+The selected REALITY target is audited automatically before it is saved. If
+the TLS 1.3/h2 requirements fail, an interactive installation asks for another
+target. If only the post-handshake comparison signal is observed, it offers the
+choice to keep the explicitly selected target or enter another one. `--yes`
+skips the final confirmation prompt; for the normal question-driven install,
+leave it out. An audit warning is accepted only through the interactive choice.
+
+## Source layout
+
+Development happens in the ordered Bash modules under `src/`. The public
+`install-sing-box-server.sh` is a generated, self-contained artifact, so a
+clean VPS still downloads and runs one file without Git or repository files.
+Regenerate it after module changes with:
+
+```bash
+scripts/build-standalone.sh
+```
+
 ## First login
 
 Keep the installer session open. In a second terminal, log in once with the new
@@ -86,11 +104,12 @@ Do not share this output: the links contain client credentials.
 | Check server health | `vpn health` |
 | Show detailed redacted health data | `vpn health --verbose` |
 | Check installation compatibility | `vpn check` |
-| List clients | `vpn list` |
-| Show links and QR codes | `vpn show NAME` |
+| List clients | `vpn show` |
+| Show private links and QR codes | `vpn show NAME` |
 | Add an independent client | `vpn add NAME` |
 | Revoke a client | `vpn delete NAME --yes` |
 | Update sing-box safely | `vpn update` |
+| Audit a REALITY target | `vpn audit-target [DOMAIN]` |
 | Change the REALITY target | `vpn set-target DOMAIN` |
 | Select a client fingerprint | `vpn set-fingerprint` |
 | Use native Hysteria2/QUIC | `vpn set-obfs off` |
@@ -134,6 +153,9 @@ configuration and can restore the cached previous package if startup fails.
 | Storage | 1 GiB swap when supported and absent, plus a 200 MiB / 30-day journal limit |
 | Updates | Automatic OS security updates and transactional sing-box updates |
 
+The installer owns only `table inet vpn_filter`; it does not flush unrelated
+nftables tables.
+
 ## Subscriptions
 
 Each client receives an unguessable HTTPS subscription URL on TCP/8443. The
@@ -167,22 +189,18 @@ vpn lockdown-ssh --yes
 vpn self-update /root/install-sing-box-server.sh
 ```
 
-If Let's Encrypt rejected an email saved during an interrupted installation:
-
-```bash
-./vpn-install.sh install --email you@your-domain.com
-```
-
 </details>
 
 <details>
 <summary><strong>Development checks</strong></summary>
 
 ```bash
-bash -n install-sing-box-server.sh
-shellcheck --severity=style install-sing-box-server.sh
+scripts/build-standalone.sh
+bash -n src/*.sh scripts/build-standalone.sh install-sing-box-server.sh tests/*.sh
+shellcheck --severity=style scripts/build-standalone.sh install-sing-box-server.sh tests/*.sh
 bash tests/static-smoke.sh
 bash tests/fingerprint-smoke.sh
+sudo bash tests/firewall-smoke.sh
 ./install-sing-box-server.sh plan
 ```
 
@@ -193,6 +211,12 @@ bash tests/fingerprint-smoke.sh
 This project was vibe-coded with AI assistance, then reviewed, tested, and
 iterated on real Debian and Ubuntu VPS installations. Read the code and assess
 the trade-offs before using it on infrastructure you do not control.
+
+The `audit-target` heuristic is based on the TLS 1.3 post-handshake detection
+research and MIT-licensed proof of concept in
+[Aparecium](https://github.com/ban6cat6/aparecium) by ban6cat6. This project
+uses only the narrow target-audit idea and does not vendor Aparecium or its Go
+dependencies.
 
 ## License
 
