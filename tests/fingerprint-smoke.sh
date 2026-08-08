@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
+# shellcheck disable=SC2016
 
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -9,11 +10,61 @@ repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck disable=SC1091
 source "${repo_root}/install-sing-box-server.sh"
 
-[[ "$SCRIPT_VERSION" == "1.0.8" ]]
+[[ "$SCRIPT_VERSION" == "1.0.10" ]]
 [[ "$SING_BOX_MIN_VERSION" == "1.13.0" ]]
 [[ "$SING_BOX_MAX_EXCLUSIVE" == "1.14.0" ]]
 (( ${#SUPPORTED_CLIENT_FINGERPRINTS[@]} == 9 ))
 (( ${#SUPPORTED_HY2_OBFS_MODES[@]} == 2 ))
+
+package_list="$(printf ' %s' "${BASE_PACKAGES[@]}")"
+for package in \
+  apt ca-certificates curl jq openssl nftables sudo certbot dnsutils qrencode \
+  nginx-light unattended-upgrades openssh-client openssh-server iproute2 procps \
+  kmod util-linux gpg
+do
+  [[ "${package_list} " == *" ${package} "* ]]
+done
+
+(
+  package_capture="$(mktemp)"
+  apt-get() {
+    if [[ "$1" == "install" ]]; then
+      shift
+      printf '%s\n' "$@" >"$package_capture"
+    fi
+  }
+  systemctl() { return 0; }
+  install_base_packages >/dev/null
+  grep -Fxq -- '--no-install-recommends' "$package_capture"
+  grep -Fxq util-linux "$package_capture"
+  grep -Fxq jq "$package_capture"
+  grep -Fxq gpg "$package_capture"
+  rm -f -- "$package_capture"
+)
+
+# Invalid interactive values must remain in the same prompt instead of
+# aborting a fresh installation. interactive_stdin is an intentional test seam.
+(
+  interactive_stdin() { return 0; }
+  ADMIN_USER=""
+  prompt_value ADMIN_USER '[Step 1 / 10] Administrative user' 'vpnadmin' \
+    admin_user_is_valid <<< $'Root!\nvpnadmin'
+  [[ "$ADMIN_USER" == "vpnadmin" ]]
+
+  SERVER_IPV4=""
+  prompt_value SERVER_IPV4 '[Step 3 / 10] Public VPS IPv4' '' ipv4_is_valid \
+    <<< $'999.1.2.3\n203.0.113.10'
+  [[ "$SERVER_IPV4" == "203.0.113.10" ]]
+
+  ACME_EMAIL=""
+  prompt_value ACME_EMAIL '[Step 5 / 10] ACME email' '' email_is_valid \
+    <<< $'admin@example.com\nadmin@vpn-mail.net'
+  [[ "$ACME_EMAIL" == "admin@vpn-mail.net" ]]
+
+  test_fingerprint=""
+  select_client_fingerprint test_fingerprint <<< $'invalid\n  FIREFOX  '
+  [[ "$test_fingerprint" == "firefox" ]]
+)
 
 validate_emoji "🇩🇪"
 if (validate_emoji $'\033[31m' >/dev/null 2>&1); then
@@ -25,6 +76,86 @@ parse_args set-fingerprint firefox --yes
 [[ "$COMMAND" == "set-fingerprint" ]]
 [[ "$NEW_CLIENT_FINGERPRINT" == "firefox" ]]
 (( ASSUME_YES == 1 ))
+
+(
+  COMMAND="plan"
+  CLIENT_NAME=""
+  parse_args show
+  [[ "$COMMAND" == "client-list" ]]
+  [[ -z "$CLIENT_NAME" ]]
+)
+
+(
+  COMMAND="plan"
+  CLIENT_NAME=""
+  parse_args show WorkPC
+  [[ "$COMMAND" == "client-show" ]]
+  [[ "$CLIENT_NAME" == "WorkPC" ]]
+)
+
+trap - ERR
+if unknown_output="$(bash "$repo_root/install-sing-box-server.sh" unsupported-command 2>&1)"; then
+  printf 'An unsupported command unexpectedly remains accepted.\n' >&2
+  exit 1
+fi
+trap on_error ERR
+grep -Fq 'Unknown command: unsupported-command' <<<"$unknown_output"
+if grep -Fq 'VPN settings are unavailable' <<<"$unknown_output"; then
+  printf 'Unknown commands are validated only after loading managed state.\n' >&2
+  exit 1
+fi
+
+(
+  COMMAND="plan"
+  AUDIT_TARGET=""
+  parse_args audit-target cdn.example.com
+  [[ "$COMMAND" == "audit-target" ]]
+  [[ "$AUDIT_TARGET" == "cdn.example.com" ]]
+)
+
+(
+  trap - ERR
+  require_command() { :; }
+  AUDIT_TARGET="tickets.example.com"
+  capture_reality_target_audit_probe() {
+    printf '%s\n' 'ALPN protocol: h2' '<<< TLS 1.3, Handshake, NewSessionTicket'
+  }
+  if audit_output="$(audit_reality_target 2>&1)"; then
+    printf 'A target with a post-handshake ticket unexpectedly passed the audit.\n' >&2
+    exit 1
+  fi
+  grep -Fq 'Aparecium-class comparison signal: OBSERVED' <<<"$audit_output"
+)
+
+(
+  require_command() { :; }
+  AUDIT_TARGET="no-tickets.example.com"
+  capture_reality_target_audit_probe() {
+    printf '%s\n' 'ALPN protocol: h2'
+  }
+  audit_output="$(audit_reality_target 2>&1)"
+  grep -Fq 'Aparecium-class comparison signal: NOT OBSERVED' <<<"$audit_output"
+)
+
+(
+  interactive_stdin() { return 0; }
+  audit_reality_target() {
+    [[ "$REALITY_TARGET" == "safe.example.com" ]]
+  }
+  ASSUME_YES=0
+  REALITY_TARGET="tickets.example.com"
+  select_audited_reality_target_for_install <<< $'n\nsafe.example.com'
+  [[ "$REALITY_TARGET" == "safe.example.com" ]]
+)
+
+(
+  interactive_stdin() { return 0; }
+  audit_reality_target() { return 1; }
+  ASSUME_YES=0
+  REALITY_TARGET="reviewed.example.com"
+  select_audited_reality_target_for_install <<< $'\n'
+  [[ "$REALITY_TARGET" == "reviewed.example.com" ]]
+)
 
 (
   COMMAND="plan"
@@ -67,6 +198,8 @@ if grep -Eq 'vpn (status|diagnostic)([[:space:]]|$)' <<<"$help_output"; then
   printf 'Removed management command is still advertised.\n' >&2
   exit 1
 fi
+grep -Fq 'vpn show [NAME]' <<<"$help_output"
+[[ "$(style_text '1;32' PASS)" == "PASS" ]]
 
 for fingerprint in chrome firefox safari ios android edge 360 qq random; do
   client_fingerprint_is_supported "$fingerprint"
@@ -100,6 +233,24 @@ HY2_OBFS_MODE="salamander"
 
 work="$(mktemp -d)"
 trap 'rm -rf -- "$work"' EXIT
+
+# The retained installer log is redacted and bounded while terminal output is
+# preserved verbatim. Generate input without an early-closing pipeline.
+exec 6>"${work}/terminal-output"
+awk 'BEGIN {
+  print "admin@vpn-mail.net 203.0.113.10 vpn.example.com 550e8400-e29b-41d4-a716-446655440000"
+  printf "\033[31mFAIL\033[0m\n"
+  for (i=0; i<120000; i++) print "0123456789abcdef"
+}' | capture_install_output "${work}/bounded.log"
+exec 6>&-
+grep -Fq 'admin@vpn-mail.net 203.0.113.10' "${work}/terminal-output"
+grep -Fq '[EMAIL-REDACTED] [IP-REDACTED] [DOMAIN-REDACTED] [UUID-REDACTED]' "${work}/bounded.log"
+grep -Fq '[LOG TRUNCATED:' "${work}/bounded.log"
+if LC_ALL=C grep -q "$(printf '\033')" "${work}/bounded.log"; then
+  printf 'ANSI terminal styling leaked into the retained installer log.\n' >&2
+  exit 1
+fi
+(( $(wc -c <"${work}/bounded.log") < 1050000 ))
 render_user_command_wrapper "${work}/vpn-command"
 sh -n "${work}/vpn-command"
 grep -Fxq 'exec sudo -n "$helper" "$@"' "${work}/vpn-command"
@@ -123,35 +274,6 @@ do
     exit 1
   fi
 done
-
-# A corrected --email must be able to replace a syntax-valid but ACME-rejected
-# address saved by an interrupted v1.0.0 installation.
-(
-  ADMIN_USER=""
-  ADMIN_PUBLIC_KEY=""
-  SERVER_IPV4=""
-  TLS_DOMAIN=""
-  ACME_EMAIL="admin@vpn-mail.net"
-  SSH_PORT=""
-  REALITY_TARGET=""
-  COUNTRY_EMOJI=""
-  CLIENT_FINGERPRINT=""
-  HY2_OBFS_MODE=""
-  load_settings() {
-    ADMIN_USER="vpnadmin"
-    ADMIN_PUBLIC_KEY="ssh-ed25519 test"
-    SERVER_IPV4="203.0.113.10"
-    TLS_DOMAIN="vpn.example.com"
-    ACME_EMAIL="random@example.com"
-    SSH_PORT="22"
-    REALITY_TARGET="www.example.com"
-    COUNTRY_EMOJI="🇩🇪"
-    CLIENT_FINGERPRINT="chrome"
-    HY2_OBFS_MODE="off"
-  }
-  load_resume_settings
-  [[ "$ACME_EMAIL" == "admin@vpn-mail.net" ]]
-)
 
 if declare -F configure_first_login_hook >/dev/null || declare -F render_first_login_hook >/dev/null; then
   printf 'Obsolete automatic first-login finalization hook is still present.\n' >&2
@@ -227,10 +349,43 @@ fi
 upgrade_body="$(declare -f upgrade_existing_installation)"
 grep -Fq 'reconcile_managed_runtime' <<<"$upgrade_body"
 grep -Fq 'write_runtime_version_marker' <<<"$upgrade_body"
-marker_line="$(grep -n 'write_runtime_version_marker' <<<"$upgrade_body" | head -n1 | cut -d: -f1)"
-health_line="$(grep -n '"$INSTALLED_HELPER" health' <<<"$upgrade_body" | head -n1 | cut -d: -f1)"
+marker_line="$(awk 'index($0, "write_runtime_version_marker") && !found {
+  line=NR
+  found=1
+} END { if (found) print line }' <<<"$upgrade_body")"
+health_line="$(awk 'index($0, "\"$INSTALLED_HELPER\" health") && !found {
+  line=NR
+  found=1
+} END { if (found) print line }' <<<"$upgrade_body")"
 [[ -n "$marker_line" && -n "$health_line" && "$marker_line" -lt "$health_line" ]]
+grep -Fq 'Refusing managed runtime downgrade' <<<"$upgrade_body"
 
+install_body="$(declare -f run_install)"
+grep -Fq 'acquire_bootstrap_lock' <<<"$install_body"
+grep -Fq 'install_base_packages' <<<"$install_body"
+grep -Fq 'acquire_install_flock' <<<"$install_body"
+grep -Fq 'switching install to safe overlay-update mode' <<<"$install_body"
+grep -Fq 'select_audited_reality_target_for_install' <<<"$install_body"
+audit_line="$(awk 'index($0, "select_audited_reality_target_for_install") && !found {
+  line=NR
+  found=1
+} END { if (found) print line }' <<<"$install_body")"
+save_line="$(awk 'index($0, "save_settings") && !found {
+  line=NR
+  found=1
+} END { if (found) print line }' <<<"$install_body")"
+[[ -n "$audit_line" && -n "$save_line" && "$audit_line" -lt "$save_line" ]]
+
+certificate_body="$(declare -f obtain_certificate)"
+grep -Fq 'Existing ACME certificate found; reusing it.' <<<"$certificate_body"
+firewall_body="$(declare -f confirm_firewall)"
+grep -Fq 'systemctl enable --now nftables.service' <<<"$firewall_body"
+firewall_health_body="$(declare -f managed_firewall_is_healthy)"
+grep -Fq 'systemctl is-enabled --quiet nftables.service' <<<"$firewall_health_body"
+grep -Fq 'systemctl is-active --quiet nftables.service' <<<"$firewall_health_body"
+health_details_body="$(declare -f health_details)"
+grep -Fq 'printf '\''%s\n'\'' "$health_summary" | redact_health_stream' \
+  <<<"$health_details_body"
 subscription_health_body="$(declare -f subscription_service_healthy)"
 grep -Fq -- '--resolve "${TLS_DOMAIN}:${SUBSCRIPTION_PORT}:127.0.0.1"' \
   <<<"$subscription_health_body"

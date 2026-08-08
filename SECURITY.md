@@ -19,3 +19,7 @@ domains, or unredacted installation logs in a report.
 Include the affected release, operating system, threat scenario, reproduction
 steps, and the smallest relevant code fragment. Reports are evaluated against
 the documented project scope and supported platforms.
+
+The installer retains at most five root-only, redacted installation logs of up
+to 1 MiB each under `/var/log/vpn-setup/`. Redaction is defense in depth, not a
+guarantee: review a log before sharing it and never commit logs to Git.

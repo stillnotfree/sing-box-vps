@@ -19,16 +19,22 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install test dependencies
-        run: sudo apt-get update && sudo apt-get install -y jq shellcheck
+        run: sudo apt-get update && sudo apt-get install -y jq nftables shellcheck
 
       - name: Check Bash syntax
-        run: bash -n install-sing-box-server.sh
+        run: bash -n src/*.sh scripts/build-standalone.sh install-sing-box-server.sh tests/*.sh
 
       - name: Run ShellCheck
-        run: shellcheck --severity=style install-sing-box-server.sh
+        run: shellcheck --severity=style scripts/build-standalone.sh install-sing-box-server.sh tests/*.sh
+
+      - name: Check generated standalone installer
+        run: scripts/build-standalone.sh && git diff --exit-code -- install-sing-box-server.sh
 
       - name: Run static smoke tests
         run: bash tests/static-smoke.sh
 
       - name: Run state smoke tests
         run: bash tests/fingerprint-smoke.sh
+
+      - name: Validate nftables candidate
+        run: sudo bash tests/firewall-smoke.sh

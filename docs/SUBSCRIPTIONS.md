@@ -86,10 +86,12 @@ provider dependency and must not be the default.
 
 ```text
 vpn add NAME          Create credentials and immediately print the URL and QR
+vpn show              List clients without printing secrets
 vpn show NAME         Print the existing URL, QR, and direct fallback links
 vpn delete NAME       Revoke protocol credentials and the subscription URL
-vpn list              List clients without printing secrets
 vpn set-target DOMAIN Validate and transactionally change the REALITY target
+vpn audit-target [DOMAIN]
+                      Audit post-handshake TLS 1.3 target behavior (read-only)
 vpn set-fingerprint   Interactively select and transactionally publish a fingerprint
 vpn set-fingerprint VALUE  Use an explicit supported fingerprint
 vpn set-obfs MODE     Transactionally switch Hysteria2 between off and salamander
@@ -100,6 +102,19 @@ subscription files in a private temporary directory; validate the target and
 candidate configuration; atomically replace files; restart sing-box; perform a
 local health check; and restore the previous state on any failure. The stable
 subscription URL does not change, so the user only presses Update in the client.
+
+`audit-target` uses the configured target when `DOMAIN` is omitted. It performs
+a read-only TLS 1.3/h2 probe and looks for post-handshake `NewSessionTicket`
+messages, following the detection insight demonstrated by Aparecium. No
+observed tickets returns success; observed tickets return a non-zero status and
+identify a comparison signal for that specific active-probing method. Neither
+result is a general censorship-resistance guarantee.
+
+Fresh interactive installations run this audit before persisting the selected
+target. A failed TLS 1.3/h2 requirement asks for another target; an observed
+comparison signal offers the choice to keep the explicitly selected target or
+enter another one. The `--yes` flag only skips the final confirmation; when
+stdin is not interactive, it is also required because prompts cannot be used.
 
 `set-fingerprint` changes client material only. It stages the settings and all
 subscription representations, verifies that both the decoded VLESS URI and the
