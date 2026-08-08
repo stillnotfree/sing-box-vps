@@ -18,3 +18,8 @@
 
 # Personal client tooling kept locally and never published with the server.
 /private/
+
+# An interrupted standalone build can leave this temporary sibling behind.
+/install-sing-box-server.sh.*
+
+# src/, scripts/, and tests/ are project files and must remain tracked.
