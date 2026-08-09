@@ -313,6 +313,7 @@ select_audited_reality_target_for_install() {
     AUDIT_TARGET="$REALITY_TARGET"
     if audit_reality_target; then
       AUDIT_TARGET=""
+      REALITY_TARGET_AUDITED=1
       return
     else
       audit_status=$?
@@ -330,12 +331,13 @@ select_audited_reality_target_for_install() {
       printf 'The target is technically usable, but the audit found a post-handshake comparison signal.\n'
       printf 'Keep %s anyway, or choose another target now.\n' "$REALITY_TARGET"
       while true; do
-        read_prompt 'Keep this target? [Y/n]: ' answer
+        read -r -p 'Keep this target? [Y/n]: ' answer
         answer="${answer:-y}"
         answer="$(printf '%s' "$answer" | tr '[:upper:]' '[:lower:]')"
         case "$answer" in
           y|yes|keep)
             log "Keeping explicitly accepted REALITY target ${REALITY_TARGET} despite the audit warning."
+            REALITY_TARGET_AUDITED=1
             return
             ;;
           n|no|new)

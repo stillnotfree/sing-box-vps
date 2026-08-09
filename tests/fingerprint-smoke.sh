@@ -144,8 +144,10 @@ fi
   }
   ASSUME_YES=0
   REALITY_TARGET="tickets.example.com"
+  REALITY_TARGET_AUDITED=0
   select_audited_reality_target_for_install <<< $'n\nsafe.example.com'
   [[ "$REALITY_TARGET" == "safe.example.com" ]]
+  (( REALITY_TARGET_AUDITED == 1 ))
 )
 
 (
@@ -153,8 +155,10 @@ fi
   audit_reality_target() { return 1; }
   ASSUME_YES=0
   REALITY_TARGET="reviewed.example.com"
+  REALITY_TARGET_AUDITED=0
   select_audited_reality_target_for_install <<< $'\n'
   [[ "$REALITY_TARGET" == "reviewed.example.com" ]]
+  (( REALITY_TARGET_AUDITED == 1 ))
 )
 
 (
@@ -231,8 +235,53 @@ COUNTRY_EMOJI="🇩🇪"
 CLIENT_FINGERPRINT="random"
 HY2_OBFS_MODE="salamander"
 
+(
+  audit_tool_dir="$(mktemp -d)"
+  printf '#!/bin/sh\nexit 0\n' >"${audit_tool_dir}/openssl"
+  printf '#!/bin/sh\nexit 0\n' >"${audit_tool_dir}/timeout"
+  chmod 0700 "${audit_tool_dir}/openssl" "${audit_tool_dir}/timeout"
+  PATH="${audit_tool_dir}:${PATH}"
+  REALITY_TARGET_AUDITED=0
+  audit_during_settings=0
+  select_audited_reality_target_for_install() {
+    audit_during_settings=1
+    REALITY_TARGET_AUDITED=1
+  }
+  collect_install_settings >/dev/null
+  (( audit_during_settings == 1 ))
+  (( REALITY_TARGET_AUDITED == 1 ))
+  rm -rf -- "$audit_tool_dir"
+)
+
 work="$(mktemp -d)"
 trap 'rm -rf -- "$work"' EXIT
+
+# A prompt without a newline must reach the terminal immediately instead of
+# waiting for the next logged line. This is the fresh-install interaction that
+# previously appeared to hang or reordered prompts ahead of their menus.
+mkfifo "${work}/prompt-stream"
+exec 6>"${work}/prompt-terminal"
+capture_install_output "${work}/prompt.log" <"${work}/prompt-stream" &
+prompt_capture_pid=$!
+exec 7>"${work}/prompt-stream"
+printf 'Prompt without newline: ' >&7
+prompt_visible=0
+for _ in {1..100}; do
+  if grep -Fq 'Prompt without newline: ' "${work}/prompt-terminal"; then
+    prompt_visible=1
+    break
+  fi
+  sleep 0.01
+done
+if (( prompt_visible == 0 )); then
+  printf 'Interactive prompt was buffered instead of reaching the terminal immediately.\n' >&2
+  exit 1
+fi
+printf 'answer\nNext line\n' >&7
+exec 7>&-
+wait "$prompt_capture_pid"
+exec 6>&-
+[[ "$(cat "${work}/prompt-terminal")" == $'Prompt without newline: answer\nNext line' ]]
 
 # The retained installer log is redacted and bounded while terminal output is
 # preserved verbatim. Generate input without an early-closing pipeline.
