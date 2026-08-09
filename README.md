@@ -59,12 +59,13 @@ command.
 
 The selected REALITY target is audited immediately when `openssl` and `timeout`
 are already available. Otherwise the installer explicitly defers the audit
-until dependencies are installed, but still runs it before saving settings. If
-the TLS 1.3/h2 requirements fail, an interactive installation asks for another
-target. If only the post-handshake comparison signal is observed, it offers the
-choice to keep the explicitly selected target or enter another one. `--yes`
-skips the final confirmation prompt; for the normal question-driven install,
-leave it out. An audit warning is accepted only through the interactive choice.
+until dependencies are installed, but still runs it before saving settings. A
+TLS 1.3, certificate-chain, or ALPN h2 failure requires another target. Zero
+observed `NewSessionTicket` messages is preferred only for this heuristic; one
+or more tickets produces a warning, but the target remains usable and can be
+kept by default. `--yes` skips the final confirmation prompt; for the normal
+question-driven install, leave it out. An audit warning is accepted only
+through the interactive choice.
 
 ## Source layout
 

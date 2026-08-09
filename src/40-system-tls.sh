@@ -257,53 +257,69 @@ verify_reality_target() {
 }
 
 capture_reality_target_audit_probe() {
-  local target="$1" output status=0
-  if output="$(timeout 12 openssl s_client \
+  local target="$1" destination="$2" status=0
+  if timeout 12 openssl s_client \
     -connect "${target}:443" \
     -servername "$target" \
     -tls1_3 -alpn h2 -verify_return_error -msg -ign_eof \
-    <<< $'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n' 2>&1)"; then
-    :
+    <<< $'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n' >"$destination" 2>&1; then
+    return
   else
     status=$?
-    if (( status != 124 )); then
-      printf '%s\n' "$output" >&2
-      return "$status"
-    fi
   fi
-  printf '%s\n' "$output"
+  (( status == 124 )) && return
+  return "$status"
 }
 
 audit_reality_target() {
-  local target="${AUDIT_TARGET:-$REALITY_TARGET}" tls_probe ticket_count
+  local target="${AUDIT_TARGET:-$REALITY_TARGET}" probe_file probe_status=0 ticket_count
+  local tls_state=FAIL certificate_state=FAIL alpn_state=FAIL
   require_command openssl
   require_command timeout
   validate_domain "$target"
 
   log "Auditing REALITY target ${target} for post-handshake TLS 1.3 session tickets."
-  if ! tls_probe="$(capture_reality_target_audit_probe "$target")"; then
-    warn "REALITY target ${target} did not complete the audit TLS 1.3 probe."
-    return 2
+  new_temp_dir
+  probe_file="${TMP_DIR}/reality-target-audit.raw"
+  if capture_reality_target_audit_probe "$target" "$probe_file"; then
+    probe_status=0
+  else
+    probe_status=$?
   fi
-  if ! grep -Eiq 'ALPN protocol:[[:space:]]*h2|ALPN[^[:alnum:]]+h2' <<<"$tls_probe"; then
-    warn "REALITY target ${target} did not negotiate HTTP/2 (ALPN h2)."
+
+  if LC_ALL=C grep -aEiq \
+    'New,[[:space:]]*TLSv1\.3|Protocol( version)?[[:space:]]*:[[:space:]]*TLSv1\.3' "$probe_file"; then
+    tls_state=PASS
+  fi
+  if LC_ALL=C grep -aEiq \
+    'Verify return code:[[:space:]]*0[[:space:]]*\(ok\)|Verification:[[:space:]]*OK' "$probe_file"; then
+    certificate_state=PASS
+  fi
+  if LC_ALL=C grep -aEiq \
+    'ALPN protocol:[[:space:]]*h2|ALPN[^[:alnum:]]+h2' "$probe_file"; then
+    alpn_state=PASS
+  fi
+
+  print_title 'REALITY target audit'
+  printf '  Target         %s\n' "$target"
+  print_status_row 'TLS 1.3' "$tls_state" 'negotiated'
+  print_status_row 'Certificate' "$certificate_state" 'trusted'
+  print_status_row 'ALPN h2' "$alpn_state" 'negotiated'
+
+  if (( probe_status != 0 )) || [[ "$tls_state" != PASS || "$certificate_state" != PASS || "$alpn_state" != PASS ]]; then
+    print_status_row Assessment FAIL 'Choose another target.'
     return 2
   fi
 
-  ticket_count="$(grep -Ec 'NewSessionTicket' <<<"$tls_probe" || true)"
-  print_title 'REALITY target audit'
-  printf 'Target: %s\n' "$target"
-  printf 'TLS 1.3 certificate and ALPN h2: PASS\n'
-  printf 'Post-handshake NewSessionTicket messages: %s\n' "$ticket_count"
+  ticket_count="$(LC_ALL=C grep -aEc 'NewSessionTicket' "$probe_file" || true)"
   if (( ticket_count == 0 )); then
-    printf 'Aparecium-class comparison signal: NOT OBSERVED\n'
-    printf 'This lowers exposure to this specific active-probing method; it is not a general undetectability guarantee.\n'
+    print_status_row Tickets PASS '0 NewSessionTicket messages observed'
+    print_status_row Assessment PASS 'Preferred for this specific Aparecium-class heuristic.'
     return
   fi
 
-  printf 'Aparecium-class comparison signal: OBSERVED\n'
-  warn 'This target exposes a post-handshake comparison signal that can make REALITY easier to distinguish during active probing.'
-  printf 'Prefer a reviewed TLS 1.3/h2 target with no observed post-handshake tickets.\n'
+  print_status_row Tickets WARN "${ticket_count} NewSessionTicket message(s) observed"
+  print_status_row Assessment WARN 'Usable; zero tickets is preferred for this specific heuristic.'
   return 1
 }
 
@@ -322,16 +338,14 @@ select_audited_reality_target_for_install() {
 
     if (( ASSUME_YES == 1 )) || ! interactive_stdin; then
       if (( audit_status == 1 )); then
-        die "REALITY target ${REALITY_TARGET} exposes the audited post-handshake comparison signal; rerun with a different --reality-target."
+        die "REALITY target ${REALITY_TARGET} is usable but produced an audit warning; rerun interactively to accept it or choose a zero-ticket --reality-target."
       fi
-      die "REALITY target ${REALITY_TARGET} could not pass the TLS 1.3/h2 audit; rerun with a different --reality-target."
+      die "REALITY target ${REALITY_TARGET} failed a required TLS 1.3, certificate, or ALPN h2 check; rerun with a different --reality-target."
     fi
 
     if (( audit_status == 1 )); then
-      printf 'The target is technically usable, but the audit found a post-handshake comparison signal.\n'
-      printf 'Keep %s anyway, or choose another target now.\n' "$REALITY_TARGET"
       while true; do
-        read -r -p 'Keep this target? [Y/n]: ' answer
+        read -r -p "Use ${REALITY_TARGET} anyway? [Y/n]: " answer
         answer="${answer:-y}"
         answer="$(printf '%s' "$answer" | tr '[:upper:]' '[:lower:]')"
         case "$answer" in
@@ -346,12 +360,12 @@ select_audited_reality_target_for_install() {
             break
             ;;
           *)
-            warn 'Answer yes to keep this target or no to enter another one.'
+            warn 'Answer yes to use this target or no to enter another one.'
             ;;
         esac
       done
     else
-      warn "Choose another REALITY target; ${REALITY_TARGET} did not pass the TLS 1.3/h2 requirements."
+      warn "Choose another REALITY target; ${REALITY_TARGET} failed a required TLS, certificate, or ALPN check."
       REALITY_TARGET=""
       prompt_value REALITY_TARGET 'Replacement REALITY target' '' domain_is_valid
     fi
