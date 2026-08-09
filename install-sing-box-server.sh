@@ -49,6 +49,7 @@ readonly RUNTIME_VERSION_FILE="${STATE_DIR}/runtime.version"
 readonly INSTALL_LOCK_FILE="${STATE_DIR}/install.lock"
 readonly FIREWALL_LOCK_FILE="${STATE_DIR}/firewall.lock"
 readonly PACKAGE_CACHE_DIR="${STATE_DIR}/packages"
+readonly APT_DOWNLOAD_ROOT="/var/cache/${PROJECT_NAME}-apt-downloads"
 readonly INSTALLER_BACKUP_DIR="${STATE_DIR}/installer-backups"
 readonly INITIAL_CLIENT_NAME="default"
 readonly DEFAULT_CLIENT_FINGERPRINT="chrome"
@@ -78,11 +79,13 @@ readonly AUTO_FINALIZE_REMOVAL_STAGE="${STATE_DIR}/vpn-auto-finalize.conf.removi
 readonly INSTALLED_HELPER="/usr/local/sbin/vpn"
 readonly USER_COMMAND="/usr/local/bin/vpn"
 readonly CERT_HOOK="/etc/letsencrypt/renewal-hooks/deploy/50-vpn-sing-box"
+readonly UNATTENDED_UPGRADES_CONFIG="/etc/apt/apt.conf.d/52-vpn-unattended-upgrades"
 readonly FIREWALL_UNIT_STATE="${STATE_DIR}/firewall.rollback.unit"
 readonly LOG_DIR="/var/log/${PROJECT_NAME}"
 readonly BOOTSTRAP_LOCK_DIR="${STATE_DIR}/install.bootstrap.lock"
 readonly INSTALL_LOG_MAX_BYTES="1048576"
 readonly INSTALL_LOG_RETENTION="5"
+readonly NTP_BOOT_GRACE_SECONDS="300"
 readonly -a BASE_PACKAGES=(
   apt ca-certificates curl jq openssl nftables sudo certbot dnsutils qrencode
   nginx-light unattended-upgrades openssh-client openssh-server iproute2 procps
@@ -107,6 +110,7 @@ DEBUG=0
 COMMAND="plan"
 TMP_DIR=""
 TEMP_ROOT=""
+APT_DOWNLOAD_DIR=""
 CLIENT_NAME=""
 NEW_REALITY_TARGET=""
 AUDIT_TARGET=""
@@ -174,6 +178,7 @@ print_status_value() {
   case "$value" in
     PASS|OK|HEALTHY) style_text '1;32' "$value" ;;
     WARN) style_text '1;33' "$value" ;;
+    INFO|PENDING) style_text '1;36' "$value" ;;
     FAIL|UNHEALTHY) style_text '1;31' "$value" ;;
     *) printf '%s' "$value" ;;
   esac
@@ -199,6 +204,11 @@ die() {
 cli_error() {
   printf '[ERROR] %s\n' "$*" >&2
   exit 1
+}
+
+cancel_command() {
+  printf 'Cancelled; no changes made.\n'
+  exit 0
 }
 
 cli_options_are_close() {
@@ -465,6 +475,9 @@ cleanup() {
     printf '[FATAL] Preserved incomplete overlay rollback state for manual recovery: %s\n' \
       "$UPGRADE_BACKUP_DIR" >&2
   fi
+  if declare -F cleanup_apt_download_dir >/dev/null; then
+    cleanup_apt_download_dir
+  fi
   release_bootstrap_lock
   finish_install_log
 }
@@ -500,7 +513,7 @@ Usage:
   vpn self-update /path/to/new/install-sing-box-server.sh
 
 Install options (missing values are requested interactively):
-  --admin-user NAME        Administrative account to create.
+  --admin-user NAME        Full administrative account with passwordless sudo.
   --public-key KEY         One quoted OpenSSH public-key line. Never a private key.
   --server-ipv4 ADDRESS    Public IPv4 address of the VPS.
   --domain DOMAIN          Domain whose A record points to the VPS.
@@ -668,17 +681,17 @@ require_root() {
 require_confirmation() {
   local answer
   (( ASSUME_YES == 1 )) && return
-  [[ -t 0 ]] || die 'Mutating non-interactive commands require --yes.'
+  interactive_stdin || cli_error 'Mutating non-interactive commands require --yes.'
   read -r -p 'Continue? [y/N] ' answer
-  [[ "$answer" =~ ^[Yy]$ ]] || die 'Cancelled.'
+  [[ "$answer" =~ ^[Yy]$ ]] || cancel_command
 }
 
 require_install_confirmation() {
   local answer
   (( ASSUME_YES == 1 )) && return
-  [[ -t 0 ]] || die 'Non-interactive installation requires --yes.'
+  interactive_stdin || die 'Non-interactive installation requires --yes.'
   read -r -p '[Step 10 / 10] Install now? [Y/n] ' answer
-  [[ -z "$answer" || "$answer" =~ ^[Yy]$ ]] || die 'Cancelled.'
+  [[ -z "$answer" || "$answer" =~ ^[Yy]$ ]] || cancel_command
 }
 
 require_command() {
@@ -1209,7 +1222,7 @@ preflight_os() {
 
 preflight_hardware_and_runtime() {
   local mem_kib min_mem_kib min_mem_label cpu_count virtualization pid_one
-  local epoch ntp_state
+  local epoch ntp_state boot_uptime
 
   [[ -r /proc/1/comm ]] || die 'Unable to inspect the init process through /proc/1/comm.'
   pid_one="$(</proc/1/comm)"
@@ -1239,7 +1252,15 @@ preflight_hardware_and_runtime() {
     die 'System clock is implausible; correct date/time before TLS and ACME operations.'
   fi
   ntp_state="$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)"
-  [[ "$ntp_state" == "yes" ]] || warn 'System clock is not currently reported as NTP-synchronized.'
+  if [[ "$ntp_state" != "yes" ]]; then
+    boot_uptime="$(cut -d ' ' -f 1 /proc/uptime 2>/dev/null || true)"
+    boot_uptime="${boot_uptime%%.*}"
+    if [[ "$boot_uptime" =~ ^[0-9]+$ ]] && (( boot_uptime < NTP_BOOT_GRACE_SECONDS )); then
+      log 'NTP synchronization is still pending during the initial boot grace period.'
+    else
+      warn 'System clock is not currently reported as NTP-synchronized.'
+    fi
+  fi
 
   virtualization="$(systemd-detect-virt 2>/dev/null || true)"
   virtualization="${virtualization:-none}"
@@ -1394,18 +1415,45 @@ sing_box_candidate_version() {
   '
 }
 
+cleanup_apt_download_dir() {
+  [[ -n "$APT_DOWNLOAD_DIR" ]] || return 0
+  case "$APT_DOWNLOAD_DIR" in
+    "${APT_DOWNLOAD_ROOT}"/download.*)
+      rm -rf -- "$APT_DOWNLOAD_DIR"
+      ;;
+    *)
+      warn "Refusing to remove unexpected APT download directory: ${APT_DOWNLOAD_DIR}"
+      ;;
+  esac
+  APT_DOWNLOAD_DIR=""
+}
+
+prepare_apt_download_dir() {
+  id _apt >/dev/null 2>&1 || die 'The required APT sandbox account _apt is unavailable.'
+  cleanup_apt_download_dir
+  # The parent is traversable but not listable. Each unpredictable child is
+  # private to _apt, so apt-get can retain its sandbox without a 0777 staging
+  # directory or an unsandboxed-root fallback.
+  install -d -o root -g root -m 0711 "$APT_DOWNLOAD_ROOT"
+  APT_DOWNLOAD_DIR="$(mktemp -d "${APT_DOWNLOAD_ROOT}/download.XXXXXX")"
+  chown _apt:root "$APT_DOWNLOAD_DIR"
+  chmod 0700 "$APT_DOWNLOAD_DIR"
+}
+
 download_sing_box_package() {
-  local version="$1" destination="$2" package
-  install -d -o root -g root -m 0700 "$destination"
+  local version="$1" output_variable="$2" package
+  prepare_apt_download_dir
   (
-    cd "$destination"
+    cd "$APT_DOWNLOAD_DIR"
     apt-get download "sing-box=${version}" >/dev/null
   )
-  package="$(find "$destination" -maxdepth 1 -type f -name 'sing-box_*.deb' -print -quit)"
+  package="$(find "$APT_DOWNLOAD_DIR" -maxdepth 1 -type f -name 'sing-box_*.deb' -print -quit)"
   [[ -n "$package" ]] || die "Could not download sing-box ${version}."
+  chown root:root "$package"
+  chmod 0600 "$package"
   [[ "$(dpkg-deb -f "$package" Package)" == "sing-box" ]] || die 'Downloaded package name is not sing-box.'
   [[ "$(dpkg-deb -f "$package" Version)" == "$version" ]] || die 'Downloaded sing-box version does not match APT metadata.'
-  printf '%s\n' "$package"
+  printf -v "$output_variable" '%s' "$package"
 }
 
 archive_sing_box_package() {
@@ -1453,21 +1501,22 @@ install_sing_box() {
   if [[ "$installed_version" == "$candidate" ]]; then
     require_supported_sing_box_version "$installed_version"
     if ! find_cached_sing_box_package "$installed_version" >/dev/null; then
-      new_temp_dir
-      package_path="$(download_sing_box_package "$candidate" "$TMP_DIR")"
+      download_sing_box_package "$candidate" package_path
       archive_sing_box_package "$package_path" >/dev/null
+      cleanup_apt_download_dir
     fi
     apt-mark hold sing-box >/dev/null
     log "Verified existing stable sing-box ${installed_version}; reusing it."
     return
   fi
 
-  new_temp_dir
-  package_path="$(download_sing_box_package "$candidate" "$TMP_DIR")"
+  download_sing_box_package "$candidate" package_path
   package_path="$(archive_sing_box_package "$package_path")"
+  cleanup_apt_download_dir
 
   apt-mark unhold sing-box >/dev/null 2>&1 || true
-  DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-change-held-packages "$package_path"
+  DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-change-held-packages \
+    "sing-box=${candidate}"
   installed_version="$(dpkg-query -W -f='${Version}' sing-box 2>/dev/null || true)"
   [[ "$installed_version" == "$candidate" ]] || die "Unexpected installed sing-box version: ${installed_version:-missing}"
   apt-mark hold sing-box >/dev/null
@@ -1676,18 +1725,110 @@ EOF
   log 'Limited persistent journal storage to 200 MiB with a 30-day retention ceiling.'
 }
 
-configure_unattended_upgrades() {
-  local candidate
-  candidate="$(mktemp)"
-  cat >"$candidate" <<'EOF'
-// VPN setup: security updates without automatic reboot.
+render_unattended_upgrades_config() {
+  local output="$1" host_os_id="$2"
+  cat >"$output" <<'EOF'
+// VPN setup: automatic security updates only; no automatic reboot.
 APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
+#clear Unattended-Upgrade::Origins-Pattern;
+#clear Unattended-Upgrade::Allowed-Origins;
+Unattended-Upgrade::Origins-Pattern {
+EOF
+  case "$host_os_id" in
+    debian)
+      printf '%s\n' \
+        "  \"origin=Debian,codename=\${distro_codename},label=Debian-Security\";" \
+        "  \"origin=Debian,codename=\${distro_codename}-security,label=Debian-Security\";" \
+        >>"$output"
+      ;;
+    ubuntu)
+      printf '%s\n' \
+        "  \"origin=Ubuntu,archive=\${distro_codename}-security,label=Ubuntu\";" \
+        >>"$output"
+      ;;
+    *)
+      die "Unsupported unattended-upgrades policy target: ${host_os_id:-unknown}"
+      ;;
+  esac
+  cat >>"$output" <<'EOF'
+};
 Unattended-Upgrade::Automatic-Reboot "false";
 EOF
-  write_atomic /etc/apt/apt.conf.d/52-vpn-unattended-upgrades root root 0644 "$candidate"
+}
+
+unattended_policy_dump_is_security_only() {
+  local host_os_id="$1" effective_dump="$2" line origin origins=""
+  local debian_release_security debian_pocket_security ubuntu_pocket_security
+  debian_release_security="origin=Debian,codename=\${distro_codename},label=Debian-Security"
+  debian_pocket_security="origin=Debian,codename=\${distro_codename}-security,label=Debian-Security"
+  ubuntu_pocket_security="origin=Ubuntu,archive=\${distro_codename}-security,label=Ubuntu"
+  UNATTENDED_POLICY_REASON=""
+  if ! grep -Fq 'APT::Periodic::Update-Package-Lists "1";' <<<"$effective_dump"; then
+    UNATTENDED_POLICY_REASON='periodic package-list updates are disabled'
+    return 1
+  fi
+  if ! grep -Fq 'APT::Periodic::Unattended-Upgrade "1";' <<<"$effective_dump"; then
+    UNATTENDED_POLICY_REASON='unattended upgrades are disabled'
+    return 1
+  fi
+  if ! grep -Fq 'Unattended-Upgrade::Automatic-Reboot "false";' <<<"$effective_dump"; then
+    UNATTENDED_POLICY_REASON='automatic reboot is not disabled'
+    return 1
+  fi
+  origins="$(awk '
+    /^Unattended-Upgrade::Origins-Pattern::/ ||
+    /^Unattended-Upgrade::Allowed-Origins::/ {print}
+  ' <<<"$effective_dump")"
+  if [[ -z "$origins" ]]; then
+    UNATTENDED_POLICY_REASON='no unattended-upgrade origins are configured'
+    return 1
+  fi
+  while IFS= read -r line; do
+    origin="${line#*\"}"
+    origin="${origin%\";*}"
+    case "$host_os_id" in
+      debian)
+        case "$origin" in
+          "$debian_release_security"|"$debian_pocket_security") ;;
+          *)
+            UNATTENDED_POLICY_REASON='a non-security Debian origin is allowed'
+            return 1
+            ;;
+        esac
+        ;;
+      ubuntu)
+        if [[ "$origin" != "$ubuntu_pocket_security" ]]; then
+          UNATTENDED_POLICY_REASON='a non-security Ubuntu origin is allowed'
+          return 1
+        fi
+        ;;
+      *)
+        UNATTENDED_POLICY_REASON="unsupported distribution policy: ${host_os_id:-unknown}"
+        return 1
+        ;;
+    esac
+  done <<<"$origins"
+}
+
+configure_unattended_upgrades() {
+  local candidate effective_dump host_os_id="$OS_ID"
+  if [[ -z "$host_os_id" && -r /etc/os-release ]]; then
+    host_os_id="$(sed -n 's/^ID=//p' /etc/os-release | tr -d '"' | sed -n '1p')"
+  fi
+  candidate="$(mktemp)"
+  render_unattended_upgrades_config "$candidate" "$host_os_id"
+  write_atomic "$UNATTENDED_UPGRADES_CONFIG" root root 0644 "$candidate"
   rm -f -- "$candidate"
+  effective_dump="$(apt-config dump)"
+  unattended_policy_dump_is_security_only "$host_os_id" "$effective_dump" || \
+    die "Effective unattended-upgrades policy is invalid: ${UNATTENDED_POLICY_REASON}."
   systemctl enable --now apt-daily.timer apt-daily-upgrade.timer >/dev/null
+  systemctl is-enabled --quiet apt-daily.timer || die 'apt-daily.timer is not enabled.'
+  systemctl is-enabled --quiet apt-daily-upgrade.timer || die 'apt-daily-upgrade.timer is not enabled.'
+  systemctl is-active --quiet apt-daily.timer || die 'apt-daily.timer is not active.'
+  systemctl is-active --quiet apt-daily-upgrade.timer || die 'apt-daily-upgrade.timer is not active.'
+  log "Configured ${host_os_id} unattended upgrades for security origins only, without automatic reboot."
 }
 
 verify_dns() {
@@ -1714,41 +1855,6 @@ verify_dns() {
     fi
   done
   log "DNS A and CAA responses for ${TLS_DOMAIN} are healthy on both public resolvers."
-}
-
-verify_reality_target() {
-  local probe_file probe_status=0
-  log "Checking TLS 1.3 reachability of the reviewed REALITY target ${REALITY_TARGET}."
-  if [[ -z "$TMP_DIR" || ! -d "$TMP_DIR" ]]; then
-    new_temp_dir
-  fi
-  probe_file="$(mktemp "${TMP_DIR}/reality-target-verify.XXXXXX")"
-  chmod 0600 "$probe_file"
-  if timeout 15 openssl s_client \
-    -connect "${REALITY_TARGET}:443" \
-    -servername "$REALITY_TARGET" \
-    -verify_hostname "$REALITY_TARGET" \
-    -tls1_3 -alpn h2 -verify_return_error </dev/null >"$probe_file" 2>&1; then
-    probe_status=0
-  else
-    probe_status=$?
-  fi
-  if (( probe_status != 0 )); then
-    die "REALITY target ${REALITY_TARGET} did not pass the TLS 1.3 verification test."
-  fi
-  if ! LC_ALL=C grep -aEiq \
-    'New,[[:space:]]*TLSv1\.3|Protocol( version)?[[:space:]]*:[[:space:]]*TLSv1\.3' "$probe_file"; then
-    die "REALITY target ${REALITY_TARGET} did not negotiate TLS 1.3."
-  fi
-  if ! LC_ALL=C grep -aEiq \
-    'Verify return code:[[:space:]]*0[[:space:]]*\(ok\)|Verification:[[:space:]]*OK' "$probe_file"; then
-    die "REALITY target ${REALITY_TARGET} failed certificate or SNI verification."
-  fi
-  if ! LC_ALL=C grep -aEiq \
-    'ALPN protocol:[[:space:]]*h2|ALPN[^[:alnum:]]+h2' "$probe_file"; then
-    die "REALITY target ${REALITY_TARGET} did not negotiate HTTP/2 (ALPN h2)."
-  fi
-  log "REALITY target ${REALITY_TARGET} passed the basic certificate, TLS 1.3, and ALPN h2 checks."
 }
 
 capture_reality_target_audit_probe() {
@@ -1822,7 +1928,7 @@ audit_reality_target() {
   local comparison_signal=UNKNOWN result reason="" ticket_word=tickets
   require_command openssl
   require_command timeout
-  validate_domain "$target"
+  domain_is_valid "$target" || cli_error "Invalid fully qualified domain: $target"
 
   if [[ -z "$TMP_DIR" || ! -d "$TMP_DIR" ]]; then
     new_temp_dir
@@ -1920,6 +2026,7 @@ audit_reality_target() {
   fi
   printf 'Comparison signal: %s\n' "$comparison_signal"
   printf 'Result: %s\n' "$result"
+  printf 'Note: TLS 1.3 session tickets are normal; this WARN is only the comparison heuristic.\n'
   print_reality_target_audit_debug "$probe_status" "$raw_file" "$text_file"
   return 1
 }
@@ -2156,7 +2263,32 @@ obtain_certificate() {
 validate_client_name() {
   local value="$1"
   [[ "$value" =~ ^[A-Za-z][A-Za-z0-9._-]{0,31}$ ]] || \
-    die 'Client name must start with a letter and contain only A-Z, a-z, 0-9, dot, underscore, or hyphen (maximum 32 characters).'
+    cli_error 'Client name must start with a letter and contain only A-Z, a-z, 0-9, dot, underscore, or hyphen (maximum 32 characters).'
+}
+
+require_client_name_available() {
+  local name="$1" existing_client="$2"
+  [[ -z "$existing_client" ]] || \
+    cli_error "Client ${name} already exists (names are case-insensitive)."
+}
+
+require_existing_client() {
+  local name="$1" existing_client="$2"
+  [[ -n "$existing_client" ]] || cli_error "Client ${name} does not exist."
+}
+
+append_client_to_database() {
+  local database="$1" client="$2" output="$3"
+  jq --argjson client "$client" '.clients += [$client]' "$database" >"$output"
+  validate_client_database "$output"
+}
+
+remove_client_from_database() {
+  local database="$1" name="$2" output="$3"
+  jq --arg name "$name" \
+    '.clients |= map(select((.name | ascii_downcase) != ($name | ascii_downcase)))' \
+    "$database" >"$output"
+  validate_client_database "$output"
 }
 
 validate_client_database() {
@@ -2575,34 +2707,33 @@ reconcile_managed_runtime() {
 client_add() {
   local candidate uuid hy2 token client
   require_client_runtime
+  validate_client_name "$CLIENT_NAME"
   acquire_operation_lock
   require_client_runtime
-  validate_client_name "$CLIENT_NAME"
   exec 9>"$CLIENT_LOCK_FILE"
   flock -x 9
+  require_client_name_available "$CLIENT_NAME" "$(find_client_json "$CLIENT_NAME")"
 
-  if [[ -n "$(find_client_json "$CLIENT_NAME")" ]]; then
-    die "Client ${CLIENT_NAME} already exists (names are case-insensitive)."
-  fi
-
+  CURRENT_STEP='client add transaction'
   new_temp_dir
   candidate="${TMP_DIR}/clients.candidate.json"
   uuid="$(cat /proc/sys/kernel/random/uuid)"
   hy2="$(openssl rand -hex 24)"
   token="$(openssl rand -hex 32)"
-  jq \
+  client="$(jq -cn \
     --arg name "$CLIENT_NAME" \
     --arg uuid "$uuid" \
     --arg hy2 "$hy2" \
     --arg token "$token" \
     --arg created "$(date --iso-8601=seconds)" \
-    '.clients += [{
+    '{
       name: $name,
       vless_uuid: $uuid,
       hy2_password: $hy2,
       subscription_token: $token,
       created_at: $created
-    }]' "$CLIENTS_FILE" >"$candidate"
+    }')"
+  append_client_to_database "$CLIENTS_FILE" "$client" "$candidate"
   apply_client_database "$candidate"
   log "Client ${CLIENT_NAME} added with independent VLESS and Hysteria2 credentials."
   client="$(find_client_json "$CLIENT_NAME")"
@@ -2901,28 +3032,28 @@ client_show() {
   exec 9>"$CLIENT_LOCK_FILE"
   flock -s 9
   client="$(find_client_json "$CLIENT_NAME")"
-  [[ -n "$client" ]] || die "Client ${CLIENT_NAME} does not exist."
+  require_existing_client "$CLIENT_NAME" "$client"
   show_client_material "$client"
 }
 
 client_delete() {
-  local candidate stored_name count
-  require_client_runtime
-  acquire_operation_lock
+  local candidate stored_name count existing_client
   require_client_runtime
   validate_client_name "$CLIENT_NAME"
+  acquire_operation_lock
+  require_client_runtime
   exec 9>"$CLIENT_LOCK_FILE"
   flock -x 9
-  stored_name="$(find_client_json "$CLIENT_NAME" | jq -r '.name')"
-  [[ -n "$stored_name" ]] || die "Client ${CLIENT_NAME} does not exist."
+  existing_client="$(find_client_json "$CLIENT_NAME")"
+  require_existing_client "$CLIENT_NAME" "$existing_client"
+  stored_name="$(jq -r '.name' <<<"$existing_client")"
   count="$(jq '.clients | length' "$CLIENTS_FILE")"
-  (( count > 1 )) || die 'Refusing to delete the last VPN client. Add a replacement client first.'
+  (( count > 1 )) || cli_error 'Refusing to delete the last VPN client. Add a replacement client first.'
 
+  CURRENT_STEP='client delete transaction'
   new_temp_dir
   candidate="${TMP_DIR}/clients.candidate.json"
-  jq --arg name "$stored_name" \
-    '.clients |= map(select((.name | ascii_downcase) != ($name | ascii_downcase)))' \
-    "$CLIENTS_FILE" >"$candidate"
+  remove_client_from_database "$CLIENTS_FILE" "$stored_name" "$candidate"
   apply_client_database "$candidate"
   log "Client ${stored_name} deleted; its VLESS UUID and Hysteria2 password are no longer accepted."
 }
@@ -2957,19 +3088,36 @@ restore_target_transaction() {
 
 set_reality_target() {
   local old_target candidate_settings candidate_config candidate_subscriptions old_subscriptions
-  local settings_backup config_backup failed=0
+  local settings_backup config_backup previous_audit_target audit_status=0 failed=0
   require_client_runtime
-  validate_domain "$NEW_REALITY_TARGET"
+  domain_is_valid "$NEW_REALITY_TARGET" || \
+    cli_error "Invalid fully qualified domain: $NEW_REALITY_TARGET"
   old_target="$REALITY_TARGET"
   if [[ "$NEW_REALITY_TARGET" == "$old_target" ]]; then
     printf 'REALITY target is already %s; nothing changed.\n' "$old_target"
     return
   fi
 
+  previous_audit_target="$AUDIT_TARGET"
+  AUDIT_TARGET="$NEW_REALITY_TARGET"
+  if audit_reality_target; then
+    audit_status=0
+  else
+    audit_status=$?
+  fi
+  AUDIT_TARGET="$previous_audit_target"
+  if (( audit_status == 2 )); then
+    cli_error "REALITY target ${NEW_REALITY_TARGET} failed the shared audit; no changes were made."
+  fi
+
   printf 'REALITY target change: %s -> %s\n' "$old_target" "$NEW_REALITY_TARGET"
   printf 'All client subscriptions will be regenerated; their URLs will stay unchanged.\n'
+  if (( audit_status == 1 )); then
+    printf 'The target is usable but has the comparison-heuristic warning shown above.\n'
+  fi
   require_confirmation
 
+  CURRENT_STEP='REALITY target transaction'
   acquire_operation_lock
   load_settings
   require_client_runtime
@@ -2993,7 +3141,6 @@ set_reality_target() {
   install -o root -g root -m 0600 "$CONFIG_FILE" "$config_backup"
 
   REALITY_TARGET="$NEW_REALITY_TARGET"
-  verify_reality_target
   render_settings "$candidate_settings"
   build_sing_box_config "$CLIENTS_FILE" "$candidate_config"
   render_subscription_tree "$CLIENTS_FILE" "$candidate_subscriptions"
@@ -3061,6 +3208,7 @@ set_client_fingerprint() {
   printf 'Connected clients keep their current profile until their subscription is refreshed.\n'
   require_confirmation
 
+  CURRENT_STEP='client fingerprint transaction'
   acquire_operation_lock
   load_settings
   require_client_runtime
@@ -3144,6 +3292,7 @@ set_hy2_obfs() {
   printf 'Subscription URLs will stay unchanged, but every Hysteria2 client must refresh.\n'
   require_confirmation
 
+  CURRENT_STEP='Hysteria2 obfuscation transaction'
   acquire_operation_lock
   load_settings
   require_client_runtime
@@ -3796,13 +3945,14 @@ update_sing_box() {
   dpkg --compare-versions "$candidate" gt "$installed" || die "Refusing non-upgrade candidate ${candidate} over ${installed}."
 
   new_temp_dir
-  new_package="$(download_sing_box_package "$candidate" "${TMP_DIR}/download")"
+  download_sing_box_package "$candidate" new_package
   candidate_root="${TMP_DIR}/candidate-root"
   mkdir -p "$candidate_root"
   dpkg-deb -x "$new_package" "$candidate_root"
   [[ -x "${candidate_root}/usr/bin/sing-box" ]] || die 'Candidate package does not contain the sing-box binary.'
   "${candidate_root}/usr/bin/sing-box" check -c "$CONFIG_FILE"
   new_package="$(archive_sing_box_package "$new_package")"
+  cleanup_apt_download_dir
 
   log "Installing validated sing-box ${candidate} (rollback: ${installed})."
   dpkg --force-confold -i "$new_package" >/dev/null 2>&1 || failed=1
@@ -3827,26 +3977,88 @@ update_sing_box() {
   log "sing-box updated successfully: ${installed} -> ${candidate}."
 }
 
+health_build_redaction_literals() {
+  local output="$1" value
+  # Keep the first awk input non-empty. With an empty first file, portable awk
+  # cannot distinguish it from stdin using FNR == NR and would consume every
+  # diagnostic line as a literal definition.
+  printf '\t\n' >"$output"
+  chmod 0600 "$output"
+  if [[ -n "$SERVER_IPV4" ]]; then
+    printf '%s\t%s\n' "$SERVER_IPV4" '[IP-REDACTED]' >>"$output"
+  fi
+  if [[ -n "$TLS_DOMAIN" ]]; then
+    printf '%s\t%s\n' "$TLS_DOMAIN" '[DOMAIN-REDACTED]' >>"$output"
+  fi
+  if [[ -n "$REALITY_TARGET" ]]; then
+    printf '%s\t%s\n' "$REALITY_TARGET" '[DOMAIN-REDACTED]' >>"$output"
+  fi
+  for value in "${REALITY_PRIVATE_KEY:-}" "${REALITY_PUBLIC_KEY:-}" \
+    "${REALITY_SHORT_ID:-}" "${HY2_OBFS_PASSWORD:-}"; do
+    if [[ -n "$value" ]]; then
+      printf '%s\t%s\n' "$value" '[SECRET-REDACTED]' >>"$output"
+    fi
+  done
+  if [[ -r "$SECRETS_FILE" ]]; then
+    (
+      set +u
+      # shellcheck disable=SC1090
+      source "$SECRETS_FILE"
+      for value in "${REALITY_PRIVATE_KEY:-}" "${REALITY_PUBLIC_KEY:-}" \
+        "${REALITY_SHORT_ID:-}" "${HY2_OBFS_PASSWORD:-}"; do
+        if [[ -n "$value" ]]; then
+          printf '%s\t%s\n' "$value" '[SECRET-REDACTED]'
+        fi
+      done
+    ) >>"$output"
+  fi
+  if [[ -r "$CLIENTS_FILE" ]]; then
+    jq -r '.clients[] | (.vless_uuid // empty), (.hy2_password // empty),
+      (.subscription_token // empty)' \
+      "$CLIENTS_FILE" 2>/dev/null | while IFS= read -r value; do
+        if [[ -n "$value" ]]; then
+          printf '%s\t%s\n' "$value" '[CREDENTIAL-REDACTED]'
+        fi
+      done >>"$output"
+  fi
+}
+
 redact_health_stream() {
-  sed -E \
+  local literals_file status=0
+  literals_file="$(mktemp)"
+  health_build_redaction_literals "$literals_file"
+  LC_ALL=C awk -F '\t' '
+    FNR == NR {
+      if (length($1) > 0) {
+        needle[++count]=$1
+        replacement[count]=$2
+      }
+      next
+    }
+    {
+      line=$0
+      for (i=1; i<=count; i++) {
+        while ((position=index(line, needle[i])) > 0) {
+          line=substr(line, 1, position - 1) replacement[i] \
+            substr(line, position + length(needle[i]))
+        }
+      }
+      print line
+    }
+  ' "$literals_file" - | sed -E \
     -e 's#(vless|hysteria2)://[^[:space:]]+#\1://[REDACTED]#g' \
     -e 's#(https?://)[^/@[:space:]]+@#\1[CREDENTIALS-REDACTED]@#g' \
     -e 's/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/[UUID-REDACTED]/g' \
     -e 's/[0-9a-fA-F]{64}/[TOKEN-REDACTED]/g' \
     -e 's/[0-9a-fA-F]{48}/[SECRET-REDACTED]/g' \
     -e 's/[A-Za-z0-9+_\/-]{32,}={0,2}/[SECRET-REDACTED]/g' \
-    -e 's/([0-9]{1,3}\.){3}[0-9]{1,3}/[IP-REDACTED]/g' \
-    -e 's/\[[0-9a-fA-F:]+\]/[IPv6-REDACTED]/g' \
-    -e 's/([0-9a-fA-F]{0,4}:){3,7}[0-9a-fA-F]{0,4}/[IPv6-REDACTED]/g' \
-    -e 's/(^|[^[:alnum:]_-])([[:alnum:]-]+\.)+[[:alpha:]]{2,}([^[:alnum:]_-]|$)/\1[DOMAIN-REDACTED]\3/g' \
-    -e 's/((password|private_key|public_key|short_id|secret|pbk|sid)[^:=]*[:=][[:space:]]*)[^, }"]+/\1[REDACTED]/Ig'
-}
-
-health_limit_output_width() {
-  LC_ALL=C awk '
-    length($0) > 110 { print substr($0, 1, 107) "..."; next }
-    { print }
-  '
+    -e 's/(^|[^0-9])(([0-9]{1,3}\.){3}[0-9]{1,3})(:[0-9]+)?([^0-9]|$)/\1[IP-REDACTED]\5/g' \
+    -e 's/\[[0-9a-fA-F]*:[0-9a-fA-F:]*\]/[IPv6-REDACTED]/g' \
+    -e 's/(^|[^0-9a-fA-F:])([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}([^0-9a-fA-F:]|$)/\1[IPv6-REDACTED]\3/g' \
+    -e 's/(^|[^0-9a-fA-F:])([0-9a-fA-F]{0,4}:){1,7}:[0-9a-fA-F]{0,4}([^0-9a-fA-F:]|$)/\1[IPv6-REDACTED]\3/g' \
+    -e 's/((password|private_key|public_key|short_id|secret|token|pbk|sid)[^:=]*[:=][[:space:]]*)[^, }"]+/\1[REDACTED]/Ig' || status=$?
+  rm -f -- "$literals_file"
+  return "$status"
 }
 
 health_join_states() {
@@ -3938,6 +4150,10 @@ health_reset_state() {
   HEALTH_FIREWALL_STATE=FAIL
   HEALTH_SSH_STATE=FAIL
   HEALTH_PERMISSIONS_STATE=FAIL
+  HEALTH_SECURITY_UPDATES_STATE=WARN
+  HEALTH_SECURITY_UPDATES_DETAIL='automatic update policy unavailable'
+  HEALTH_CORE_UPDATES_STATE=FAIL
+  HEALTH_CORE_UPDATES_DETAIL='sing-box apt hold unavailable'
   HEALTH_TCP443_STATE=FAIL
   HEALTH_UDP443_STATE=FAIL
   HEALTH_TCP8443_STATE=FAIL
@@ -3949,6 +4165,7 @@ health_reset_state() {
   HEALTH_CONGESTION_STATE=WARN
   HEALTH_CONGESTION=unknown
   HEALTH_QUEUE_STATE=WARN
+  HEALTH_QUEUE_DETAIL='active state unavailable'
   HEALTH_ACTIVE_QDISC=unknown
   HEALTH_CONFIGURED_QDISC=unknown
   HEALTH_DEFAULT_INTERFACE=""
@@ -3958,12 +4175,17 @@ health_reset_state() {
   HEALTH_OS=unknown
   HEALTH_KERNEL=unknown
   HEALTH_UPTIME=unknown
+  HEALTH_UPTIME_SECONDS=""
   HEALTH_RESOURCES=unknown
   HEALTH_CLOCK_STATE=WARN
   HEALTH_CLOCK_DETAIL='NTP state unknown'
   HEALTH_RUNTIME_VERSION=missing
   HEALTH_RECENT_ERRORS_STATE=PASS
   HEALTH_RECENT_ERRORS_FILE=""
+  HEALTH_DEBUG_ACTIONABLE_FILE=""
+  HEALTH_REALITY_NOISE_SAMPLES_FILE=""
+  HEALTH_REALITY_NOISE_COUNT=0
+  HEALTH_REALITY_NOISE_UNIQUE_SOURCES=0
   HEALTH_SS_TCP=""
   HEALTH_SS_UDP=""
 }
@@ -4005,7 +4227,7 @@ health_collect_listeners() {
 }
 
 health_managed_permissions_are_healthy() {
-  local specification path expected actual
+  local specification path expected actual token suffix tokens
   for specification in \
     "$SETTINGS_FILE|600:root:root" \
     "$SECRETS_FILE|600:root:root" \
@@ -4019,6 +4241,20 @@ health_managed_permissions_are_healthy() {
     actual="$(stat -c '%a:%U:%G' "$path" 2>/dev/null || true)"
     [[ "$actual" == "$expected" ]] || return 1
   done
+  [[ -d "$SUBSCRIPTION_ROOT" && ! -L "$SUBSCRIPTION_ROOT" ]] || return 1
+  actual="$(stat -c '%a:%U:%G' "$SUBSCRIPTION_ROOT" 2>/dev/null || true)"
+  [[ "$actual" == '750:root:www-data' ]] || return 1
+  tokens="$(jq -r '.clients[].subscription_token' "$CLIENTS_FILE" 2>/dev/null)" || return 1
+  [[ -n "$tokens" ]] || return 1
+  while IFS= read -r token; do
+    [[ "$token" =~ ^[0-9a-f]{64}$ ]] || return 1
+    for suffix in links mihomo; do
+      path="${SUBSCRIPTION_ROOT}/${token}.${suffix}"
+      [[ -f "$path" && ! -L "$path" ]] || return 1
+      actual="$(stat -c '%a:%U:%G' "$path" 2>/dev/null || true)"
+      [[ "$actual" == '640:root:www-data' ]] || return 1
+    done
+  done <<<"$tokens"
 }
 
 health_collect_system() {
@@ -4027,6 +4263,9 @@ health_collect_system() {
   HEALTH_OS="${HEALTH_OS:-unknown}"
   HEALTH_KERNEL="$(uname -r 2>/dev/null || printf unknown)"
   uptime_seconds="$(cut -d ' ' -f 1 /proc/uptime 2>/dev/null || true)"
+  if [[ "${uptime_seconds%%.*}" =~ ^[0-9]+$ ]]; then
+    HEALTH_UPTIME_SECONDS="${uptime_seconds%%.*}"
+  fi
   HEALTH_UPTIME="$(health_format_uptime "$uptime_seconds")"
   ram_total="$(free -b 2>/dev/null | awk '/^Mem:/ {print $2; exit}')"
   ram_used="$(free -b 2>/dev/null | awk '/^Mem:/ {print $3; exit}')"
@@ -4043,12 +4282,24 @@ health_collect_system() {
     fi
   fi
   ntp="$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)"
-  if [[ "$ntp" == yes ]]; then
+  health_classify_ntp_state "$ntp" "$HEALTH_UPTIME_SECONDS"
+}
+
+health_classify_ntp_state() {
+  local ntp_state="$1" uptime_seconds="$2"
+  if [[ "$ntp_state" == yes ]]; then
     HEALTH_CLOCK_STATE=PASS
     HEALTH_CLOCK_DETAIL='NTP synchronized'
-  elif [[ "$ntp" == no ]]; then
+  elif [[ "$ntp_state" == no && "$uptime_seconds" =~ ^[0-9]+$ ]] &&
+       (( uptime_seconds < NTP_BOOT_GRACE_SECONDS )); then
+    HEALTH_CLOCK_STATE=PENDING
+    HEALTH_CLOCK_DETAIL='waiting for NTP synchronization'
+  elif [[ "$ntp_state" == no ]]; then
     HEALTH_CLOCK_STATE=WARN
     HEALTH_CLOCK_DETAIL='NTP not synchronized'
+  else
+    HEALTH_CLOCK_STATE=WARN
+    HEALTH_CLOCK_DETAIL='NTP state unknown'
   fi
 }
 
@@ -4076,10 +4327,18 @@ health_collect_network() {
     HEALTH_ACTIVE_QDISC="$(awk '$1 == "qdisc" && $0 ~ / root([[:space:]]|$)/ {print $2; exit}' <<<"$qdisc_output")"
     HEALTH_ACTIVE_QDISC="${HEALTH_ACTIVE_QDISC:-unknown}"
   fi
-  if [[ "$HEALTH_ACTIVE_QDISC" == fq ]]; then
+  if [[ "$HEALTH_CONFIGURED_QDISC" == fq && "$HEALTH_ACTIVE_QDISC" == fq ]]; then
     HEALTH_QUEUE_STATE=PASS
+    HEALTH_QUEUE_DETAIL='active fq'
+  elif [[ "$HEALTH_CONFIGURED_QDISC" == fq && "$HEALTH_ACTIVE_QDISC" == fq_codel ]]; then
+    HEALTH_QUEUE_STATE=INFO
+    HEALTH_QUEUE_DETAIL='active fq_codel · fq configured for next interface recreation'
+  elif [[ "$HEALTH_CONFIGURED_QDISC" == fq ]]; then
+    HEALTH_QUEUE_STATE=INFO
+    HEALTH_QUEUE_DETAIL="active $HEALTH_ACTIVE_QDISC · configured default fq"
   else
     HEALTH_QUEUE_STATE=WARN
+    HEALTH_QUEUE_DETAIL="active $HEALTH_ACTIVE_QDISC · configured default $HEALTH_CONFIGURED_QDISC"
   fi
 }
 
@@ -4186,20 +4445,94 @@ health_reality_target_is_healthy() {
   LC_ALL=C grep -aEiq 'ALPN protocol:[[:space:]]*h2' "$probe_file"
 }
 
+health_write_bounded_redacted_file() {
+  local input="$1" output="$2" max_entries="$3" max_bytes="$4"
+  local redacted_file selected_file
+  redacted_file="$(mktemp "${TMP_DIR}/health-redacted.XXXXXX")"
+  selected_file="$(mktemp "${TMP_DIR}/health-selected.XXXXXX")"
+  chmod 0600 "$redacted_file" "$selected_file"
+  redact_health_stream <"$input" >"$redacted_file"
+  tail -n "$max_entries" "$redacted_file" >"$selected_file"
+  LC_ALL=C awk -v limit="$max_bytes" '
+    { lines[NR]=$0; sizes[NR]=length($0) + 1 }
+    END {
+      start=NR + 1
+      for (i=NR; i>=1; i--) {
+        if (used + sizes[i] > limit) break
+        used += sizes[i]
+        start=i
+      }
+      for (i=start; i<=NR; i++) print lines[i]
+    }
+  ' "$selected_file" >"$output"
+}
+
+health_count_unique_reality_noise_sources() {
+  local input="$1" sources_file
+  sources_file="$(mktemp "${TMP_DIR}/health-noise-sources.XXXXXX")"
+  chmod 0600 "$sources_file"
+  sed -nE \
+    -e 's/.*[Ff]rom[[:space:]]+\[([0-9a-fA-F:]+)\]:[0-9]+.*/\1/p' \
+    -e 's/.*[Ff]rom[[:space:]]+(([0-9]{1,3}\.){3}[0-9]{1,3}):[0-9]+.*/\1/p' \
+    "$input" >"$sources_file"
+  sort -u "$sources_file" | awk 'END {print NR + 0}'
+}
+
 health_collect_recent_errors() {
-  local raw_file
+  local raw_file actionable_raw noise_raw
   if [[ -z "$TMP_DIR" || ! -d "$TMP_DIR" ]]; then
     new_temp_dir
   fi
   raw_file="$(mktemp "${TMP_DIR}/health-journal.raw.XXXXXX")"
+  actionable_raw="$(mktemp "${TMP_DIR}/health-actionable.raw.XXXXXX")"
+  noise_raw="$(mktemp "${TMP_DIR}/health-reality-noise.raw.XXXXXX")"
   HEALTH_RECENT_ERRORS_FILE="$(mktemp "${TMP_DIR}/health-journal.redacted.XXXXXX")"
-  chmod 0600 "$raw_file" "$HEALTH_RECENT_ERRORS_FILE"
-  journalctl -u sing-box.service --since '-30 minutes' -p warning..alert -n 5 \
+  HEALTH_DEBUG_ACTIONABLE_FILE="$(mktemp "${TMP_DIR}/health-actionable-debug.XXXXXX")"
+  HEALTH_REALITY_NOISE_SAMPLES_FILE="$(mktemp "${TMP_DIR}/health-noise-samples.XXXXXX")"
+  chmod 0600 "$raw_file" "$actionable_raw" "$noise_raw" \
+    "$HEALTH_RECENT_ERRORS_FILE" "$HEALTH_DEBUG_ACTIONABLE_FILE" \
+    "$HEALTH_REALITY_NOISE_SAMPLES_FILE"
+  journalctl -u sing-box.service --since '-30 minutes' -p warning..alert -n 500 \
     --no-pager --output=short-iso >"$raw_file" 2>/dev/null || true
-  redact_health_stream <"$raw_file" | \
-    sed '/^-- No entries --$/d; /^-- Boot /d; /^$/d' >"$HEALTH_RECENT_ERRORS_FILE"
+  awk '
+    /^-- No entries --$/ || /^-- Boot / || /^$/ { next }
+    index($0, "REALITY: processed invalid connection") { print > noise; next }
+    { print > actionable }
+  ' actionable="$actionable_raw" noise="$noise_raw" "$raw_file"
+  HEALTH_REALITY_NOISE_COUNT="$(grep -cF 'REALITY: processed invalid connection' "$noise_raw" || true)"
+  HEALTH_REALITY_NOISE_UNIQUE_SOURCES="$(health_count_unique_reality_noise_sources "$noise_raw")"
+  health_write_bounded_redacted_file "$actionable_raw" "$HEALTH_RECENT_ERRORS_FILE" 5 8192
+  health_write_bounded_redacted_file "$actionable_raw" "$HEALTH_DEBUG_ACTIONABLE_FILE" 20 12288
+  health_write_bounded_redacted_file "$noise_raw" "$HEALTH_REALITY_NOISE_SAMPLES_FILE" 5 4096
   if [[ -s "$HEALTH_RECENT_ERRORS_FILE" ]]; then
     HEALTH_RECENT_ERRORS_STATE=WARN
+  fi
+}
+
+health_collect_update_policy() {
+  local effective_dump host_os_id="${1:-}"
+  if [[ -z "$host_os_id" ]]; then
+    host_os_id="$(sed -n 's/^ID=//p' /etc/os-release 2>/dev/null | tr -d '"' | sed -n '1p')"
+  fi
+  effective_dump="$(apt-config dump 2>/dev/null || true)"
+  if [[ -z "$effective_dump" ]]; then
+    HEALTH_SECURITY_UPDATES_DETAIL='effective APT configuration unavailable'
+  elif ! unattended_policy_dump_is_security_only "$host_os_id" "$effective_dump"; then
+    HEALTH_SECURITY_UPDATES_DETAIL="$UNATTENDED_POLICY_REASON"
+  elif ! systemctl is-enabled --quiet apt-daily.timer 2>/dev/null ||
+       ! systemctl is-active --quiet apt-daily.timer 2>/dev/null; then
+    HEALTH_SECURITY_UPDATES_DETAIL='apt-daily.timer is disabled or inactive'
+  elif ! systemctl is-enabled --quiet apt-daily-upgrade.timer 2>/dev/null ||
+       ! systemctl is-active --quiet apt-daily-upgrade.timer 2>/dev/null; then
+    HEALTH_SECURITY_UPDATES_DETAIL='apt-daily-upgrade.timer is disabled or inactive'
+  else
+    HEALTH_SECURITY_UPDATES_STATE=PASS
+    HEALTH_SECURITY_UPDATES_DETAIL='automatic · security-only · no automatic reboot'
+  fi
+
+  if apt-mark showhold 2>/dev/null | grep -Fxq sing-box; then
+    HEALTH_CORE_UPDATES_STATE=PASS
+    HEALTH_CORE_UPDATES_DETAIL='sing-box apt-held · update through vpn update'
   fi
 }
 
@@ -4263,6 +4596,7 @@ health_collect_state() {
   health_collect_network
   health_collect_system
   health_collect_recent_errors
+  health_collect_update_policy
   health_recalculate_result
 }
 
@@ -4272,6 +4606,7 @@ health_recalculate_result() {
   HEALTH_WARNINGS=0
   for state in \
     "$HEALTH_CORE_STATE" "$HEALTH_VERSION_STATE" "$HEALTH_RUNTIME_STATE" \
+    "$HEALTH_CORE_UPDATES_STATE" "$HEALTH_SECURITY_UPDATES_STATE" \
     "$HEALTH_VLESS_STATE" "$HEALTH_HY2_STATE" \
     "$HEALTH_SUBSCRIPTION_STATE" "$HEALTH_DNS_STATE" "$HEALTH_CERT_STATE" \
     "$HEALTH_CERT_HOSTNAME_STATE" "$HEALTH_CERT_KEYPAIR_STATE" "$HEALTH_RENEWAL_STATE" \
@@ -4308,19 +4643,21 @@ health_network_detail() {
 }
 
 render_health_short() {
-  local protocol_state tls_state security_state network_state
+  local core_state protocol_state tls_state security_state network_state
+  core_state="$(health_join_states "$HEALTH_CORE_STATE" "$HEALTH_CORE_UPDATES_STATE")"
   protocol_state="$(health_join_states "$HEALTH_VLESS_STATE" "$HEALTH_HY2_STATE")"
   tls_state="$(health_join_states "$HEALTH_DNS_STATE" "$HEALTH_CERT_STATE" \
     "$HEALTH_CERT_HOSTNAME_STATE" "$HEALTH_CERT_KEYPAIR_STATE" "$HEALTH_RENEWAL_STATE")"
   security_state="$(health_join_states "$HEALTH_FIREWALL_STATE" "$HEALTH_SSH_STATE" \
-    "$HEALTH_PERMISSIONS_STATE")"
+    "$HEALTH_PERMISSIONS_STATE" "$HEALTH_SECURITY_UPDATES_STATE")"
   network_state="$(health_join_states "$HEALTH_CONGESTION_STATE" "$HEALTH_QUEUE_STATE")"
   print_title 'VPN health'
-  health_print_row Core "$HEALTH_CORE_STATE" "sing-box $HEALTH_CORE_VERSION"
+  health_print_row Core "$core_state" "sing-box $HEALTH_CORE_VERSION"
   health_print_row Protocols "$protocol_state" 'REALITY tcp/443 · Hysteria2 udp/443'
   health_print_row Subscription "$HEALTH_SUBSCRIPTION_STATE" "$(health_client_label "$HEALTH_CLIENT_COUNT")"
   health_print_row DNS/TLS "$tls_state" 'configured · DNS/certificate checked'
-  health_print_row REALITY "$HEALTH_TARGET_STATE" 'TLS 1.3 · certificate/SNI · ALPN h2'
+  health_print_row 'REALITY target' "$HEALTH_TARGET_STATE" \
+    'TLS 1.3 · certificate/SNI · ALPN h2'
   health_print_row Security "$security_state" 'nftables · SSH key-only · permissions'
   health_print_row Network "$network_state" "$(health_network_detail)"
   printf '\n'
@@ -4328,8 +4665,7 @@ render_health_short() {
 }
 
 render_health_verbose() {
-  local queue_detail certificate_detail
-  queue_detail="active $HEALTH_ACTIVE_QDISC · configured default $HEALTH_CONFIGURED_QDISC"
+  local certificate_detail
   certificate_detail="$HEALTH_CERT_DETAIL"
   if [[ "$HEALTH_CERT_HOSTNAME_STATE" == PASS && "$HEALTH_CERT_KEYPAIR_STATE" == PASS ]]; then
     certificate_detail+=' · hostname · key pair'
@@ -4371,7 +4707,7 @@ render_health_verbose() {
   health_print_row UDP/443 "$HEALTH_UDP443_STATE" "$HEALTH_UDP443_DETAIL"
   health_print_row TCP/8443 "$HEALTH_TCP8443_STATE" "$HEALTH_TCP8443_DETAIL"
   health_print_row Congestion "$HEALTH_CONGESTION_STATE" "kernel default $HEALTH_CONGESTION"
-  health_print_row Queue "$HEALTH_QUEUE_STATE" "$queue_detail"
+  health_print_row Queue "$HEALTH_QUEUE_STATE" "$HEALTH_QUEUE_DETAIL"
 
   print_section 'TLS'
   health_print_row Certificate "$HEALTH_CERT_STATE" "$certificate_detail"
@@ -4384,8 +4720,11 @@ render_health_verbose() {
   health_print_row SSH "$HEALTH_SSH_STATE" 'key-only policy'
   health_print_row 'SSH listener' "$HEALTH_SSH_LISTENER_STATE" "tcp/$SSH_PORT · $HEALTH_SSH_LISTENER_DETAIL"
   health_print_row Permissions "$HEALTH_PERMISSIONS_STATE" 'managed files'
+  health_print_row 'Security updates' "$HEALTH_SECURITY_UPDATES_STATE" \
+    "$HEALTH_SECURITY_UPDATES_DETAIL"
+  health_print_row 'Core updates' "$HEALTH_CORE_UPDATES_STATE" "$HEALTH_CORE_UPDATES_DETAIL"
 
-  print_section 'RECENT ERRORS'
+  print_section 'RECENT ACTIONABLE ERRORS'
   if [[ "$HEALTH_RECENT_ERRORS_STATE" == PASS ]]; then
     printf '  None\n'
   else
@@ -4418,9 +4757,19 @@ render_health_debug_details() {
   printf '\nSystemd state:\n'
   systemctl show sing-box.service nginx.service nftables.service certbot.timer ssh.service \
     -p Id -p LoadState -p ActiveState -p SubState --no-pager 2>/dev/null | sed -n '1,100p' || true
-  printf '\nRecent sing-box journal (bounded):\n'
-  journalctl -u sing-box.service --since '-30 minutes' -n 80 --no-pager \
-    --output=short-iso 2>/dev/null | sed -n '1,80p' || true
+  print_section 'ACTIONABLE ERROR DETAILS'
+  if [[ -s "$HEALTH_DEBUG_ACTIONABLE_FILE" ]]; then
+    sed -n '1,20p' "$HEALTH_DEBUG_ACTIONABLE_FILE"
+  else
+    printf '  None\n'
+  fi
+  print_section 'IGNORED INBOUND NOISE'
+  printf '  Invalid REALITY handshakes (30 min): %s\n' "$HEALTH_REALITY_NOISE_COUNT"
+  printf '  Unique source addresses (30 min): %s\n' "$HEALTH_REALITY_NOISE_UNIQUE_SOURCES"
+  if [[ -s "$HEALTH_REALITY_NOISE_SAMPLES_FILE" ]]; then
+    printf '  Redacted samples (bounded):\n'
+    sed -n '1,5p' "$HEALTH_REALITY_NOISE_SAMPLES_FILE"
+  fi
 }
 
 health_details() {
@@ -4428,7 +4777,7 @@ health_details() {
   require_root
   health_collect_state
   (( HEALTH_FAILURES == 0 )) || health_status=1
-  render_health_verbose | redact_health_stream | health_limit_output_width
+  render_health_verbose | redact_health_stream
   return "$health_status"
 }
 
@@ -4440,7 +4789,7 @@ health_debug() {
   {
     render_health_verbose
     render_health_debug_details
-  } | redact_health_stream | health_limit_output_width
+  } | redact_health_stream
   return "$health_status"
 }
 
@@ -4517,6 +4866,7 @@ prepare_upgrade_transaction() {
   UPGRADE_ORIGINAL_RMEM="$(sysctl -n net.core.rmem_max)"
   UPGRADE_ORIGINAL_WMEM="$(sysctl -n net.core.wmem_max)"
   backup_upgrade_file "$UDP_SYSCTL_FILE" udp-sysctl 0644
+  backup_upgrade_file "$UNATTENDED_UPGRADES_CONFIG" unattended-upgrades 0644
   backup_upgrade_file "$CERT_HOOK" certificate-hook 0750
   backup_upgrade_file "$INSTALLED_HELPER" vpn-helper 0750
   backup_upgrade_file "$USER_COMMAND" vpn-command 0755
@@ -4532,6 +4882,7 @@ rollback_upgrade_transaction() {
   printf '[WARN] Overlay update did not complete; restoring its previous managed files and runtime UDP ceilings.\n' >&2
   set +e
   restore_upgrade_file "$UDP_SYSCTL_FILE" udp-sysctl root root 0644 || restore_failed=1
+  restore_upgrade_file "$UNATTENDED_UPGRADES_CONFIG" unattended-upgrades root root 0644 || restore_failed=1
   restore_upgrade_file "$CERT_HOOK" certificate-hook root root 0750 || restore_failed=1
   restore_upgrade_file "$INSTALLED_HELPER" vpn-helper root root 0750 || restore_failed=1
   restore_upgrade_file "$USER_COMMAND" vpn-command root root 0755 || restore_failed=1
@@ -4601,6 +4952,8 @@ EOF
 
   set_step 'Hysteria2 UDP socket-buffer ceilings'
   configure_udp_buffer_ceilings
+  set_step 'automatic security updates policy'
+  configure_unattended_upgrades
   set_step 'certificate renewal hook refresh'
   configure_certificate_hook
   smoke_test_certificate_hook

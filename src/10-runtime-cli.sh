@@ -41,6 +41,7 @@ print_status_value() {
   case "$value" in
     PASS|OK|HEALTHY) style_text '1;32' "$value" ;;
     WARN) style_text '1;33' "$value" ;;
+    INFO|PENDING) style_text '1;36' "$value" ;;
     FAIL|UNHEALTHY) style_text '1;31' "$value" ;;
     *) printf '%s' "$value" ;;
   esac
@@ -66,6 +67,11 @@ die() {
 cli_error() {
   printf '[ERROR] %s\n' "$*" >&2
   exit 1
+}
+
+cancel_command() {
+  printf 'Cancelled; no changes made.\n'
+  exit 0
 }
 
 cli_options_are_close() {
@@ -332,6 +338,9 @@ cleanup() {
     printf '[FATAL] Preserved incomplete overlay rollback state for manual recovery: %s\n' \
       "$UPGRADE_BACKUP_DIR" >&2
   fi
+  if declare -F cleanup_apt_download_dir >/dev/null; then
+    cleanup_apt_download_dir
+  fi
   release_bootstrap_lock
   finish_install_log
 }
@@ -367,7 +376,7 @@ Usage:
   vpn self-update /path/to/new/install-sing-box-server.sh
 
 Install options (missing values are requested interactively):
-  --admin-user NAME        Administrative account to create.
+  --admin-user NAME        Full administrative account with passwordless sudo.
   --public-key KEY         One quoted OpenSSH public-key line. Never a private key.
   --server-ipv4 ADDRESS    Public IPv4 address of the VPS.
   --domain DOMAIN          Domain whose A record points to the VPS.

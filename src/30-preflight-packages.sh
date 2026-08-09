@@ -51,7 +51,7 @@ preflight_os() {
 
 preflight_hardware_and_runtime() {
   local mem_kib min_mem_kib min_mem_label cpu_count virtualization pid_one
-  local epoch ntp_state
+  local epoch ntp_state boot_uptime
 
   [[ -r /proc/1/comm ]] || die 'Unable to inspect the init process through /proc/1/comm.'
   pid_one="$(</proc/1/comm)"
@@ -81,7 +81,15 @@ preflight_hardware_and_runtime() {
     die 'System clock is implausible; correct date/time before TLS and ACME operations.'
   fi
   ntp_state="$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)"
-  [[ "$ntp_state" == "yes" ]] || warn 'System clock is not currently reported as NTP-synchronized.'
+  if [[ "$ntp_state" != "yes" ]]; then
+    boot_uptime="$(cut -d ' ' -f 1 /proc/uptime 2>/dev/null || true)"
+    boot_uptime="${boot_uptime%%.*}"
+    if [[ "$boot_uptime" =~ ^[0-9]+$ ]] && (( boot_uptime < NTP_BOOT_GRACE_SECONDS )); then
+      log 'NTP synchronization is still pending during the initial boot grace period.'
+    else
+      warn 'System clock is not currently reported as NTP-synchronized.'
+    fi
+  fi
 
   virtualization="$(systemd-detect-virt 2>/dev/null || true)"
   virtualization="${virtualization:-none}"
@@ -236,18 +244,45 @@ sing_box_candidate_version() {
   '
 }
 
+cleanup_apt_download_dir() {
+  [[ -n "$APT_DOWNLOAD_DIR" ]] || return 0
+  case "$APT_DOWNLOAD_DIR" in
+    "${APT_DOWNLOAD_ROOT}"/download.*)
+      rm -rf -- "$APT_DOWNLOAD_DIR"
+      ;;
+    *)
+      warn "Refusing to remove unexpected APT download directory: ${APT_DOWNLOAD_DIR}"
+      ;;
+  esac
+  APT_DOWNLOAD_DIR=""
+}
+
+prepare_apt_download_dir() {
+  id _apt >/dev/null 2>&1 || die 'The required APT sandbox account _apt is unavailable.'
+  cleanup_apt_download_dir
+  # The parent is traversable but not listable. Each unpredictable child is
+  # private to _apt, so apt-get can retain its sandbox without a 0777 staging
+  # directory or an unsandboxed-root fallback.
+  install -d -o root -g root -m 0711 "$APT_DOWNLOAD_ROOT"
+  APT_DOWNLOAD_DIR="$(mktemp -d "${APT_DOWNLOAD_ROOT}/download.XXXXXX")"
+  chown _apt:root "$APT_DOWNLOAD_DIR"
+  chmod 0700 "$APT_DOWNLOAD_DIR"
+}
+
 download_sing_box_package() {
-  local version="$1" destination="$2" package
-  install -d -o root -g root -m 0700 "$destination"
+  local version="$1" output_variable="$2" package
+  prepare_apt_download_dir
   (
-    cd "$destination"
+    cd "$APT_DOWNLOAD_DIR"
     apt-get download "sing-box=${version}" >/dev/null
   )
-  package="$(find "$destination" -maxdepth 1 -type f -name 'sing-box_*.deb' -print -quit)"
+  package="$(find "$APT_DOWNLOAD_DIR" -maxdepth 1 -type f -name 'sing-box_*.deb' -print -quit)"
   [[ -n "$package" ]] || die "Could not download sing-box ${version}."
+  chown root:root "$package"
+  chmod 0600 "$package"
   [[ "$(dpkg-deb -f "$package" Package)" == "sing-box" ]] || die 'Downloaded package name is not sing-box.'
   [[ "$(dpkg-deb -f "$package" Version)" == "$version" ]] || die 'Downloaded sing-box version does not match APT metadata.'
-  printf '%s\n' "$package"
+  printf -v "$output_variable" '%s' "$package"
 }
 
 archive_sing_box_package() {
@@ -295,21 +330,22 @@ install_sing_box() {
   if [[ "$installed_version" == "$candidate" ]]; then
     require_supported_sing_box_version "$installed_version"
     if ! find_cached_sing_box_package "$installed_version" >/dev/null; then
-      new_temp_dir
-      package_path="$(download_sing_box_package "$candidate" "$TMP_DIR")"
+      download_sing_box_package "$candidate" package_path
       archive_sing_box_package "$package_path" >/dev/null
+      cleanup_apt_download_dir
     fi
     apt-mark hold sing-box >/dev/null
     log "Verified existing stable sing-box ${installed_version}; reusing it."
     return
   fi
 
-  new_temp_dir
-  package_path="$(download_sing_box_package "$candidate" "$TMP_DIR")"
+  download_sing_box_package "$candidate" package_path
   package_path="$(archive_sing_box_package "$package_path")"
+  cleanup_apt_download_dir
 
   apt-mark unhold sing-box >/dev/null 2>&1 || true
-  DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-change-held-packages "$package_path"
+  DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-change-held-packages \
+    "sing-box=${candidate}"
   installed_version="$(dpkg-query -W -f='${Version}' sing-box 2>/dev/null || true)"
   [[ "$installed_version" == "$candidate" ]] || die "Unexpected installed sing-box version: ${installed_version:-missing}"
   apt-mark hold sing-box >/dev/null

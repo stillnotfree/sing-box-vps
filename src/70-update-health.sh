@@ -26,13 +26,14 @@ update_sing_box() {
   dpkg --compare-versions "$candidate" gt "$installed" || die "Refusing non-upgrade candidate ${candidate} over ${installed}."
 
   new_temp_dir
-  new_package="$(download_sing_box_package "$candidate" "${TMP_DIR}/download")"
+  download_sing_box_package "$candidate" new_package
   candidate_root="${TMP_DIR}/candidate-root"
   mkdir -p "$candidate_root"
   dpkg-deb -x "$new_package" "$candidate_root"
   [[ -x "${candidate_root}/usr/bin/sing-box" ]] || die 'Candidate package does not contain the sing-box binary.'
   "${candidate_root}/usr/bin/sing-box" check -c "$CONFIG_FILE"
   new_package="$(archive_sing_box_package "$new_package")"
+  cleanup_apt_download_dir
 
   log "Installing validated sing-box ${candidate} (rollback: ${installed})."
   dpkg --force-confold -i "$new_package" >/dev/null 2>&1 || failed=1
@@ -57,26 +58,88 @@ update_sing_box() {
   log "sing-box updated successfully: ${installed} -> ${candidate}."
 }
 
+health_build_redaction_literals() {
+  local output="$1" value
+  # Keep the first awk input non-empty. With an empty first file, portable awk
+  # cannot distinguish it from stdin using FNR == NR and would consume every
+  # diagnostic line as a literal definition.
+  printf '\t\n' >"$output"
+  chmod 0600 "$output"
+  if [[ -n "$SERVER_IPV4" ]]; then
+    printf '%s\t%s\n' "$SERVER_IPV4" '[IP-REDACTED]' >>"$output"
+  fi
+  if [[ -n "$TLS_DOMAIN" ]]; then
+    printf '%s\t%s\n' "$TLS_DOMAIN" '[DOMAIN-REDACTED]' >>"$output"
+  fi
+  if [[ -n "$REALITY_TARGET" ]]; then
+    printf '%s\t%s\n' "$REALITY_TARGET" '[DOMAIN-REDACTED]' >>"$output"
+  fi
+  for value in "${REALITY_PRIVATE_KEY:-}" "${REALITY_PUBLIC_KEY:-}" \
+    "${REALITY_SHORT_ID:-}" "${HY2_OBFS_PASSWORD:-}"; do
+    if [[ -n "$value" ]]; then
+      printf '%s\t%s\n' "$value" '[SECRET-REDACTED]' >>"$output"
+    fi
+  done
+  if [[ -r "$SECRETS_FILE" ]]; then
+    (
+      set +u
+      # shellcheck disable=SC1090
+      source "$SECRETS_FILE"
+      for value in "${REALITY_PRIVATE_KEY:-}" "${REALITY_PUBLIC_KEY:-}" \
+        "${REALITY_SHORT_ID:-}" "${HY2_OBFS_PASSWORD:-}"; do
+        if [[ -n "$value" ]]; then
+          printf '%s\t%s\n' "$value" '[SECRET-REDACTED]'
+        fi
+      done
+    ) >>"$output"
+  fi
+  if [[ -r "$CLIENTS_FILE" ]]; then
+    jq -r '.clients[] | (.vless_uuid // empty), (.hy2_password // empty),
+      (.subscription_token // empty)' \
+      "$CLIENTS_FILE" 2>/dev/null | while IFS= read -r value; do
+        if [[ -n "$value" ]]; then
+          printf '%s\t%s\n' "$value" '[CREDENTIAL-REDACTED]'
+        fi
+      done >>"$output"
+  fi
+}
+
 redact_health_stream() {
-  sed -E \
+  local literals_file status=0
+  literals_file="$(mktemp)"
+  health_build_redaction_literals "$literals_file"
+  LC_ALL=C awk -F '\t' '
+    FNR == NR {
+      if (length($1) > 0) {
+        needle[++count]=$1
+        replacement[count]=$2
+      }
+      next
+    }
+    {
+      line=$0
+      for (i=1; i<=count; i++) {
+        while ((position=index(line, needle[i])) > 0) {
+          line=substr(line, 1, position - 1) replacement[i] \
+            substr(line, position + length(needle[i]))
+        }
+      }
+      print line
+    }
+  ' "$literals_file" - | sed -E \
     -e 's#(vless|hysteria2)://[^[:space:]]+#\1://[REDACTED]#g' \
     -e 's#(https?://)[^/@[:space:]]+@#\1[CREDENTIALS-REDACTED]@#g' \
     -e 's/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/[UUID-REDACTED]/g' \
     -e 's/[0-9a-fA-F]{64}/[TOKEN-REDACTED]/g' \
     -e 's/[0-9a-fA-F]{48}/[SECRET-REDACTED]/g' \
     -e 's/[A-Za-z0-9+_\/-]{32,}={0,2}/[SECRET-REDACTED]/g' \
-    -e 's/([0-9]{1,3}\.){3}[0-9]{1,3}/[IP-REDACTED]/g' \
-    -e 's/\[[0-9a-fA-F:]+\]/[IPv6-REDACTED]/g' \
-    -e 's/([0-9a-fA-F]{0,4}:){3,7}[0-9a-fA-F]{0,4}/[IPv6-REDACTED]/g' \
-    -e 's/(^|[^[:alnum:]_-])([[:alnum:]-]+\.)+[[:alpha:]]{2,}([^[:alnum:]_-]|$)/\1[DOMAIN-REDACTED]\3/g' \
-    -e 's/((password|private_key|public_key|short_id|secret|pbk|sid)[^:=]*[:=][[:space:]]*)[^, }"]+/\1[REDACTED]/Ig'
-}
-
-health_limit_output_width() {
-  LC_ALL=C awk '
-    length($0) > 110 { print substr($0, 1, 107) "..."; next }
-    { print }
-  '
+    -e 's/(^|[^0-9])(([0-9]{1,3}\.){3}[0-9]{1,3})(:[0-9]+)?([^0-9]|$)/\1[IP-REDACTED]\5/g' \
+    -e 's/\[[0-9a-fA-F]*:[0-9a-fA-F:]*\]/[IPv6-REDACTED]/g' \
+    -e 's/(^|[^0-9a-fA-F:])([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}([^0-9a-fA-F:]|$)/\1[IPv6-REDACTED]\3/g' \
+    -e 's/(^|[^0-9a-fA-F:])([0-9a-fA-F]{0,4}:){1,7}:[0-9a-fA-F]{0,4}([^0-9a-fA-F:]|$)/\1[IPv6-REDACTED]\3/g' \
+    -e 's/((password|private_key|public_key|short_id|secret|token|pbk|sid)[^:=]*[:=][[:space:]]*)[^, }"]+/\1[REDACTED]/Ig' || status=$?
+  rm -f -- "$literals_file"
+  return "$status"
 }
 
 health_join_states() {
@@ -168,6 +231,10 @@ health_reset_state() {
   HEALTH_FIREWALL_STATE=FAIL
   HEALTH_SSH_STATE=FAIL
   HEALTH_PERMISSIONS_STATE=FAIL
+  HEALTH_SECURITY_UPDATES_STATE=WARN
+  HEALTH_SECURITY_UPDATES_DETAIL='automatic update policy unavailable'
+  HEALTH_CORE_UPDATES_STATE=FAIL
+  HEALTH_CORE_UPDATES_DETAIL='sing-box apt hold unavailable'
   HEALTH_TCP443_STATE=FAIL
   HEALTH_UDP443_STATE=FAIL
   HEALTH_TCP8443_STATE=FAIL
@@ -179,6 +246,7 @@ health_reset_state() {
   HEALTH_CONGESTION_STATE=WARN
   HEALTH_CONGESTION=unknown
   HEALTH_QUEUE_STATE=WARN
+  HEALTH_QUEUE_DETAIL='active state unavailable'
   HEALTH_ACTIVE_QDISC=unknown
   HEALTH_CONFIGURED_QDISC=unknown
   HEALTH_DEFAULT_INTERFACE=""
@@ -188,12 +256,17 @@ health_reset_state() {
   HEALTH_OS=unknown
   HEALTH_KERNEL=unknown
   HEALTH_UPTIME=unknown
+  HEALTH_UPTIME_SECONDS=""
   HEALTH_RESOURCES=unknown
   HEALTH_CLOCK_STATE=WARN
   HEALTH_CLOCK_DETAIL='NTP state unknown'
   HEALTH_RUNTIME_VERSION=missing
   HEALTH_RECENT_ERRORS_STATE=PASS
   HEALTH_RECENT_ERRORS_FILE=""
+  HEALTH_DEBUG_ACTIONABLE_FILE=""
+  HEALTH_REALITY_NOISE_SAMPLES_FILE=""
+  HEALTH_REALITY_NOISE_COUNT=0
+  HEALTH_REALITY_NOISE_UNIQUE_SOURCES=0
   HEALTH_SS_TCP=""
   HEALTH_SS_UDP=""
 }
@@ -235,7 +308,7 @@ health_collect_listeners() {
 }
 
 health_managed_permissions_are_healthy() {
-  local specification path expected actual
+  local specification path expected actual token suffix tokens
   for specification in \
     "$SETTINGS_FILE|600:root:root" \
     "$SECRETS_FILE|600:root:root" \
@@ -249,6 +322,20 @@ health_managed_permissions_are_healthy() {
     actual="$(stat -c '%a:%U:%G' "$path" 2>/dev/null || true)"
     [[ "$actual" == "$expected" ]] || return 1
   done
+  [[ -d "$SUBSCRIPTION_ROOT" && ! -L "$SUBSCRIPTION_ROOT" ]] || return 1
+  actual="$(stat -c '%a:%U:%G' "$SUBSCRIPTION_ROOT" 2>/dev/null || true)"
+  [[ "$actual" == '750:root:www-data' ]] || return 1
+  tokens="$(jq -r '.clients[].subscription_token' "$CLIENTS_FILE" 2>/dev/null)" || return 1
+  [[ -n "$tokens" ]] || return 1
+  while IFS= read -r token; do
+    [[ "$token" =~ ^[0-9a-f]{64}$ ]] || return 1
+    for suffix in links mihomo; do
+      path="${SUBSCRIPTION_ROOT}/${token}.${suffix}"
+      [[ -f "$path" && ! -L "$path" ]] || return 1
+      actual="$(stat -c '%a:%U:%G' "$path" 2>/dev/null || true)"
+      [[ "$actual" == '640:root:www-data' ]] || return 1
+    done
+  done <<<"$tokens"
 }
 
 health_collect_system() {
@@ -257,6 +344,9 @@ health_collect_system() {
   HEALTH_OS="${HEALTH_OS:-unknown}"
   HEALTH_KERNEL="$(uname -r 2>/dev/null || printf unknown)"
   uptime_seconds="$(cut -d ' ' -f 1 /proc/uptime 2>/dev/null || true)"
+  if [[ "${uptime_seconds%%.*}" =~ ^[0-9]+$ ]]; then
+    HEALTH_UPTIME_SECONDS="${uptime_seconds%%.*}"
+  fi
   HEALTH_UPTIME="$(health_format_uptime "$uptime_seconds")"
   ram_total="$(free -b 2>/dev/null | awk '/^Mem:/ {print $2; exit}')"
   ram_used="$(free -b 2>/dev/null | awk '/^Mem:/ {print $3; exit}')"
@@ -273,12 +363,24 @@ health_collect_system() {
     fi
   fi
   ntp="$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)"
-  if [[ "$ntp" == yes ]]; then
+  health_classify_ntp_state "$ntp" "$HEALTH_UPTIME_SECONDS"
+}
+
+health_classify_ntp_state() {
+  local ntp_state="$1" uptime_seconds="$2"
+  if [[ "$ntp_state" == yes ]]; then
     HEALTH_CLOCK_STATE=PASS
     HEALTH_CLOCK_DETAIL='NTP synchronized'
-  elif [[ "$ntp" == no ]]; then
+  elif [[ "$ntp_state" == no && "$uptime_seconds" =~ ^[0-9]+$ ]] &&
+       (( uptime_seconds < NTP_BOOT_GRACE_SECONDS )); then
+    HEALTH_CLOCK_STATE=PENDING
+    HEALTH_CLOCK_DETAIL='waiting for NTP synchronization'
+  elif [[ "$ntp_state" == no ]]; then
     HEALTH_CLOCK_STATE=WARN
     HEALTH_CLOCK_DETAIL='NTP not synchronized'
+  else
+    HEALTH_CLOCK_STATE=WARN
+    HEALTH_CLOCK_DETAIL='NTP state unknown'
   fi
 }
 
@@ -306,10 +408,18 @@ health_collect_network() {
     HEALTH_ACTIVE_QDISC="$(awk '$1 == "qdisc" && $0 ~ / root([[:space:]]|$)/ {print $2; exit}' <<<"$qdisc_output")"
     HEALTH_ACTIVE_QDISC="${HEALTH_ACTIVE_QDISC:-unknown}"
   fi
-  if [[ "$HEALTH_ACTIVE_QDISC" == fq ]]; then
+  if [[ "$HEALTH_CONFIGURED_QDISC" == fq && "$HEALTH_ACTIVE_QDISC" == fq ]]; then
     HEALTH_QUEUE_STATE=PASS
+    HEALTH_QUEUE_DETAIL='active fq'
+  elif [[ "$HEALTH_CONFIGURED_QDISC" == fq && "$HEALTH_ACTIVE_QDISC" == fq_codel ]]; then
+    HEALTH_QUEUE_STATE=INFO
+    HEALTH_QUEUE_DETAIL='active fq_codel · fq configured for next interface recreation'
+  elif [[ "$HEALTH_CONFIGURED_QDISC" == fq ]]; then
+    HEALTH_QUEUE_STATE=INFO
+    HEALTH_QUEUE_DETAIL="active $HEALTH_ACTIVE_QDISC · configured default fq"
   else
     HEALTH_QUEUE_STATE=WARN
+    HEALTH_QUEUE_DETAIL="active $HEALTH_ACTIVE_QDISC · configured default $HEALTH_CONFIGURED_QDISC"
   fi
 }
 
@@ -416,20 +526,94 @@ health_reality_target_is_healthy() {
   LC_ALL=C grep -aEiq 'ALPN protocol:[[:space:]]*h2' "$probe_file"
 }
 
+health_write_bounded_redacted_file() {
+  local input="$1" output="$2" max_entries="$3" max_bytes="$4"
+  local redacted_file selected_file
+  redacted_file="$(mktemp "${TMP_DIR}/health-redacted.XXXXXX")"
+  selected_file="$(mktemp "${TMP_DIR}/health-selected.XXXXXX")"
+  chmod 0600 "$redacted_file" "$selected_file"
+  redact_health_stream <"$input" >"$redacted_file"
+  tail -n "$max_entries" "$redacted_file" >"$selected_file"
+  LC_ALL=C awk -v limit="$max_bytes" '
+    { lines[NR]=$0; sizes[NR]=length($0) + 1 }
+    END {
+      start=NR + 1
+      for (i=NR; i>=1; i--) {
+        if (used + sizes[i] > limit) break
+        used += sizes[i]
+        start=i
+      }
+      for (i=start; i<=NR; i++) print lines[i]
+    }
+  ' "$selected_file" >"$output"
+}
+
+health_count_unique_reality_noise_sources() {
+  local input="$1" sources_file
+  sources_file="$(mktemp "${TMP_DIR}/health-noise-sources.XXXXXX")"
+  chmod 0600 "$sources_file"
+  sed -nE \
+    -e 's/.*[Ff]rom[[:space:]]+\[([0-9a-fA-F:]+)\]:[0-9]+.*/\1/p' \
+    -e 's/.*[Ff]rom[[:space:]]+(([0-9]{1,3}\.){3}[0-9]{1,3}):[0-9]+.*/\1/p' \
+    "$input" >"$sources_file"
+  sort -u "$sources_file" | awk 'END {print NR + 0}'
+}
+
 health_collect_recent_errors() {
-  local raw_file
+  local raw_file actionable_raw noise_raw
   if [[ -z "$TMP_DIR" || ! -d "$TMP_DIR" ]]; then
     new_temp_dir
   fi
   raw_file="$(mktemp "${TMP_DIR}/health-journal.raw.XXXXXX")"
+  actionable_raw="$(mktemp "${TMP_DIR}/health-actionable.raw.XXXXXX")"
+  noise_raw="$(mktemp "${TMP_DIR}/health-reality-noise.raw.XXXXXX")"
   HEALTH_RECENT_ERRORS_FILE="$(mktemp "${TMP_DIR}/health-journal.redacted.XXXXXX")"
-  chmod 0600 "$raw_file" "$HEALTH_RECENT_ERRORS_FILE"
-  journalctl -u sing-box.service --since '-30 minutes' -p warning..alert -n 5 \
+  HEALTH_DEBUG_ACTIONABLE_FILE="$(mktemp "${TMP_DIR}/health-actionable-debug.XXXXXX")"
+  HEALTH_REALITY_NOISE_SAMPLES_FILE="$(mktemp "${TMP_DIR}/health-noise-samples.XXXXXX")"
+  chmod 0600 "$raw_file" "$actionable_raw" "$noise_raw" \
+    "$HEALTH_RECENT_ERRORS_FILE" "$HEALTH_DEBUG_ACTIONABLE_FILE" \
+    "$HEALTH_REALITY_NOISE_SAMPLES_FILE"
+  journalctl -u sing-box.service --since '-30 minutes' -p warning..alert -n 500 \
     --no-pager --output=short-iso >"$raw_file" 2>/dev/null || true
-  redact_health_stream <"$raw_file" | \
-    sed '/^-- No entries --$/d; /^-- Boot /d; /^$/d' >"$HEALTH_RECENT_ERRORS_FILE"
+  awk '
+    /^-- No entries --$/ || /^-- Boot / || /^$/ { next }
+    index($0, "REALITY: processed invalid connection") { print > noise; next }
+    { print > actionable }
+  ' actionable="$actionable_raw" noise="$noise_raw" "$raw_file"
+  HEALTH_REALITY_NOISE_COUNT="$(grep -cF 'REALITY: processed invalid connection' "$noise_raw" || true)"
+  HEALTH_REALITY_NOISE_UNIQUE_SOURCES="$(health_count_unique_reality_noise_sources "$noise_raw")"
+  health_write_bounded_redacted_file "$actionable_raw" "$HEALTH_RECENT_ERRORS_FILE" 5 8192
+  health_write_bounded_redacted_file "$actionable_raw" "$HEALTH_DEBUG_ACTIONABLE_FILE" 20 12288
+  health_write_bounded_redacted_file "$noise_raw" "$HEALTH_REALITY_NOISE_SAMPLES_FILE" 5 4096
   if [[ -s "$HEALTH_RECENT_ERRORS_FILE" ]]; then
     HEALTH_RECENT_ERRORS_STATE=WARN
+  fi
+}
+
+health_collect_update_policy() {
+  local effective_dump host_os_id="${1:-}"
+  if [[ -z "$host_os_id" ]]; then
+    host_os_id="$(sed -n 's/^ID=//p' /etc/os-release 2>/dev/null | tr -d '"' | sed -n '1p')"
+  fi
+  effective_dump="$(apt-config dump 2>/dev/null || true)"
+  if [[ -z "$effective_dump" ]]; then
+    HEALTH_SECURITY_UPDATES_DETAIL='effective APT configuration unavailable'
+  elif ! unattended_policy_dump_is_security_only "$host_os_id" "$effective_dump"; then
+    HEALTH_SECURITY_UPDATES_DETAIL="$UNATTENDED_POLICY_REASON"
+  elif ! systemctl is-enabled --quiet apt-daily.timer 2>/dev/null ||
+       ! systemctl is-active --quiet apt-daily.timer 2>/dev/null; then
+    HEALTH_SECURITY_UPDATES_DETAIL='apt-daily.timer is disabled or inactive'
+  elif ! systemctl is-enabled --quiet apt-daily-upgrade.timer 2>/dev/null ||
+       ! systemctl is-active --quiet apt-daily-upgrade.timer 2>/dev/null; then
+    HEALTH_SECURITY_UPDATES_DETAIL='apt-daily-upgrade.timer is disabled or inactive'
+  else
+    HEALTH_SECURITY_UPDATES_STATE=PASS
+    HEALTH_SECURITY_UPDATES_DETAIL='automatic · security-only · no automatic reboot'
+  fi
+
+  if apt-mark showhold 2>/dev/null | grep -Fxq sing-box; then
+    HEALTH_CORE_UPDATES_STATE=PASS
+    HEALTH_CORE_UPDATES_DETAIL='sing-box apt-held · update through vpn update'
   fi
 }
 
@@ -493,6 +677,7 @@ health_collect_state() {
   health_collect_network
   health_collect_system
   health_collect_recent_errors
+  health_collect_update_policy
   health_recalculate_result
 }
 
@@ -502,6 +687,7 @@ health_recalculate_result() {
   HEALTH_WARNINGS=0
   for state in \
     "$HEALTH_CORE_STATE" "$HEALTH_VERSION_STATE" "$HEALTH_RUNTIME_STATE" \
+    "$HEALTH_CORE_UPDATES_STATE" "$HEALTH_SECURITY_UPDATES_STATE" \
     "$HEALTH_VLESS_STATE" "$HEALTH_HY2_STATE" \
     "$HEALTH_SUBSCRIPTION_STATE" "$HEALTH_DNS_STATE" "$HEALTH_CERT_STATE" \
     "$HEALTH_CERT_HOSTNAME_STATE" "$HEALTH_CERT_KEYPAIR_STATE" "$HEALTH_RENEWAL_STATE" \
@@ -538,19 +724,21 @@ health_network_detail() {
 }
 
 render_health_short() {
-  local protocol_state tls_state security_state network_state
+  local core_state protocol_state tls_state security_state network_state
+  core_state="$(health_join_states "$HEALTH_CORE_STATE" "$HEALTH_CORE_UPDATES_STATE")"
   protocol_state="$(health_join_states "$HEALTH_VLESS_STATE" "$HEALTH_HY2_STATE")"
   tls_state="$(health_join_states "$HEALTH_DNS_STATE" "$HEALTH_CERT_STATE" \
     "$HEALTH_CERT_HOSTNAME_STATE" "$HEALTH_CERT_KEYPAIR_STATE" "$HEALTH_RENEWAL_STATE")"
   security_state="$(health_join_states "$HEALTH_FIREWALL_STATE" "$HEALTH_SSH_STATE" \
-    "$HEALTH_PERMISSIONS_STATE")"
+    "$HEALTH_PERMISSIONS_STATE" "$HEALTH_SECURITY_UPDATES_STATE")"
   network_state="$(health_join_states "$HEALTH_CONGESTION_STATE" "$HEALTH_QUEUE_STATE")"
   print_title 'VPN health'
-  health_print_row Core "$HEALTH_CORE_STATE" "sing-box $HEALTH_CORE_VERSION"
+  health_print_row Core "$core_state" "sing-box $HEALTH_CORE_VERSION"
   health_print_row Protocols "$protocol_state" 'REALITY tcp/443 · Hysteria2 udp/443'
   health_print_row Subscription "$HEALTH_SUBSCRIPTION_STATE" "$(health_client_label "$HEALTH_CLIENT_COUNT")"
   health_print_row DNS/TLS "$tls_state" 'configured · DNS/certificate checked'
-  health_print_row REALITY "$HEALTH_TARGET_STATE" 'TLS 1.3 · certificate/SNI · ALPN h2'
+  health_print_row 'REALITY target' "$HEALTH_TARGET_STATE" \
+    'TLS 1.3 · certificate/SNI · ALPN h2'
   health_print_row Security "$security_state" 'nftables · SSH key-only · permissions'
   health_print_row Network "$network_state" "$(health_network_detail)"
   printf '\n'
@@ -558,8 +746,7 @@ render_health_short() {
 }
 
 render_health_verbose() {
-  local queue_detail certificate_detail
-  queue_detail="active $HEALTH_ACTIVE_QDISC · configured default $HEALTH_CONFIGURED_QDISC"
+  local certificate_detail
   certificate_detail="$HEALTH_CERT_DETAIL"
   if [[ "$HEALTH_CERT_HOSTNAME_STATE" == PASS && "$HEALTH_CERT_KEYPAIR_STATE" == PASS ]]; then
     certificate_detail+=' · hostname · key pair'
@@ -601,7 +788,7 @@ render_health_verbose() {
   health_print_row UDP/443 "$HEALTH_UDP443_STATE" "$HEALTH_UDP443_DETAIL"
   health_print_row TCP/8443 "$HEALTH_TCP8443_STATE" "$HEALTH_TCP8443_DETAIL"
   health_print_row Congestion "$HEALTH_CONGESTION_STATE" "kernel default $HEALTH_CONGESTION"
-  health_print_row Queue "$HEALTH_QUEUE_STATE" "$queue_detail"
+  health_print_row Queue "$HEALTH_QUEUE_STATE" "$HEALTH_QUEUE_DETAIL"
 
   print_section 'TLS'
   health_print_row Certificate "$HEALTH_CERT_STATE" "$certificate_detail"
@@ -614,8 +801,11 @@ render_health_verbose() {
   health_print_row SSH "$HEALTH_SSH_STATE" 'key-only policy'
   health_print_row 'SSH listener' "$HEALTH_SSH_LISTENER_STATE" "tcp/$SSH_PORT · $HEALTH_SSH_LISTENER_DETAIL"
   health_print_row Permissions "$HEALTH_PERMISSIONS_STATE" 'managed files'
+  health_print_row 'Security updates' "$HEALTH_SECURITY_UPDATES_STATE" \
+    "$HEALTH_SECURITY_UPDATES_DETAIL"
+  health_print_row 'Core updates' "$HEALTH_CORE_UPDATES_STATE" "$HEALTH_CORE_UPDATES_DETAIL"
 
-  print_section 'RECENT ERRORS'
+  print_section 'RECENT ACTIONABLE ERRORS'
   if [[ "$HEALTH_RECENT_ERRORS_STATE" == PASS ]]; then
     printf '  None\n'
   else
@@ -648,9 +838,19 @@ render_health_debug_details() {
   printf '\nSystemd state:\n'
   systemctl show sing-box.service nginx.service nftables.service certbot.timer ssh.service \
     -p Id -p LoadState -p ActiveState -p SubState --no-pager 2>/dev/null | sed -n '1,100p' || true
-  printf '\nRecent sing-box journal (bounded):\n'
-  journalctl -u sing-box.service --since '-30 minutes' -n 80 --no-pager \
-    --output=short-iso 2>/dev/null | sed -n '1,80p' || true
+  print_section 'ACTIONABLE ERROR DETAILS'
+  if [[ -s "$HEALTH_DEBUG_ACTIONABLE_FILE" ]]; then
+    sed -n '1,20p' "$HEALTH_DEBUG_ACTIONABLE_FILE"
+  else
+    printf '  None\n'
+  fi
+  print_section 'IGNORED INBOUND NOISE'
+  printf '  Invalid REALITY handshakes (30 min): %s\n' "$HEALTH_REALITY_NOISE_COUNT"
+  printf '  Unique source addresses (30 min): %s\n' "$HEALTH_REALITY_NOISE_UNIQUE_SOURCES"
+  if [[ -s "$HEALTH_REALITY_NOISE_SAMPLES_FILE" ]]; then
+    printf '  Redacted samples (bounded):\n'
+    sed -n '1,5p' "$HEALTH_REALITY_NOISE_SAMPLES_FILE"
+  fi
 }
 
 health_details() {
@@ -658,7 +858,7 @@ health_details() {
   require_root
   health_collect_state
   (( HEALTH_FAILURES == 0 )) || health_status=1
-  render_health_verbose | redact_health_stream | health_limit_output_width
+  render_health_verbose | redact_health_stream
   return "$health_status"
 }
 
@@ -670,7 +870,7 @@ health_debug() {
   {
     render_health_verbose
     render_health_debug_details
-  } | redact_health_stream | health_limit_output_width
+  } | redact_health_stream
   return "$health_status"
 }
 

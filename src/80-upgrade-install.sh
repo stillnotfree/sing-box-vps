@@ -38,6 +38,7 @@ prepare_upgrade_transaction() {
   UPGRADE_ORIGINAL_RMEM="$(sysctl -n net.core.rmem_max)"
   UPGRADE_ORIGINAL_WMEM="$(sysctl -n net.core.wmem_max)"
   backup_upgrade_file "$UDP_SYSCTL_FILE" udp-sysctl 0644
+  backup_upgrade_file "$UNATTENDED_UPGRADES_CONFIG" unattended-upgrades 0644
   backup_upgrade_file "$CERT_HOOK" certificate-hook 0750
   backup_upgrade_file "$INSTALLED_HELPER" vpn-helper 0750
   backup_upgrade_file "$USER_COMMAND" vpn-command 0755
@@ -53,6 +54,7 @@ rollback_upgrade_transaction() {
   printf '[WARN] Overlay update did not complete; restoring its previous managed files and runtime UDP ceilings.\n' >&2
   set +e
   restore_upgrade_file "$UDP_SYSCTL_FILE" udp-sysctl root root 0644 || restore_failed=1
+  restore_upgrade_file "$UNATTENDED_UPGRADES_CONFIG" unattended-upgrades root root 0644 || restore_failed=1
   restore_upgrade_file "$CERT_HOOK" certificate-hook root root 0750 || restore_failed=1
   restore_upgrade_file "$INSTALLED_HELPER" vpn-helper root root 0750 || restore_failed=1
   restore_upgrade_file "$USER_COMMAND" vpn-command root root 0755 || restore_failed=1
@@ -122,6 +124,8 @@ EOF
 
   set_step 'Hysteria2 UDP socket-buffer ceilings'
   configure_udp_buffer_ceilings
+  set_step 'automatic security updates policy'
+  configure_unattended_upgrades
   set_step 'certificate renewal hook refresh'
   configure_certificate_hook
   smoke_test_certificate_hook

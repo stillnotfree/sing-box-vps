@@ -5,17 +5,17 @@ require_root() {
 require_confirmation() {
   local answer
   (( ASSUME_YES == 1 )) && return
-  [[ -t 0 ]] || die 'Mutating non-interactive commands require --yes.'
+  interactive_stdin || cli_error 'Mutating non-interactive commands require --yes.'
   read -r -p 'Continue? [y/N] ' answer
-  [[ "$answer" =~ ^[Yy]$ ]] || die 'Cancelled.'
+  [[ "$answer" =~ ^[Yy]$ ]] || cancel_command
 }
 
 require_install_confirmation() {
   local answer
   (( ASSUME_YES == 1 )) && return
-  [[ -t 0 ]] || die 'Non-interactive installation requires --yes.'
+  interactive_stdin || die 'Non-interactive installation requires --yes.'
   read -r -p '[Step 10 / 10] Install now? [Y/n] ' answer
-  [[ -z "$answer" || "$answer" =~ ^[Yy]$ ]] || die 'Cancelled.'
+  [[ -z "$answer" || "$answer" =~ ^[Yy]$ ]] || cancel_command
 }
 
 require_command() {

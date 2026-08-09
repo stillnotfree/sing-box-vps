@@ -70,6 +70,10 @@ the heuristic's limitations. A non-interactive install keeps a target that has
 passed TLS, certificate/SNI, and ALPN checks even when tickets were observed.
 Raw OpenSSL trace and certificate diagnostics are hidden by default; use
 `vpn audit-target DOMAIN --verbose` only when they are explicitly needed.
+`vpn set-target DOMAIN` uses this same audit before any transaction starts. A
+target with a comparison-heuristic warning is still usable, but must be
+accepted before settings, configuration, or subscriptions are changed. Session
+tickets are normal TLS 1.3 behavior; their count is not a security score.
 
 ## Source layout
 
@@ -94,6 +98,11 @@ ssh ADMIN_USER@SERVER_IP
 That successful interactive login automatically confirms the firewall and
 enables key-only SSH. No separate finalization command or second login is
 normally required.
+
+The created account is a full administrator with `NOPASSWD: ALL`. Possession
+of its SSH private key therefore permits root access through `sudo` without a
+second factor. `PermitRootLogin no` still blocks direct root login, but is not
+an additional privilege boundary after the administrator has logged in.
 
 The first independent client is named `default`. Display its private
 subscription, direct links, and QR codes with:
@@ -128,10 +137,12 @@ The installed `vpn` command obtains its required administrative privileges
 automatically. You do not need to prefix it with `sudo`.
 
 `vpn health` is the short operational result. `--verbose` expands it into
-semantic SYSTEM, VPN, NETWORK, TLS, SECURITY, and RECENT ERRORS sections without
-raw system dumps. `--debug` adds bounded low-level listener, qdisc, interface,
-certificate, systemd, and journal data. Sensitive values remain redacted in
-both diagnostic modes.
+semantic SYSTEM, VPN, NETWORK, TLS, SECURITY, and RECENT ACTIONABLE ERRORS
+sections without raw system dumps. `--debug` adds bounded low-level listener,
+qdisc, interface, certificate, systemd, and journal data. Known invalid
+REALITY handshakes are treated as unauthenticated inbound noise, not a server
+failure; only debug output includes redacted bounded samples and 30-minute
+counts. Sensitive values remain redacted in both diagnostic modes.
 
 Target, fingerprint, obfuscation, client, and update changes are validated and
 applied transactionally. Existing subscription URLs remain stable; refresh the
@@ -148,9 +159,10 @@ vpn update
 vpn health
 ```
 
-OS security updates are enabled automatically without automatic reboot.
-sing-box is updated separately by `vpn update`, which validates the current
-configuration and can restore the cached previous package if startup fails.
+Only OS security origins are enabled for automatic unattended upgrades, and
+automatic reboot is disabled. sing-box is APT-held and updated separately by
+`vpn update`, which validates the current configuration and can restore the
+cached previous package if startup fails.
 
 ## What the installer configures
 
@@ -165,7 +177,7 @@ configuration and can restore the cached previous package if startup fails.
 | TLS | Let's Encrypt certificate with tested automatic renewal |
 | Network | BBR + `fq` when supported and conservative UDP buffer ceilings |
 | Storage | 1 GiB swap when supported and absent, plus a 200 MiB / 30-day journal limit |
-| Updates | Automatic OS security updates and transactional sing-box updates |
+| Updates | Security-only automatic OS updates without reboot; APT-held transactional sing-box updates |
 
 The installer owns only `table inet vpn_filter`; it does not flush unrelated
 nftables tables.
@@ -187,6 +199,10 @@ the subscription threat model.
 - The installer deliberately accepts only the tested sing-box 1.13 release line.
 - IPv6 profiles, CDN transports, port hopping, panels, and traffic statistics are not configured.
 - Client routing and TLS fragmentation are not forced by the server.
+- When `fq` is configured on an already-running host, the current interface may
+  retain `fq_codel` until it is recreated or the VPS reboots.
+- Invalid REALITY handshakes can appear in raw logs and do not by themselves
+  indicate a broken server or an attack.
 - Test both transports on the actual Wi-Fi and mobile networks where they will be used.
 
 <details>
@@ -215,6 +231,8 @@ shellcheck --severity=style scripts/build-standalone.sh install-sing-box-server.
 bash tests/static-smoke.sh
 bash tests/fingerprint-smoke.sh
 bash tests/health-smoke.sh
+bash tests/management-lifecycle-smoke.sh
+bash tests/package-policy-smoke.sh
 sudo bash tests/firewall-smoke.sh
 ./install-sing-box-server.sh plan
 ```

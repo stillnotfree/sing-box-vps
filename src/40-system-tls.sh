@@ -201,18 +201,110 @@ EOF
   log 'Limited persistent journal storage to 200 MiB with a 30-day retention ceiling.'
 }
 
-configure_unattended_upgrades() {
-  local candidate
-  candidate="$(mktemp)"
-  cat >"$candidate" <<'EOF'
-// VPN setup: security updates without automatic reboot.
+render_unattended_upgrades_config() {
+  local output="$1" host_os_id="$2"
+  cat >"$output" <<'EOF'
+// VPN setup: automatic security updates only; no automatic reboot.
 APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
+#clear Unattended-Upgrade::Origins-Pattern;
+#clear Unattended-Upgrade::Allowed-Origins;
+Unattended-Upgrade::Origins-Pattern {
+EOF
+  case "$host_os_id" in
+    debian)
+      printf '%s\n' \
+        "  \"origin=Debian,codename=\${distro_codename},label=Debian-Security\";" \
+        "  \"origin=Debian,codename=\${distro_codename}-security,label=Debian-Security\";" \
+        >>"$output"
+      ;;
+    ubuntu)
+      printf '%s\n' \
+        "  \"origin=Ubuntu,archive=\${distro_codename}-security,label=Ubuntu\";" \
+        >>"$output"
+      ;;
+    *)
+      die "Unsupported unattended-upgrades policy target: ${host_os_id:-unknown}"
+      ;;
+  esac
+  cat >>"$output" <<'EOF'
+};
 Unattended-Upgrade::Automatic-Reboot "false";
 EOF
-  write_atomic /etc/apt/apt.conf.d/52-vpn-unattended-upgrades root root 0644 "$candidate"
+}
+
+unattended_policy_dump_is_security_only() {
+  local host_os_id="$1" effective_dump="$2" line origin origins=""
+  local debian_release_security debian_pocket_security ubuntu_pocket_security
+  debian_release_security="origin=Debian,codename=\${distro_codename},label=Debian-Security"
+  debian_pocket_security="origin=Debian,codename=\${distro_codename}-security,label=Debian-Security"
+  ubuntu_pocket_security="origin=Ubuntu,archive=\${distro_codename}-security,label=Ubuntu"
+  UNATTENDED_POLICY_REASON=""
+  if ! grep -Fq 'APT::Periodic::Update-Package-Lists "1";' <<<"$effective_dump"; then
+    UNATTENDED_POLICY_REASON='periodic package-list updates are disabled'
+    return 1
+  fi
+  if ! grep -Fq 'APT::Periodic::Unattended-Upgrade "1";' <<<"$effective_dump"; then
+    UNATTENDED_POLICY_REASON='unattended upgrades are disabled'
+    return 1
+  fi
+  if ! grep -Fq 'Unattended-Upgrade::Automatic-Reboot "false";' <<<"$effective_dump"; then
+    UNATTENDED_POLICY_REASON='automatic reboot is not disabled'
+    return 1
+  fi
+  origins="$(awk '
+    /^Unattended-Upgrade::Origins-Pattern::/ ||
+    /^Unattended-Upgrade::Allowed-Origins::/ {print}
+  ' <<<"$effective_dump")"
+  if [[ -z "$origins" ]]; then
+    UNATTENDED_POLICY_REASON='no unattended-upgrade origins are configured'
+    return 1
+  fi
+  while IFS= read -r line; do
+    origin="${line#*\"}"
+    origin="${origin%\";*}"
+    case "$host_os_id" in
+      debian)
+        case "$origin" in
+          "$debian_release_security"|"$debian_pocket_security") ;;
+          *)
+            UNATTENDED_POLICY_REASON='a non-security Debian origin is allowed'
+            return 1
+            ;;
+        esac
+        ;;
+      ubuntu)
+        if [[ "$origin" != "$ubuntu_pocket_security" ]]; then
+          UNATTENDED_POLICY_REASON='a non-security Ubuntu origin is allowed'
+          return 1
+        fi
+        ;;
+      *)
+        UNATTENDED_POLICY_REASON="unsupported distribution policy: ${host_os_id:-unknown}"
+        return 1
+        ;;
+    esac
+  done <<<"$origins"
+}
+
+configure_unattended_upgrades() {
+  local candidate effective_dump host_os_id="$OS_ID"
+  if [[ -z "$host_os_id" && -r /etc/os-release ]]; then
+    host_os_id="$(sed -n 's/^ID=//p' /etc/os-release | tr -d '"' | sed -n '1p')"
+  fi
+  candidate="$(mktemp)"
+  render_unattended_upgrades_config "$candidate" "$host_os_id"
+  write_atomic "$UNATTENDED_UPGRADES_CONFIG" root root 0644 "$candidate"
   rm -f -- "$candidate"
+  effective_dump="$(apt-config dump)"
+  unattended_policy_dump_is_security_only "$host_os_id" "$effective_dump" || \
+    die "Effective unattended-upgrades policy is invalid: ${UNATTENDED_POLICY_REASON}."
   systemctl enable --now apt-daily.timer apt-daily-upgrade.timer >/dev/null
+  systemctl is-enabled --quiet apt-daily.timer || die 'apt-daily.timer is not enabled.'
+  systemctl is-enabled --quiet apt-daily-upgrade.timer || die 'apt-daily-upgrade.timer is not enabled.'
+  systemctl is-active --quiet apt-daily.timer || die 'apt-daily.timer is not active.'
+  systemctl is-active --quiet apt-daily-upgrade.timer || die 'apt-daily-upgrade.timer is not active.'
+  log "Configured ${host_os_id} unattended upgrades for security origins only, without automatic reboot."
 }
 
 verify_dns() {
@@ -239,41 +331,6 @@ verify_dns() {
     fi
   done
   log "DNS A and CAA responses for ${TLS_DOMAIN} are healthy on both public resolvers."
-}
-
-verify_reality_target() {
-  local probe_file probe_status=0
-  log "Checking TLS 1.3 reachability of the reviewed REALITY target ${REALITY_TARGET}."
-  if [[ -z "$TMP_DIR" || ! -d "$TMP_DIR" ]]; then
-    new_temp_dir
-  fi
-  probe_file="$(mktemp "${TMP_DIR}/reality-target-verify.XXXXXX")"
-  chmod 0600 "$probe_file"
-  if timeout 15 openssl s_client \
-    -connect "${REALITY_TARGET}:443" \
-    -servername "$REALITY_TARGET" \
-    -verify_hostname "$REALITY_TARGET" \
-    -tls1_3 -alpn h2 -verify_return_error </dev/null >"$probe_file" 2>&1; then
-    probe_status=0
-  else
-    probe_status=$?
-  fi
-  if (( probe_status != 0 )); then
-    die "REALITY target ${REALITY_TARGET} did not pass the TLS 1.3 verification test."
-  fi
-  if ! LC_ALL=C grep -aEiq \
-    'New,[[:space:]]*TLSv1\.3|Protocol( version)?[[:space:]]*:[[:space:]]*TLSv1\.3' "$probe_file"; then
-    die "REALITY target ${REALITY_TARGET} did not negotiate TLS 1.3."
-  fi
-  if ! LC_ALL=C grep -aEiq \
-    'Verify return code:[[:space:]]*0[[:space:]]*\(ok\)|Verification:[[:space:]]*OK' "$probe_file"; then
-    die "REALITY target ${REALITY_TARGET} failed certificate or SNI verification."
-  fi
-  if ! LC_ALL=C grep -aEiq \
-    'ALPN protocol:[[:space:]]*h2|ALPN[^[:alnum:]]+h2' "$probe_file"; then
-    die "REALITY target ${REALITY_TARGET} did not negotiate HTTP/2 (ALPN h2)."
-  fi
-  log "REALITY target ${REALITY_TARGET} passed the basic certificate, TLS 1.3, and ALPN h2 checks."
 }
 
 capture_reality_target_audit_probe() {
@@ -347,7 +404,7 @@ audit_reality_target() {
   local comparison_signal=UNKNOWN result reason="" ticket_word=tickets
   require_command openssl
   require_command timeout
-  validate_domain "$target"
+  domain_is_valid "$target" || cli_error "Invalid fully qualified domain: $target"
 
   if [[ -z "$TMP_DIR" || ! -d "$TMP_DIR" ]]; then
     new_temp_dir
@@ -445,6 +502,7 @@ audit_reality_target() {
   fi
   printf 'Comparison signal: %s\n' "$comparison_signal"
   printf 'Result: %s\n' "$result"
+  printf 'Note: TLS 1.3 session tickets are normal; this WARN is only the comparison heuristic.\n'
   print_reality_target_audit_debug "$probe_status" "$raw_file" "$text_file"
   return 1
 }

@@ -156,6 +156,8 @@ fi
   grep -Fq 'Post-handshake NewSessionTicket: 1' <<<"$audit_output"
   grep -Fq 'Comparison signal: OBSERVED' <<<"$audit_output"
   grep -Fq 'Result: WARN — target is usable, but 1 post-handshake ticket was observed.' <<<"$audit_output"
+  grep -Fq 'TLS 1.3 session tickets are normal; this WARN is only the comparison heuristic.' \
+    <<<"$audit_output"
 )
 
 (
