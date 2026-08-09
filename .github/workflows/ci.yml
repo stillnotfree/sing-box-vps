@@ -36,5 +36,17 @@ jobs:
       - name: Run state smoke tests
         run: bash tests/fingerprint-smoke.sh
 
+      - name: Run health smoke tests
+        run: bash tests/health-smoke.sh
+
+      - name: Run management lifecycle smoke tests
+        run: bash tests/management-lifecycle-smoke.sh
+
+      - name: Run package policy smoke tests
+        run: bash tests/package-policy-smoke.sh
+
+      - name: Validate dry-run plan
+        run: ./install-sing-box-server.sh plan
+
       - name: Validate nftables candidate
         run: sudo bash tests/firewall-smoke.sh

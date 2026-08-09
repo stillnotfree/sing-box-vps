@@ -133,7 +133,9 @@ redact_health_stream() {
     -e 's/[0-9a-fA-F]{64}/[TOKEN-REDACTED]/g' \
     -e 's/[0-9a-fA-F]{48}/[SECRET-REDACTED]/g' \
     -e 's/[A-Za-z0-9+_\/-]{32,}={0,2}/[SECRET-REDACTED]/g' \
-    -e 's/(^|[^0-9])(([0-9]{1,3}\.){3}[0-9]{1,3})(:[0-9]+)?([^0-9]|$)/\1[IP-REDACTED]\5/g' \
+    -e ':redact_ipv4' \
+    -e 's/(^|[^0-9])(([0-9]{1,3}\.){3}[0-9]{1,3})(:[0-9]+)?([^0-9]|$)/\1[IP-REDACTED]\5/' \
+    -e 't redact_ipv4' \
     -e 's/\[[0-9a-fA-F]*:[0-9a-fA-F:]*\]/[IPv6-REDACTED]/g' \
     -e 's/(^|[^0-9a-fA-F:])([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}([^0-9a-fA-F:]|$)/\1[IPv6-REDACTED]\3/g' \
     -e 's/(^|[^0-9a-fA-F:])([0-9a-fA-F]{0,4}:){1,7}:[0-9a-fA-F]{0,4}([^0-9a-fA-F:]|$)/\1[IPv6-REDACTED]\3/g' \

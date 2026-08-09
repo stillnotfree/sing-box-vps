@@ -594,18 +594,32 @@ activate_subscription_tree() {
   local staged="$1" new_root="${SUBSCRIPTION_ROOT}.new.$$" old_root="${SUBSCRIPTION_ROOT}.old.$$" file
   [[ -d "$staged" ]] || return 1
   getent passwd www-data >/dev/null 2>&1 || return 1
-  install -d -o root -g root -m 0755 "$(dirname "$SUBSCRIPTION_ROOT")"
-  rm -rf -- "$new_root" "$old_root"
-  install -d -o root -g www-data -m 0750 "$new_root"
+  if ! install -d -o root -g root -m 0755 "$(dirname "$SUBSCRIPTION_ROOT")"; then
+    return 1
+  fi
+  if ! rm -rf -- "$new_root" "$old_root"; then
+    return 1
+  fi
+  if ! install -d -o root -g www-data -m 0750 "$new_root"; then
+    rm -rf -- "$new_root"
+    return 1
+  fi
   while IFS= read -r -d '' file; do
-    install -o root -g www-data -m 0640 "$file" "${new_root}/$(basename "$file")"
+    if ! install -o root -g www-data -m 0640 "$file" "${new_root}/$(basename "$file")"; then
+      rm -rf -- "$new_root"
+      return 1
+    fi
   done < <(find "$staged" -maxdepth 1 -type f -print0)
 
   if [[ -d "$SUBSCRIPTION_ROOT" ]]; then
-    mv -- "$SUBSCRIPTION_ROOT" "$old_root" || return 1
+    if ! mv -- "$SUBSCRIPTION_ROOT" "$old_root"; then
+      rm -rf -- "$new_root"
+      return 1
+    fi
   fi
   if ! mv -- "$new_root" "$SUBSCRIPTION_ROOT"; then
     [[ ! -d "$old_root" ]] || mv -- "$old_root" "$SUBSCRIPTION_ROOT"
+    rm -rf -- "$new_root"
     return 1
   fi
   rm -rf -- "$old_root"

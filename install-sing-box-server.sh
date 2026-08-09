@@ -2856,18 +2856,32 @@ activate_subscription_tree() {
   local staged="$1" new_root="${SUBSCRIPTION_ROOT}.new.$$" old_root="${SUBSCRIPTION_ROOT}.old.$$" file
   [[ -d "$staged" ]] || return 1
   getent passwd www-data >/dev/null 2>&1 || return 1
-  install -d -o root -g root -m 0755 "$(dirname "$SUBSCRIPTION_ROOT")"
-  rm -rf -- "$new_root" "$old_root"
-  install -d -o root -g www-data -m 0750 "$new_root"
+  if ! install -d -o root -g root -m 0755 "$(dirname "$SUBSCRIPTION_ROOT")"; then
+    return 1
+  fi
+  if ! rm -rf -- "$new_root" "$old_root"; then
+    return 1
+  fi
+  if ! install -d -o root -g www-data -m 0750 "$new_root"; then
+    rm -rf -- "$new_root"
+    return 1
+  fi
   while IFS= read -r -d '' file; do
-    install -o root -g www-data -m 0640 "$file" "${new_root}/$(basename "$file")"
+    if ! install -o root -g www-data -m 0640 "$file" "${new_root}/$(basename "$file")"; then
+      rm -rf -- "$new_root"
+      return 1
+    fi
   done < <(find "$staged" -maxdepth 1 -type f -print0)
 
   if [[ -d "$SUBSCRIPTION_ROOT" ]]; then
-    mv -- "$SUBSCRIPTION_ROOT" "$old_root" || return 1
+    if ! mv -- "$SUBSCRIPTION_ROOT" "$old_root"; then
+      rm -rf -- "$new_root"
+      return 1
+    fi
   fi
   if ! mv -- "$new_root" "$SUBSCRIPTION_ROOT"; then
     [[ ! -d "$old_root" ]] || mv -- "$old_root" "$SUBSCRIPTION_ROOT"
+    rm -rf -- "$new_root"
     return 1
   fi
   rm -rf -- "$old_root"
@@ -4052,7 +4066,9 @@ redact_health_stream() {
     -e 's/[0-9a-fA-F]{64}/[TOKEN-REDACTED]/g' \
     -e 's/[0-9a-fA-F]{48}/[SECRET-REDACTED]/g' \
     -e 's/[A-Za-z0-9+_\/-]{32,}={0,2}/[SECRET-REDACTED]/g' \
-    -e 's/(^|[^0-9])(([0-9]{1,3}\.){3}[0-9]{1,3})(:[0-9]+)?([^0-9]|$)/\1[IP-REDACTED]\5/g' \
+    -e ':redact_ipv4' \
+    -e 's/(^|[^0-9])(([0-9]{1,3}\.){3}[0-9]{1,3})(:[0-9]+)?([^0-9]|$)/\1[IP-REDACTED]\5/' \
+    -e 't redact_ipv4' \
     -e 's/\[[0-9a-fA-F]*:[0-9a-fA-F:]*\]/[IPv6-REDACTED]/g' \
     -e 's/(^|[^0-9a-fA-F:])([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}([^0-9a-fA-F:]|$)/\1[IPv6-REDACTED]\3/g' \
     -e 's/(^|[^0-9a-fA-F:])([0-9a-fA-F]{0,4}:){1,7}:[0-9a-fA-F]{0,4}([^0-9a-fA-F:]|$)/\1[IPv6-REDACTED]\3/g' \

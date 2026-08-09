@@ -299,6 +299,59 @@ grep -Fq 'limit_except GET HEAD { deny all; }' "$nginx_before"
 activation_body="$(declare -f activate_subscription_tree)"
 grep -Fq 'install -d -o root -g www-data -m 0750' <<<"$activation_body"
 grep -Fq 'install -o root -g www-data -m 0640' <<<"$activation_body"
+
+(
+  bash -c '
+    set -Eeuo pipefail
+    installer="$1"
+    work="$2"
+    activation_root="${work}/activation-live"
+    staged="${work}/activation-staged"
+    mv_log="${work}/activation-mv.log"
+    sandbox_installer="${work}/activation-installer.sh"
+    cp "$installer" "$sandbox_installer"
+    sed -i.bak "s|^readonly SUBSCRIPTION_ROOT=.*|readonly SUBSCRIPTION_ROOT=\"${activation_root}\"|" "$sandbox_installer"
+    rm -f "${sandbox_installer}.bak"
+    source "$sandbox_installer"
+    mkdir -p "$staged" "$SUBSCRIPTION_ROOT"
+    printf "staged subscription\\n" >"${staged}/token.links"
+    printf "active subscription\\n" >"${SUBSCRIPTION_ROOT}/token.links"
+
+    getent() { return 0; }
+    install() {
+      if [[ "$1" == "-d" ]]; then
+        command mkdir -p -- "${!#}"
+        return
+      fi
+      return 1
+    }
+    rm() {
+      local arg
+      for arg in "$@"; do
+        [[ "$arg" == -- || "$arg" == -* ]] && continue
+        [[ "$arg" == "${work}/"* ]] || return 1
+      done
+      command rm "$@"
+    }
+    mv() {
+      local arg
+      for arg in "$@"; do
+        [[ "$arg" == -- || "$arg" == -* ]] && continue
+        [[ "$arg" == "${work}/"* ]] || return 1
+      done
+      printf "%s\\n" "$*" >>"$mv_log"
+      command mv "$@"
+    }
+
+    if activate_subscription_tree "$staged"; then
+      printf "Subscription activation unexpectedly succeeded after file install failure.\\n" >&2
+      exit 1
+    fi
+    cmp -s <(printf "active subscription\\n") "${SUBSCRIPTION_ROOT}/token.links"
+    [[ ! -e "${SUBSCRIPTION_ROOT}.new.$$" ]]
+    [[ ! -s "$mv_log" ]]
+  ' _ "${repo_root}/install-sing-box-server.sh" "$work"
+)
 permissions_body="$(declare -f health_managed_permissions_are_healthy)"
 grep -Fq "'750:root:www-data'" <<<"$permissions_body"
 grep -Fq "'640:root:www-data'" <<<"$permissions_body"

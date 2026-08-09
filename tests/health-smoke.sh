@@ -300,6 +300,16 @@ for literal in net.core.default_qdisc net.core.rmem_max net.core.wmem_max \
   [[ "$redacted_output" == *"$literal"* ]]
 done
 
+for adjacent_ipv4_input in \
+  '198.51.100.10 203.0.113.20 192.0.2.30' \
+  '198.51.100.10,203.0.113.20,192.0.2.30'; do
+  adjacent_ipv4_output="$(printf '%s\n' "$adjacent_ipv4_input" | redact_health_stream)"
+  for ipv4 in 198.51.100.10 203.0.113.20 192.0.2.30; do
+    [[ "$adjacent_ipv4_output" != *"$ipv4"* ]]
+  done
+  [[ "$(grep -o '\[IP-REDACTED\]' <<<"$adjacent_ipv4_output" | wc -l | tr -d ' ')" == 3 ]]
+done
+
 health_reset_state
 health_classify_ntp_state no 120
 [[ "$HEALTH_CLOCK_STATE" == PENDING ]]
