@@ -118,23 +118,49 @@ fi
   require_command() { :; }
   AUDIT_TARGET="tickets.example.com"
   capture_reality_target_audit_probe() {
-    printf '%s\n' 'ALPN protocol: h2' '<<< TLS 1.3, Handshake, NewSessionTicket'
+    printf 'New, TLSv1.3, Cipher is TLS_AES_128_GCM_SHA256\n' >"$2"
+    printf 'Verify return code: 0 (ok)\nALPN protocol: h2\n' >>"$2"
+    printf '<<< TLS 1.3, Handshake, NewSessionTicket\000binary-response\n' >>"$2"
   }
   if audit_output="$(audit_reality_target 2>&1)"; then
     printf 'A target with a post-handshake ticket unexpectedly passed the audit.\n' >&2
     exit 1
   fi
-  grep -Fq 'Aparecium-class comparison signal: OBSERVED' <<<"$audit_output"
+  grep -Fq '1 NewSessionTicket message(s) observed' <<<"$audit_output"
+  grep -Fq 'Usable; zero tickets is preferred' <<<"$audit_output"
+  [[ "$audit_output" != *'ignored null byte'* ]]
 )
 
 (
   require_command() { :; }
   AUDIT_TARGET="no-tickets.example.com"
   capture_reality_target_audit_probe() {
-    printf '%s\n' 'ALPN protocol: h2'
+    printf '%s\n' \
+      'New, TLSv1.3, Cipher is TLS_AES_128_GCM_SHA256' \
+      'Verify return code: 0 (ok)' \
+      'ALPN protocol: h2' >"$2"
   }
   audit_output="$(audit_reality_target 2>&1)"
-  grep -Fq 'Aparecium-class comparison signal: NOT OBSERVED' <<<"$audit_output"
+  grep -Fq '0 NewSessionTicket messages observed' <<<"$audit_output"
+  grep -Fq 'Preferred for this specific Aparecium-class heuristic' <<<"$audit_output"
+)
+
+(
+  trap - ERR
+  require_command() { :; }
+  AUDIT_TARGET="broken.example.com"
+  capture_reality_target_audit_probe() {
+    printf '%s\n' \
+      'New, TLSv1.3, Cipher is TLS_AES_128_GCM_SHA256' \
+      'Verify return code: 20 (unable to get local issuer certificate)' >"$2"
+  }
+  if audit_output="$(audit_reality_target 2>&1)"; then
+    printf 'A target with failed certificate and ALPN checks unexpectedly passed.\n' >&2
+    exit 1
+  fi
+  grep -Eq 'Certificate[[:space:]]+FAIL' <<<"$audit_output"
+  grep -Eq 'ALPN h2[[:space:]]+FAIL' <<<"$audit_output"
+  grep -Eq 'Assessment[[:space:]]+FAIL' <<<"$audit_output"
 )
 
 (
