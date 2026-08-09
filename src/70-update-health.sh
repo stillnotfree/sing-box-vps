@@ -677,7 +677,7 @@ health_collect_state() {
   health_collect_network
   health_collect_system
   health_collect_recent_errors
-  health_collect_update_policy
+  health_collect_update_policy "$OS_ID"
   health_recalculate_result
 }
 
