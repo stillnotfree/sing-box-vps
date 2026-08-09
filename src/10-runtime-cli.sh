@@ -99,20 +99,6 @@ set_step() {
   log "STEP: ${CURRENT_STEP}"
 }
 
-read_prompt() {
-  local prompt="$1"
-  shift
-  if (( INSTALL_LOG_ACTIVE == 1 )) && [[ -t 6 ]]; then
-    # Interactive prompts must bypass the line-oriented redaction pipe. A
-    # Bash read prompt has no trailing newline, so forwarding it through that
-    # pipe would hide it until the user had already entered an answer.
-    printf '%s' "$prompt" >&6
-    read -r "$@"
-  else
-    read -r -p "$prompt" "$@"
-  fi
-}
-
 redact_install_stream() {
   local escape_sequence=$'\033'
   sed -E \
@@ -123,11 +109,16 @@ redact_install_stream() {
 }
 
 capture_install_output() {
-  local destination="$1" line
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    printf '%s\n' "$line" >&6
-    printf '%s\n' "$line"
-  done | redact_install_stream | LC_ALL=C awk -v max="$INSTALL_LOG_MAX_BYTES" '
+  local destination="$1" terminal_fifo terminal_pid pipeline_status=0 terminal_status=0
+  terminal_fifo="${destination}.terminal.$$"
+  mkfifo -m 0600 "$terminal_fifo"
+  cat "$terminal_fifo" >&6 &
+  terminal_pid=$!
+
+  # tee forwards bytes through one ordered stream, including Bash prompts
+  # without a trailing newline. The FIFO avoids reopening /dev/fd entries,
+  # which is not portable across all development and runtime environments.
+  if tee "$terminal_fifo" | redact_install_stream | LC_ALL=C awk -v max="$INSTALL_LOG_MAX_BYTES" '
     {
       bytes = length($0) + 1
       if (written + bytes <= max) {
@@ -138,7 +129,15 @@ capture_install_output() {
         truncated = 1
       }
     }
-  ' >"$destination"
+  ' >"$destination"; then
+    pipeline_status=0
+  else
+    pipeline_status=$?
+  fi
+  wait "$terminal_pid" || terminal_status=$?
+  rm -f -- "$terminal_fifo"
+  (( pipeline_status == 0 )) || return "$pipeline_status"
+  return "$terminal_status"
 }
 
 sanitize_install_log_file() {

@@ -57,7 +57,9 @@ shows a short summary and asks for confirmation with `[Y/n]`; pressing Enter
 accepts. An interrupted installation can normally be resumed with the same
 command.
 
-The selected REALITY target is audited automatically before it is saved. If
+The selected REALITY target is audited immediately when `openssl` and `timeout`
+are already available. Otherwise the installer explicitly defers the audit
+until dependencies are installed, but still runs it before saving settings. If
 the TLS 1.3/h2 requirements fail, an interactive installation asks for another
 target. If only the post-handshake comparison signal is observed, it offers the
 choice to keep the explicitly selected target or enter another one. `--yes`

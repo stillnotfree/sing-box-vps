@@ -95,6 +95,7 @@ SERVER_IPV4=""
 TLS_DOMAIN=""
 SSH_PORT=""
 REALITY_TARGET=""
+REALITY_TARGET_AUDITED=0
 COUNTRY_EMOJI=""
 ACME_EMAIL=""
 CLIENT_FINGERPRINT=""
@@ -230,20 +231,6 @@ set_step() {
   log "STEP: ${CURRENT_STEP}"
 }
 
-read_prompt() {
-  local prompt="$1"
-  shift
-  if (( INSTALL_LOG_ACTIVE == 1 )) && [[ -t 6 ]]; then
-    # Interactive prompts must bypass the line-oriented redaction pipe. A
-    # Bash read prompt has no trailing newline, so forwarding it through that
-    # pipe would hide it until the user had already entered an answer.
-    printf '%s' "$prompt" >&6
-    read -r "$@"
-  else
-    read -r -p "$prompt" "$@"
-  fi
-}
-
 redact_install_stream() {
   local escape_sequence=$'\033'
   sed -E \
@@ -254,11 +241,16 @@ redact_install_stream() {
 }
 
 capture_install_output() {
-  local destination="$1" line
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    printf '%s\n' "$line" >&6
-    printf '%s\n' "$line"
-  done | redact_install_stream | LC_ALL=C awk -v max="$INSTALL_LOG_MAX_BYTES" '
+  local destination="$1" terminal_fifo terminal_pid pipeline_status=0 terminal_status=0
+  terminal_fifo="${destination}.terminal.$$"
+  mkfifo -m 0600 "$terminal_fifo"
+  cat "$terminal_fifo" >&6 &
+  terminal_pid=$!
+
+  # tee forwards bytes through one ordered stream, including Bash prompts
+  # without a trailing newline. The FIFO avoids reopening /dev/fd entries,
+  # which is not portable across all development and runtime environments.
+  if tee "$terminal_fifo" | redact_install_stream | LC_ALL=C awk -v max="$INSTALL_LOG_MAX_BYTES" '
     {
       bytes = length($0) + 1
       if (written + bytes <= max) {
@@ -269,7 +261,15 @@ capture_install_output() {
         truncated = 1
       }
     }
-  ' >"$destination"
+  ' >"$destination"; then
+    pipeline_status=0
+  else
+    pipeline_status=$?
+  fi
+  wait "$terminal_pid" || terminal_status=$?
+  rm -f -- "$terminal_fifo"
+  (( pipeline_status == 0 )) || return "$pipeline_status"
+  return "$terminal_status"
 }
 
 sanitize_install_log_file() {
@@ -602,7 +602,7 @@ require_confirmation() {
   local answer
   (( ASSUME_YES == 1 )) && return
   [[ -t 0 ]] || die 'Mutating non-interactive commands require --yes.'
-  read_prompt 'Continue? [y/N] ' answer
+  read -r -p 'Continue? [y/N] ' answer
   [[ "$answer" =~ ^[Yy]$ ]] || die 'Cancelled.'
 }
 
@@ -610,7 +610,7 @@ require_install_confirmation() {
   local answer
   (( ASSUME_YES == 1 )) && return
   [[ -t 0 ]] || die 'Non-interactive installation requires --yes.'
-  read_prompt '[Step 10 / 10] Install now? [Y/n] ' answer
+  read -r -p '[Step 10 / 10] Install now? [Y/n] ' answer
   [[ -z "$answer" || "$answer" =~ ^[Yy]$ ]] || die 'Cancelled.'
 }
 
@@ -730,7 +730,7 @@ subscription after a change. Use Salamander only when testing shows that native
 Hysteria2 is filtered or throttled on the affected network.
 EOF
   while true; do
-    read_prompt 'Hysteria2 obfuscation [1]: ' answer
+    read -r -p 'Hysteria2 obfuscation [1]: ' answer
     answer="${answer:-1}"
     answer="${answer#"${answer%%[![:space:]]*}"}"
     answer="${answer%"${answer##*[![:space:]]}"}"
@@ -764,7 +764,7 @@ the current profile is failing. "randomized" is deliberately excluded because
 current Mihomo profiles do not support it consistently.
 EOF
   while true; do
-    read_prompt '[Step 9 / 10] Fingerprint [1]: ' answer
+    read -r -p '[Step 9 / 10] Fingerprint [1]: ' answer
     answer="${answer:-1}"
     answer="${answer#"${answer%%[![:space:]]*}"}"
     answer="${answer%"${answer##*[![:space:]]}"}"
@@ -801,7 +801,7 @@ Select the VPS location used in generated profile names:
   9) 🌐  Other / neutral
 EOF
   while true; do
-    read_prompt '[Step 8 / 10] Location [9]: ' answer
+    read -r -p '[Step 8 / 10] Location [9]: ' answer
     answer="${answer:-9}"
     answer="${answer#"${answer%%[![:space:]]*}"}"
     answer="${answer%"${answer##*[![:space:]]}"}"
@@ -842,10 +842,10 @@ prompt_value() {
   interactive_stdin || die "Missing required option: ${prompt}"
   while true; do
     if [[ -n "$default_value" ]]; then
-      read_prompt "${prompt} [${default_value}]: " answer
+      read -r -p "${prompt} [${default_value}]: " answer
       answer="${answer:-$default_value}"
     else
-      read_prompt "${prompt}: " answer
+      read -r -p "${prompt}: " answer
     fi
     if "$validator" "$answer"; then
       printf -v "$variable" '%s' "$answer"
@@ -884,6 +884,11 @@ collect_install_settings() {
       'The installer also checks the Aparecium-class post-handshake signal.'
   fi
   prompt_value REALITY_TARGET '[Step 7 / 10] REALITY target (explicit choice required)' '' domain_is_valid
+  if command -v openssl >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1; then
+    select_audited_reality_target_for_install
+  else
+    printf 'REALITY target recorded. The audit will run after dependency installation and before settings are saved.\n'
+  fi
   if [[ -z "$COUNTRY_EMOJI" ]]; then
     if interactive_stdin; then
       select_country_emoji COUNTRY_EMOJI
@@ -1716,6 +1721,7 @@ select_audited_reality_target_for_install() {
     AUDIT_TARGET="$REALITY_TARGET"
     if audit_reality_target; then
       AUDIT_TARGET=""
+      REALITY_TARGET_AUDITED=1
       return
     else
       audit_status=$?
@@ -1733,12 +1739,13 @@ select_audited_reality_target_for_install() {
       printf 'The target is technically usable, but the audit found a post-handshake comparison signal.\n'
       printf 'Keep %s anyway, or choose another target now.\n' "$REALITY_TARGET"
       while true; do
-        read_prompt 'Keep this target? [Y/n]: ' answer
+        read -r -p 'Keep this target? [Y/n]: ' answer
         answer="${answer:-y}"
         answer="$(printf '%s' "$answer" | tr '[:upper:]' '[:lower:]')"
         case "$answer" in
           y|yes|keep)
             log "Keeping explicitly accepted REALITY target ${REALITY_TARGET} despite the audit warning."
+            REALITY_TARGET_AUDITED=1
             return
             ;;
           n|no|new)
@@ -4062,6 +4069,7 @@ EOF
 
 run_upgrade() {
   require_root
+  require_command mkfifo
   require_command tee
   start_install_log
   set_step 'upgrade state and concurrency lock'
@@ -4072,6 +4080,7 @@ run_upgrade() {
 
 run_install() {
   require_root
+  require_command mkfifo
   require_command tee
   start_install_log
   set_step 'installation state and concurrency lock'
@@ -4155,7 +4164,11 @@ EOF
   set_step 'TLS domain DNS validation'
   verify_dns
   set_step 'REALITY target audit and selection'
-  select_audited_reality_target_for_install
+  if (( REALITY_TARGET_AUDITED == 0 )); then
+    select_audited_reality_target_for_install
+  else
+    log "REALITY target ${REALITY_TARGET} was already audited during initial settings."
+  fi
   set_step 'saving resumable installation settings'
   save_settings
   log 'Saved validated installation settings; a failed installation can now be resumed safely.'

@@ -6,7 +6,7 @@ require_confirmation() {
   local answer
   (( ASSUME_YES == 1 )) && return
   [[ -t 0 ]] || die 'Mutating non-interactive commands require --yes.'
-  read_prompt 'Continue? [y/N] ' answer
+  read -r -p 'Continue? [y/N] ' answer
   [[ "$answer" =~ ^[Yy]$ ]] || die 'Cancelled.'
 }
 
@@ -14,7 +14,7 @@ require_install_confirmation() {
   local answer
   (( ASSUME_YES == 1 )) && return
   [[ -t 0 ]] || die 'Non-interactive installation requires --yes.'
-  read_prompt '[Step 10 / 10] Install now? [Y/n] ' answer
+  read -r -p '[Step 10 / 10] Install now? [Y/n] ' answer
   [[ -z "$answer" || "$answer" =~ ^[Yy]$ ]] || die 'Cancelled.'
 }
 
@@ -134,7 +134,7 @@ subscription after a change. Use Salamander only when testing shows that native
 Hysteria2 is filtered or throttled on the affected network.
 EOF
   while true; do
-    read_prompt 'Hysteria2 obfuscation [1]: ' answer
+    read -r -p 'Hysteria2 obfuscation [1]: ' answer
     answer="${answer:-1}"
     answer="${answer#"${answer%%[![:space:]]*}"}"
     answer="${answer%"${answer##*[![:space:]]}"}"
@@ -168,7 +168,7 @@ the current profile is failing. "randomized" is deliberately excluded because
 current Mihomo profiles do not support it consistently.
 EOF
   while true; do
-    read_prompt '[Step 9 / 10] Fingerprint [1]: ' answer
+    read -r -p '[Step 9 / 10] Fingerprint [1]: ' answer
     answer="${answer:-1}"
     answer="${answer#"${answer%%[![:space:]]*}"}"
     answer="${answer%"${answer##*[![:space:]]}"}"
@@ -205,7 +205,7 @@ Select the VPS location used in generated profile names:
   9) 🌐  Other / neutral
 EOF
   while true; do
-    read_prompt '[Step 8 / 10] Location [9]: ' answer
+    read -r -p '[Step 8 / 10] Location [9]: ' answer
     answer="${answer:-9}"
     answer="${answer#"${answer%%[![:space:]]*}"}"
     answer="${answer%"${answer##*[![:space:]]}"}"
@@ -246,10 +246,10 @@ prompt_value() {
   interactive_stdin || die "Missing required option: ${prompt}"
   while true; do
     if [[ -n "$default_value" ]]; then
-      read_prompt "${prompt} [${default_value}]: " answer
+      read -r -p "${prompt} [${default_value}]: " answer
       answer="${answer:-$default_value}"
     else
-      read_prompt "${prompt}: " answer
+      read -r -p "${prompt}: " answer
     fi
     if "$validator" "$answer"; then
       printf -v "$variable" '%s' "$answer"
@@ -288,6 +288,11 @@ collect_install_settings() {
       'The installer also checks the Aparecium-class post-handshake signal.'
   fi
   prompt_value REALITY_TARGET '[Step 7 / 10] REALITY target (explicit choice required)' '' domain_is_valid
+  if command -v openssl >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1; then
+    select_audited_reality_target_for_install
+  else
+    printf 'REALITY target recorded. The audit will run after dependency installation and before settings are saved.\n'
+  fi
   if [[ -z "$COUNTRY_EMOJI" ]]; then
     if interactive_stdin; then
       select_country_emoji COUNTRY_EMOJI

@@ -147,6 +147,7 @@ EOF
 
 run_upgrade() {
   require_root
+  require_command mkfifo
   require_command tee
   start_install_log
   set_step 'upgrade state and concurrency lock'
@@ -157,6 +158,7 @@ run_upgrade() {
 
 run_install() {
   require_root
+  require_command mkfifo
   require_command tee
   start_install_log
   set_step 'installation state and concurrency lock'
@@ -240,7 +242,11 @@ EOF
   set_step 'TLS domain DNS validation'
   verify_dns
   set_step 'REALITY target audit and selection'
-  select_audited_reality_target_for_install
+  if (( REALITY_TARGET_AUDITED == 0 )); then
+    select_audited_reality_target_for_install
+  else
+    log "REALITY target ${REALITY_TARGET} was already audited during initial settings."
+  fi
   set_step 'saving resumable installation settings'
   save_settings
   log 'Saved validated installation settings; a failed installation can now be resumed safely.'
