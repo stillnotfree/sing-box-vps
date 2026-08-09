@@ -64,8 +64,12 @@ TLS 1.3, certificate-chain, or ALPN h2 failure requires another target. Zero
 observed `NewSessionTicket` messages is preferred only for this heuristic; one
 or more tickets produces a warning, but the target remains usable and can be
 kept by default. `--yes` skips the final confirmation prompt; for the normal
-question-driven install, leave it out. An audit warning is accepted only
-through the interactive choice.
+question-driven install, leave it out. In an interactive install, a warning
+offers `[K]` to keep the usable target, `[T]` to try another one, and `[?]` for
+the heuristic's limitations. A non-interactive install keeps a target that has
+passed TLS, certificate/SNI, and ALPN checks even when tickets were observed.
+Raw OpenSSL trace and certificate diagnostics are hidden by default; use
+`vpn audit-target DOMAIN --verbose` only when they are explicitly needed.
 
 ## Source layout
 
@@ -105,14 +109,15 @@ Do not share this output: the links contain client credentials.
 | Task | Command |
 | --- | --- |
 | Check server health | `vpn health` |
-| Show detailed redacted health data | `vpn health --verbose` |
+| Show semantic redacted diagnostics | `vpn health --verbose` |
+| Show bounded developer diagnostics | `vpn health --debug` |
 | Check installation compatibility | `vpn check` |
 | List clients | `vpn show` |
 | Show private links and QR codes | `vpn show NAME` |
 | Add an independent client | `vpn add NAME` |
 | Revoke a client | `vpn delete NAME --yes` |
 | Update sing-box safely | `vpn update` |
-| Audit a REALITY target | `vpn audit-target [DOMAIN]` |
+| Audit a REALITY target | `vpn audit-target [DOMAIN] [--verbose]` |
 | Change the REALITY target | `vpn set-target DOMAIN` |
 | Select a client fingerprint | `vpn set-fingerprint` |
 | Use native Hysteria2/QUIC | `vpn set-obfs off` |
@@ -121,6 +126,12 @@ Do not share this output: the links contain client credentials.
 
 The installed `vpn` command obtains its required administrative privileges
 automatically. You do not need to prefix it with `sudo`.
+
+`vpn health` is the short operational result. `--verbose` expands it into
+semantic SYSTEM, VPN, NETWORK, TLS, SECURITY, and RECENT ERRORS sections without
+raw system dumps. `--debug` adds bounded low-level listener, qdisc, interface,
+certificate, systemd, and journal data. Sensitive values remain redacted in
+both diagnostic modes.
 
 Target, fingerprint, obfuscation, client, and update changes are validated and
 applied transactionally. Existing subscription URLs remain stable; refresh the
@@ -203,6 +214,7 @@ bash -n src/*.sh scripts/build-standalone.sh install-sing-box-server.sh tests/*.
 shellcheck --severity=style scripts/build-standalone.sh install-sing-box-server.sh tests/*.sh
 bash tests/static-smoke.sh
 bash tests/fingerprint-smoke.sh
+bash tests/health-smoke.sh
 sudo bash tests/firewall-smoke.sh
 ./install-sing-box-server.sh plan
 ```

@@ -103,6 +103,7 @@ HY2_OBFS_MODE=""
 ASSUME_YES=0
 AUTOMATIC=0
 VERBOSE=0
+DEBUG=0
 COMMAND="plan"
 TMP_DIR=""
 TEMP_ROOT=""
@@ -192,6 +193,63 @@ die() {
     printf '[ERROR] Full installation log: %s (root-only; review before sharing)\n' \
       "$INSTALL_LOG_FILE" >&2
   fi
+  exit 1
+}
+
+cli_error() {
+  printf '[ERROR] %s\n' "$*" >&2
+  exit 1
+}
+
+cli_options_are_close() {
+  local candidate="$1" known="$2" candidate_length known_length index mismatches=0
+  candidate_length=${#candidate}
+  known_length=${#known}
+  (( candidate_length >= known_length - 1 && candidate_length <= known_length + 1 )) || return 1
+
+  if (( candidate_length == known_length )); then
+    for (( index=0; index<candidate_length; index++ )); do
+      if [[ "${candidate:index:1}" != "${known:index:1}" ]]; then
+        (( mismatches += 1 ))
+      fi
+    done
+    (( mismatches <= 1 )) && return 0
+    for (( index=0; index<candidate_length - 1; index++ )); do
+      if [[ "${candidate:index:1}" == "${known:index+1:1}" &&
+            "${candidate:index+1:1}" == "${known:index:1}" &&
+            "${candidate:0:index}${candidate:index+2}" == "${known:0:index}${known:index+2}" ]]; then
+        return 0
+      fi
+    done
+    return 1
+  fi
+
+  if (( candidate_length > known_length )); then
+    for (( index=0; index<candidate_length; index++ )); do
+      [[ "${candidate:0:index}${candidate:index+1}" == "$known" ]] && return 0
+    done
+  else
+    for (( index=0; index<known_length; index++ )); do
+      [[ "${known:0:index}${known:index+1}" == "$candidate" ]] && return 0
+    done
+  fi
+  return 1
+}
+
+cli_unknown_option() {
+  local option="$1" known
+  local -a known_options=(
+    --admin-user --public-key --server-ipv4 --domain --email --ssh-port
+    --reality-target --fingerprint --emoji --yes --verbose --debug --automatic
+    --help -h
+  )
+  printf '[ERROR] Unknown option: %s\n' "$option" >&2
+  for known in "${known_options[@]}"; do
+    if cli_options_are_close "$option" "$known"; then
+      printf 'Did you mean: %s?\n' "$known" >&2
+      break
+    fi
+  done
   exit 1
 }
 
@@ -430,11 +488,11 @@ Usage:
   sudo ./install-sing-box-server.sh check
   sudo ./install-sing-box-server.sh install
   sudo ./install-sing-box-server.sh upgrade
-  vpn health [--verbose]
+  vpn health [--verbose|--debug]
   vpn add NAME
   vpn show [NAME]
   vpn delete NAME
-  vpn audit-target [DOMAIN]
+  vpn audit-target [DOMAIN] [--verbose]
   vpn set-target DOMAIN
   vpn set-fingerprint [VALUE]
   vpn set-obfs [off|salamander]
@@ -452,7 +510,8 @@ Install options (missing values are requested interactively):
   --fingerprint VALUE      Initial client TLS fingerprint (default: chrome).
   --emoji EMOJI            Server/country emoji for non-interactive installs.
   --yes                    Skip the final confirmation prompt for a mutating operation.
-  --verbose                Show a redacted report; review it before sharing.
+  --verbose                Show structured component diagnostics.
+  --debug                  Add bounded low-level diagnostics to verbose health output.
   --automatic              Internal use by the firewall rollback timer.
   -h, --help               Show this help.
 
@@ -465,7 +524,7 @@ parse_args() {
     case "$1" in
       add|delete)
         COMMAND="client-$1"
-        (( $# >= 2 )) || die "$1 requires a client name."
+        (( $# >= 2 )) || cli_error "$1 requires a client name."
         CLIENT_NAME="$2"
         shift 2
         ;;
@@ -481,7 +540,7 @@ parse_args() {
         ;;
       set-target)
         COMMAND="set-target"
-        (( $# >= 2 )) || die 'set-target requires a domain.'
+        (( $# >= 2 )) || cli_error 'set-target requires a domain.'
         NEW_REALITY_TARGET="$2"
         shift 2
         ;;
@@ -514,7 +573,7 @@ parse_args() {
         ;;
       self-update)
         COMMAND="self-update"
-        (( $# >= 2 )) || die 'self-update requires a path to a newer installer file.'
+        (( $# >= 2 )) || cli_error 'self-update requires a path to a newer installer file.'
         SELF_UPDATE_SOURCE="$2"
         shift 2
         ;;
@@ -528,47 +587,47 @@ parse_args() {
   while (( $# > 0 )); do
     case "$1" in
       --email)
-        (( $# >= 2 )) || die '--email requires a value.'
+        (( $# >= 2 )) || cli_error '--email requires a value.'
         ACME_EMAIL="$2"
         shift 2
         ;;
       --admin-user)
-        (( $# >= 2 )) || die '--admin-user requires a value.'
+        (( $# >= 2 )) || cli_error '--admin-user requires a value.'
         ADMIN_USER="$2"
         shift 2
         ;;
       --public-key)
-        (( $# >= 2 )) || die '--public-key requires a value.'
+        (( $# >= 2 )) || cli_error '--public-key requires a value.'
         ADMIN_PUBLIC_KEY="$2"
         shift 2
         ;;
       --server-ipv4)
-        (( $# >= 2 )) || die '--server-ipv4 requires a value.'
+        (( $# >= 2 )) || cli_error '--server-ipv4 requires a value.'
         SERVER_IPV4="$2"
         shift 2
         ;;
       --domain)
-        (( $# >= 2 )) || die '--domain requires a value.'
+        (( $# >= 2 )) || cli_error '--domain requires a value.'
         TLS_DOMAIN="$2"
         shift 2
         ;;
       --ssh-port)
-        (( $# >= 2 )) || die '--ssh-port requires a value.'
+        (( $# >= 2 )) || cli_error '--ssh-port requires a value.'
         SSH_PORT="$2"
         shift 2
         ;;
       --reality-target)
-        (( $# >= 2 )) || die '--reality-target requires a value.'
+        (( $# >= 2 )) || cli_error '--reality-target requires a value.'
         REALITY_TARGET="$2"
         shift 2
         ;;
       --fingerprint)
-        (( $# >= 2 )) || die '--fingerprint requires a value.'
+        (( $# >= 2 )) || cli_error '--fingerprint requires a value.'
         CLIENT_FINGERPRINT="$2"
         shift 2
         ;;
       --emoji)
-        (( $# >= 2 )) || die '--emoji requires a value.'
+        (( $# >= 2 )) || cli_error '--emoji requires a value.'
         COUNTRY_EMOJI="$2"
         shift 2
         ;;
@@ -577,6 +636,11 @@ parse_args() {
         shift
         ;;
       --verbose)
+        VERBOSE=1
+        shift
+        ;;
+      --debug)
+        DEBUG=1
         VERBOSE=1
         shift
         ;;
@@ -589,7 +653,10 @@ parse_args() {
         exit 0
         ;;
       *)
-        die "Unknown argument: $1"
+        if [[ "$1" == -* ]]; then
+          cli_unknown_option "$1"
+        fi
+        cli_error "Unknown argument: $1"
         ;;
     esac
   done
@@ -1650,15 +1717,35 @@ verify_dns() {
 }
 
 verify_reality_target() {
-  local tls_probe
+  local probe_file probe_status=0
   log "Checking TLS 1.3 reachability of the reviewed REALITY target ${REALITY_TARGET}."
-  if ! tls_probe="$(timeout 15 openssl s_client \
+  if [[ -z "$TMP_DIR" || ! -d "$TMP_DIR" ]]; then
+    new_temp_dir
+  fi
+  probe_file="$(mktemp "${TMP_DIR}/reality-target-verify.XXXXXX")"
+  chmod 0600 "$probe_file"
+  if timeout 15 openssl s_client \
     -connect "${REALITY_TARGET}:443" \
     -servername "$REALITY_TARGET" \
-    -tls1_3 -alpn h2 -verify_return_error </dev/null 2>&1)"; then
+    -verify_hostname "$REALITY_TARGET" \
+    -tls1_3 -alpn h2 -verify_return_error </dev/null >"$probe_file" 2>&1; then
+    probe_status=0
+  else
+    probe_status=$?
+  fi
+  if (( probe_status != 0 )); then
     die "REALITY target ${REALITY_TARGET} did not pass the TLS 1.3 verification test."
   fi
-  if ! grep -Eiq 'ALPN protocol:[[:space:]]*h2|ALPN[^[:alnum:]]+h2' <<<"$tls_probe"; then
+  if ! LC_ALL=C grep -aEiq \
+    'New,[[:space:]]*TLSv1\.3|Protocol( version)?[[:space:]]*:[[:space:]]*TLSv1\.3' "$probe_file"; then
+    die "REALITY target ${REALITY_TARGET} did not negotiate TLS 1.3."
+  fi
+  if ! LC_ALL=C grep -aEiq \
+    'Verify return code:[[:space:]]*0[[:space:]]*\(ok\)|Verification:[[:space:]]*OK' "$probe_file"; then
+    die "REALITY target ${REALITY_TARGET} failed certificate or SNI verification."
+  fi
+  if ! LC_ALL=C grep -aEiq \
+    'ALPN protocol:[[:space:]]*h2|ALPN[^[:alnum:]]+h2' "$probe_file"; then
     die "REALITY target ${REALITY_TARGET} did not negotiate HTTP/2 (ALPN h2)."
   fi
   log "REALITY target ${REALITY_TARGET} passed the basic certificate, TLS 1.3, and ALPN h2 checks."
@@ -1666,68 +1753,174 @@ verify_reality_target() {
 
 capture_reality_target_audit_probe() {
   local target="$1" destination="$2" status=0
-  if timeout 12 openssl s_client \
-    -connect "${target}:443" \
-    -servername "$target" \
-    -tls1_3 -alpn h2 -verify_return_error -msg -ign_eof \
-    <<< $'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n' >"$destination" 2>&1; then
-    return
+  if (
+    # Bound a hostile or unexpectedly verbose endpoint to 2 MiB of diagnostics.
+    ulimit -f 2048
+    timeout 12 openssl s_client \
+      -connect "${target}:443" \
+      -servername "$target" \
+      -verify_hostname "$target" \
+      -tls1_3 -alpn h2 -verify_return_error -msg -ign_eof \
+      <<< $'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n'
+  ) >"$destination" 2>&1; then
+    status=0
   else
     status=$?
   fi
-  (( status == 124 )) && return
   return "$status"
 }
 
+extract_reality_target_audit_text() {
+  local raw_file="$1" text_file="$2"
+  {
+    LC_ALL=C grep -aEio \
+      'New,[[:space:]]*TLSv1\.3|Protocol( version)?[[:space:]]*:[[:space:]]*TLSv1\.3' \
+      "$raw_file" || true
+    LC_ALL=C grep -aEio \
+      'Verify return code:[[:space:]]*[0-9]+[[:space:]]*\([^[:cntrl:]]{0,120}\)|Verification:[[:space:]]*(OK|FAILED)' \
+      "$raw_file" || true
+    LC_ALL=C grep -aEio \
+      'ALPN protocol:[[:space:]]*[^[:space:][:cntrl:]]+|No ALPN negotiated' \
+      "$raw_file" || true
+    LC_ALL=C grep -aEio 'NewSessionTicket' "$raw_file" || true
+    LC_ALL=C grep -aEio \
+      'alert[^[:cntrl:]]{0,160}|no application protocol|protocol version|wrong version number|unsupported protocol|certificate verify failed|unable to get local issuer certificate|hostname mismatch|certificate has expired|self-signed certificate|connection refused|name or service not known|temporary failure in name resolution|unexpected eof' \
+      "$raw_file" || true
+  } >"$text_file"
+}
+
+print_reality_target_audit_debug() {
+  local probe_status="$1" raw_file="$2" text_file="$3" raw_size
+  (( VERBOSE == 1 )) || return 0
+  print_section 'OpenSSL audit diagnostics (--verbose)'
+  printf 'OpenSSL exit status: %s\n' "$probe_status"
+  printf 'Parsed diagnostic tokens:\n'
+  sed -n '1,200p' "$text_file"
+  printf 'Raw OpenSSL trace excerpt (first 64 KiB, control bytes removed):\n'
+  LC_ALL=C head -c 65536 "$raw_file" | LC_ALL=C tr -cd '\11\12\15\40-\176'
+  printf '\n'
+  raw_size="$(wc -c <"$raw_file")"
+  if (( raw_size > 65536 )); then
+    printf '[Raw diagnostics truncated: %s bytes total]\n' "$raw_size"
+  fi
+}
+
+print_reality_target_audit_details() {
+  cat <<'EOF'
+Details:
+  0 tickets is preferred only for this Aparecium-class comparison heuristic.
+  1 or more tickets is normal TLS 1.3 server behavior and remains usable.
+  The warning means a REALITY server may be easier to compare with this target
+  if it does not reproduce the target's post-handshake ticket behavior.
+  This is not a general security or censorship-resistance verdict.
+EOF
+}
+
 audit_reality_target() {
-  local target="${AUDIT_TARGET:-$REALITY_TARGET}" probe_file probe_status=0 ticket_count
-  local tls_state=FAIL certificate_state=FAIL alpn_state=FAIL
+  local target="${AUDIT_TARGET:-$REALITY_TARGET}" raw_file text_file probe_status=0 ticket_count=0
+  local tls_state=UNKNOWN certificate_state=UNKNOWN alpn_state=UNKNOWN
+  local comparison_signal=UNKNOWN result reason="" ticket_word=tickets
   require_command openssl
   require_command timeout
   validate_domain "$target"
 
-  log "Auditing REALITY target ${target} for post-handshake TLS 1.3 session tickets."
-  new_temp_dir
-  probe_file="${TMP_DIR}/reality-target-audit.raw"
-  if capture_reality_target_audit_probe "$target" "$probe_file"; then
+  if [[ -z "$TMP_DIR" || ! -d "$TMP_DIR" ]]; then
+    new_temp_dir
+  fi
+  raw_file="$(mktemp "${TMP_DIR}/reality-target-audit.raw.XXXXXX")"
+  text_file="$(mktemp "${TMP_DIR}/reality-target-audit.text.XXXXXX")"
+  chmod 0600 "$raw_file" "$text_file"
+  if capture_reality_target_audit_probe "$target" "$raw_file"; then
     probe_status=0
   else
     probe_status=$?
   fi
+  extract_reality_target_audit_text "$raw_file" "$text_file"
 
-  if LC_ALL=C grep -aEiq \
-    'New,[[:space:]]*TLSv1\.3|Protocol( version)?[[:space:]]*:[[:space:]]*TLSv1\.3' "$probe_file"; then
+  if LC_ALL=C grep -Eiq \
+    'New,[[:space:]]*TLSv1\.3|Protocol( version)?[[:space:]]*:[[:space:]]*TLSv1\.3' "$text_file"; then
     tls_state=PASS
+  elif LC_ALL=C grep -Eiq 'protocol version|wrong version number|unsupported protocol' "$text_file"; then
+    tls_state=FAIL
   fi
-  if LC_ALL=C grep -aEiq \
-    'Verify return code:[[:space:]]*0[[:space:]]*\(ok\)|Verification:[[:space:]]*OK' "$probe_file"; then
+  if LC_ALL=C grep -Eiq \
+    'Verify return code:[[:space:]]*0[[:space:]]*\(ok\)|Verification:[[:space:]]*OK' "$text_file"; then
     certificate_state=PASS
+  elif LC_ALL=C grep -Eiq \
+    'Verify return code:[[:space:]]*[1-9][0-9]*|Verification:[[:space:]]*FAILED|certificate verify failed|unable to get local issuer certificate|hostname mismatch|certificate has expired|self-signed certificate' \
+    "$text_file"; then
+    certificate_state=FAIL
   fi
-  if LC_ALL=C grep -aEiq \
-    'ALPN protocol:[[:space:]]*h2|ALPN[^[:alnum:]]+h2' "$probe_file"; then
+  if LC_ALL=C grep -Eiq 'ALPN protocol:[[:space:]]*h2' "$text_file"; then
     alpn_state=PASS
+  elif LC_ALL=C grep -Eiq 'no application protocol|No ALPN negotiated|ALPN protocol:' "$text_file"; then
+    alpn_state=FAIL
+  elif [[ "$tls_state" == PASS && "$certificate_state" == PASS ]]; then
+    alpn_state=FAIL
   fi
 
   print_title 'REALITY target audit'
-  printf '  Target         %s\n' "$target"
-  print_status_row 'TLS 1.3' "$tls_state" 'negotiated'
-  print_status_row 'Certificate' "$certificate_state" 'trusted'
-  print_status_row 'ALPN h2' "$alpn_state" 'negotiated'
+  printf 'Target: %s\n' "$target"
+  printf 'TLS 1.3: %s\n' "$tls_state"
+  printf 'Certificate/SNI: %s\n' "$certificate_state"
+  printf 'ALPN h2: %s\n' "$alpn_state"
 
-  if (( probe_status != 0 )) || [[ "$tls_state" != PASS || "$certificate_state" != PASS || "$alpn_state" != PASS ]]; then
-    print_status_row Assessment FAIL 'Choose another target.'
+  if [[ "$tls_state" != PASS || "$certificate_state" != PASS || "$alpn_state" != PASS ]]; then
+    if LC_ALL=C grep -Eiq 'no application protocol' "$text_file"; then
+      reason='server returned TLS alert "no application protocol"'
+    elif LC_ALL=C grep -Eiq 'protocol version|wrong version number|unsupported protocol' "$text_file"; then
+      reason='server returned TLS alert "protocol version"'
+    elif LC_ALL=C grep -Eiq 'hostname mismatch' "$text_file"; then
+      reason='certificate does not match the requested SNI'
+    elif LC_ALL=C grep -Eiq 'certificate has expired' "$text_file"; then
+      reason='certificate has expired'
+    elif LC_ALL=C grep -Eiq 'unable to get local issuer certificate|self-signed certificate' "$text_file"; then
+      reason='certificate chain is not trusted'
+    elif LC_ALL=C grep -Eiq 'certificate verify failed|Verify return code:[[:space:]]*[1-9][0-9]*|Verification:[[:space:]]*FAILED' "$text_file"; then
+      reason='certificate/SNI verification failed'
+    elif (( probe_status == 124 )); then
+      reason='probe timed out after 12 seconds'
+    elif LC_ALL=C grep -Eiq 'connection refused' "$text_file"; then
+      reason='target refused the TCP connection'
+    elif LC_ALL=C grep -Eiq 'name or service not known|temporary failure in name resolution' "$text_file"; then
+      reason='target DNS resolution failed'
+    elif LC_ALL=C grep -Eiq 'unexpected eof' "$text_file"; then
+      reason='server closed the connection during the TLS handshake'
+    elif [[ "$alpn_state" == FAIL ]]; then
+      reason='server did not negotiate ALPN h2'
+    elif [[ "$tls_state" != PASS ]]; then
+      reason='TLS 1.3 handshake did not complete'
+    elif [[ "$certificate_state" != PASS ]]; then
+      reason='certificate/SNI status could not be verified'
+    else
+      reason="OpenSSL probe exited with status ${probe_status}"
+    fi
+    printf 'Reason: %s\n' "$reason"
+    printf 'Result: FAIL\n'
+    print_reality_target_audit_debug "$probe_status" "$raw_file" "$text_file"
     return 2
   fi
 
-  ticket_count="$(LC_ALL=C grep -aEc 'NewSessionTicket' "$probe_file" || true)"
+  ticket_count="$(LC_ALL=C grep -cFx 'NewSessionTicket' "$text_file" || true)"
+  printf 'Post-handshake NewSessionTicket: %s\n' "$ticket_count"
   if (( ticket_count == 0 )); then
-    print_status_row Tickets PASS '0 NewSessionTicket messages observed'
-    print_status_row Assessment PASS 'Preferred for this specific Aparecium-class heuristic.'
+    comparison_signal='NOT OBSERVED'
+    result='PASS — preferred'
+    printf 'Comparison signal: %s\n' "$comparison_signal"
+    printf 'Result: %s\n' "$result"
+    print_reality_target_audit_debug "$probe_status" "$raw_file" "$text_file"
     return
   fi
 
-  print_status_row Tickets WARN "${ticket_count} NewSessionTicket message(s) observed"
-  print_status_row Assessment WARN 'Usable; zero tickets is preferred for this specific heuristic.'
+  (( ticket_count == 1 )) && ticket_word=ticket
+  comparison_signal=OBSERVED
+  result="WARN — target is usable, but ${ticket_count} post-handshake ${ticket_word} were observed."
+  if (( ticket_count == 1 )); then
+    result='WARN — target is usable, but 1 post-handshake ticket was observed.'
+  fi
+  printf 'Comparison signal: %s\n' "$comparison_signal"
+  printf 'Result: %s\n' "$result"
+  print_reality_target_audit_debug "$probe_status" "$raw_file" "$text_file"
   return 1
 }
 
@@ -1744,31 +1937,42 @@ select_audited_reality_target_for_install() {
     fi
     AUDIT_TARGET=""
 
+    if (( audit_status == 1 )) && { (( ASSUME_YES == 1 )) || ! interactive_stdin; }; then
+      REALITY_TARGET_AUDITED=1
+      return
+    fi
     if (( ASSUME_YES == 1 )) || ! interactive_stdin; then
-      if (( audit_status == 1 )); then
-        die "REALITY target ${REALITY_TARGET} is usable but produced an audit warning; rerun interactively to accept it or choose a zero-ticket --reality-target."
-      fi
       die "REALITY target ${REALITY_TARGET} failed a required TLS 1.3, certificate, or ALPN h2 check; rerun with a different --reality-target."
     fi
 
     if (( audit_status == 1 )); then
       while true; do
-        read -r -p "Use ${REALITY_TARGET} anyway? [Y/n]: " answer
-        answer="${answer:-y}"
+        cat <<'EOF'
+
+[K] Keep this target
+[T] Try another target
+[?] Details
+
+EOF
+        read -r -p 'Choice [K]: ' answer
+        answer="${answer:-k}"
         answer="$(printf '%s' "$answer" | tr '[:upper:]' '[:lower:]')"
         case "$answer" in
-          y|yes|keep)
+          k|keep|y|yes)
             log "Keeping explicitly accepted REALITY target ${REALITY_TARGET} despite the audit warning."
             REALITY_TARGET_AUDITED=1
             return
             ;;
-          n|no|new)
+          t|try|n|no|new)
             REALITY_TARGET=""
             prompt_value REALITY_TARGET 'Replacement REALITY target' '' domain_is_valid
             break
             ;;
+          \?)
+            print_reality_target_audit_details
+            ;;
           *)
-            warn 'Answer yes to use this target or no to enter another one.'
+            warn 'Choose K to keep, T to try another target, or ? for details.'
             ;;
         esac
       done
@@ -3626,185 +3830,617 @@ update_sing_box() {
 redact_health_stream() {
   sed -E \
     -e 's#(vless|hysteria2)://[^[:space:]]+#\1://[REDACTED]#g' \
+    -e 's#(https?://)[^/@[:space:]]+@#\1[CREDENTIALS-REDACTED]@#g' \
     -e 's/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/[UUID-REDACTED]/g' \
     -e 's/[0-9a-fA-F]{64}/[TOKEN-REDACTED]/g' \
     -e 's/[0-9a-fA-F]{48}/[SECRET-REDACTED]/g' \
+    -e 's/[A-Za-z0-9+_\/-]{32,}={0,2}/[SECRET-REDACTED]/g' \
     -e 's/([0-9]{1,3}\.){3}[0-9]{1,3}/[IP-REDACTED]/g' \
     -e 's/\[[0-9a-fA-F:]+\]/[IPv6-REDACTED]/g' \
+    -e 's/([0-9a-fA-F]{0,4}:){3,7}[0-9a-fA-F]{0,4}/[IPv6-REDACTED]/g' \
     -e 's/(^|[^[:alnum:]_-])([[:alnum:]-]+\.)+[[:alpha:]]{2,}([^[:alnum:]_-]|$)/\1[DOMAIN-REDACTED]\3/g' \
     -e 's/((password|private_key|public_key|short_id|secret|pbk|sid)[^:=]*[:=][[:space:]]*)[^, }"]+/\1[REDACTED]/Ig'
 }
 
-print_fragmentation_guidance() {
-  print_section 'Client-side REALITY fragmentation guidance'
-  cat <<'EOF'
-Server-enforced fragmentation: disabled (this is a client-side troubleshooting option)
-Subscription-enforced fragmentation: disabled (client syntax is not portable)
-
-Leave fragmentation disabled while REALITY works. If Hysteria2 works but
-REALITY repeatedly times out on one network, first test another supported TLS
-fingerprint with "vpn set-fingerprint" and refresh the subscription.
-Only then, in one affected client, temporarily test TLS-record/TLSHello
-fragmentation if that client explicitly supports it. Do not enable ordinary
-packet fragmentation globally: it can increase latency, battery use, and
-breakage, and it cannot repair an IP block or an unreachable TCP/443 path.
-Record the client name/version, access network, and result before keeping it.
-EOF
+health_limit_output_width() {
+  LC_ALL=C awk '
+    length($0) > 110 { print substr($0, 1, 107) "..."; next }
+    { print }
+  '
 }
 
-health_details() {
-  local config_result dns_one dns_two cert_status target_status service_status
-  local timer_enabled timer_active hook_status renewal_status sync_status keypair_status
-  local health_status=0 health_summary default_interface link_stats
-  require_root
-  print_title 'VPN health details'
-  print_section 'HEALTH SUMMARY'
-  health_summary="$(health_check)" || health_status=$?
-  printf '%s\n' "$health_summary" | redact_health_stream
-  printf '\nGenerated: %s\n' "$(date --iso-8601=seconds)"
-  printf 'Installer: %s\n' "$SCRIPT_VERSION"
-  printf 'Managed runtime: %s\n' "$(cat "$RUNTIME_VERSION_FILE" 2>/dev/null || printf missing)"
-
-  print_section 'CONFIG'
-  printf 'REALITY fingerprint: %s\n' "$CLIENT_FINGERPRINT"
-  printf 'Hysteria2 obfuscation: %s\n' "$HY2_OBFS_MODE"
-  printf 'Subscription URLs: stable across target/fingerprint/obfuscation changes\n'
-
-  print_section 'LOCAL SYSTEM'
-  sed -n 's/^PRETTY_NAME=//p' /etc/os-release 2>/dev/null | tr -d '"'
-  printf 'Kernel: %s\n' "$(uname -r)"
-  uptime -p 2>/dev/null || true
-  free -h 2>/dev/null | sed -n '1,2p' || true
-  df -h / 2>/dev/null | tail -n 1 || true
-  swapon --show 2>/dev/null || true
-  timedatectl show -p NTPSynchronized -p Timezone 2>/dev/null || true
-
-  print_section 'LOCAL SERVICES'
-  printf 'Installed: %s\n' "$(dpkg-query -W -f='${Version}' sing-box 2>/dev/null || printf missing)"
-  printf 'APT hold: %s\n' "$(apt-mark showhold 2>/dev/null | grep -Fx sing-box || printf missing)"
-  service_status="$(systemctl is-active sing-box.service 2>/dev/null || true)"
-  printf 'Service: %s\n' "${service_status:-unknown}"
-  if config_result="$(sing-box check -c "$CONFIG_FILE" 2>&1)"; then
-    printf 'Config validation: PASS\n'
+health_join_states() {
+  local state saw_warn=0
+  for state in "$@"; do
+    case "$state" in
+      FAIL) printf 'FAIL\n'; return ;;
+      WARN) saw_warn=1 ;;
+    esac
+  done
+  if (( saw_warn == 1 )); then
+    printf 'WARN\n'
   else
-    printf 'Config validation: FAIL\n%s\n' "$config_result" | redact_health_stream
+    printf 'PASS\n'
   fi
-  jq -r '.inbounds[] | "Inbound: \(.type) tag=\(.tag) port=\(.listen_port) users=\(.users | length)"' \
-    "$CONFIG_FILE" 2>/dev/null || true
+}
 
-  print_section 'SERVER EGRESS AND NETWORK'
-  printf 'Configured public IPv4: [REDACTED]\n'
-  dns_one="$(dig +short A "$TLS_DOMAIN" @1.1.1.1 2>/dev/null | sed '/^$/d' || true)"
-  dns_two="$(dig +short A "$TLS_DOMAIN" @8.8.8.8 2>/dev/null | sed '/^$/d' || true)"
-  if grep -Fxq "$SERVER_IPV4" <<<"$dns_one" && grep -Fxq "$SERVER_IPV4" <<<"$dns_two"; then
-    printf 'DNS A consistency: PASS\n'
+health_client_label() {
+  local count="$1"
+  if [[ "$count" == "1" ]]; then
+    printf '1 client\n'
   else
-    printf 'DNS A consistency: FAIL\n'
+    printf '%s clients\n' "$count"
   fi
-  if timeout 15 openssl s_client -connect "${REALITY_TARGET}:443" -servername "$REALITY_TARGET" \
-      -tls1_3 -alpn h2 -verify_return_error </dev/null >/dev/null 2>&1; then
-    target_status=PASS
+}
+
+health_print_row() {
+  local label="$1" state="$2" details="${3:-}"
+  printf '  %-14s ' "$label"
+  print_status_value "$state"
+  if [[ -n "$details" ]]; then
+    printf ' · %s' "$details"
+  fi
+  printf '\n'
+}
+
+health_print_info() {
+  local label="$1" details="$2"
+  [[ -n "$details" ]] || return 0
+  printf '  %-14s %s\n' "$label" "$details"
+}
+
+health_human_size() {
+  local bytes="${1:-0}"
+  [[ "$bytes" =~ ^[0-9]+$ ]] || { printf 'unknown'; return; }
+  if (( bytes >= 1073741824 )); then
+    awk -v value="$bytes" 'BEGIN { printf "%.1f GiB", value / 1073741824 }'
   else
-    target_status=FAIL
+    awk -v value="$bytes" 'BEGIN { printf "%.0f MiB", value / 1048576 }'
   fi
-  printf 'REALITY target TLS reachability: %s\n' "$target_status"
-  printf 'Listeners (addresses redacted):\n'
-  ss -H -lntup 2>/dev/null | awk -v ssh_port="$SSH_PORT" -v subscription_port="$SUBSCRIPTION_PORT" \
-    '$5 ~ (":" ssh_port "$") || $5 ~ (":" subscription_port "$") || $5 ~ /:(80|443)$/ {print}' | redact_health_stream
-  printf 'UDP receive ceiling: %s\n' "$(sysctl -n net.core.rmem_max 2>/dev/null || printf unknown)"
-  printf 'UDP send ceiling: %s\n' "$(sysctl -n net.core.wmem_max 2>/dev/null || printf unknown)"
-  default_interface="$(ip -4 route show default 2>/dev/null | awk '
+}
+
+health_format_uptime() {
+  local seconds="${1%%.*}" days hours minutes
+  [[ "$seconds" =~ ^[0-9]+$ ]] || { printf 'unknown'; return; }
+  days=$(( seconds / 86400 ))
+  hours=$(( (seconds % 86400) / 3600 ))
+  minutes=$(( (seconds % 3600) / 60 ))
+  if (( days > 0 )); then
+    printf '%dd %dh' "$days" "$hours"
+  elif (( hours > 0 )); then
+    printf '%dh %dm' "$hours" "$minutes"
+  else
+    printf '%dm' "$minutes"
+  fi
+}
+
+health_reset_state() {
+  HEALTH_FAILURES=0
+  HEALTH_WARNINGS=0
+  HEALTH_CORE_STATE=PASS
+  HEALTH_CORE_VERSION=missing
+  HEALTH_VERSION_STATE=FAIL
+  HEALTH_RUNTIME_STATE=FAIL
+  HEALTH_SERVICE_STATE=FAIL
+  HEALTH_CONFIG_STATE=FAIL
+  HEALTH_VLESS_STATE=FAIL
+  HEALTH_HY2_STATE=FAIL
+  HEALTH_SUBSCRIPTION_STATE=FAIL
+  HEALTH_SUBSCRIPTION_DETAIL='self-test failed'
+  HEALTH_DNS_STATE=FAIL
+  HEALTH_CERT_STATE=FAIL
+  HEALTH_CERT_DETAIL='certificate unavailable'
+  HEALTH_CERT_HOSTNAME_STATE=FAIL
+  HEALTH_CERT_KEYPAIR_STATE=FAIL
+  HEALTH_RENEWAL_STATE=FAIL
+  HEALTH_RENEWAL_DETAIL='renewal checks failed'
+  HEALTH_TARGET_STATE=FAIL
+  HEALTH_FIREWALL_STATE=FAIL
+  HEALTH_SSH_STATE=FAIL
+  HEALTH_PERMISSIONS_STATE=FAIL
+  HEALTH_TCP443_STATE=FAIL
+  HEALTH_UDP443_STATE=FAIL
+  HEALTH_TCP8443_STATE=FAIL
+  HEALTH_SSH_LISTENER_STATE=FAIL
+  HEALTH_TCP443_DETAIL='not listening'
+  HEALTH_UDP443_DETAIL='not listening'
+  HEALTH_TCP8443_DETAIL='not listening'
+  HEALTH_SSH_LISTENER_DETAIL='not listening'
+  HEALTH_CONGESTION_STATE=WARN
+  HEALTH_CONGESTION=unknown
+  HEALTH_QUEUE_STATE=WARN
+  HEALTH_ACTIVE_QDISC=unknown
+  HEALTH_CONFIGURED_QDISC=unknown
+  HEALTH_DEFAULT_INTERFACE=""
+  HEALTH_CLIENT_COUNT=unknown
+  HEALTH_VLESS_CLIENTS=unknown
+  HEALTH_HY2_CLIENTS=unknown
+  HEALTH_OS=unknown
+  HEALTH_KERNEL=unknown
+  HEALTH_UPTIME=unknown
+  HEALTH_RESOURCES=unknown
+  HEALTH_CLOCK_STATE=WARN
+  HEALTH_CLOCK_DETAIL='NTP state unknown'
+  HEALTH_RUNTIME_VERSION=missing
+  HEALTH_RECENT_ERRORS_STATE=PASS
+  HEALTH_RECENT_ERRORS_FILE=""
+  HEALTH_SS_TCP=""
+  HEALTH_SS_UDP=""
+}
+
+health_listener_check() {
+  local listeners="$1" port="$2" expected="$3" line owner
+  line="$(printf '%s\n' "$listeners" | awk -v port="$port" '$4 ~ (":" port "$") { print; exit }')"
+  if [[ -z "$line" ]]; then
+    HEALTH_LISTENER_STATE=FAIL
+    HEALTH_LISTENER_DETAIL='not listening'
+    return
+  fi
+  if grep -Fq "\"${expected}\"" <<<"$line"; then
+    HEALTH_LISTENER_STATE=PASS
+    HEALTH_LISTENER_DETAIL="${expected} listening"
+    return
+  fi
+  owner="$(sed -n 's/.*users:(("\([^"]*\)".*/\1/p' <<<"$line")"
+  HEALTH_LISTENER_STATE=FAIL
+  HEALTH_LISTENER_DETAIL="expected ${expected}, found ${owner:-unknown process}"
+}
+
+health_collect_listeners() {
+  HEALTH_SS_TCP="$(ss -H -lntp 2>/dev/null || true)"
+  HEALTH_SS_UDP="$(ss -H -lnup 2>/dev/null || true)"
+
+  health_listener_check "$HEALTH_SS_TCP" 443 sing-box
+  HEALTH_TCP443_STATE="$HEALTH_LISTENER_STATE"
+  HEALTH_TCP443_DETAIL="$HEALTH_LISTENER_DETAIL"
+  health_listener_check "$HEALTH_SS_UDP" 443 sing-box
+  HEALTH_UDP443_STATE="$HEALTH_LISTENER_STATE"
+  HEALTH_UDP443_DETAIL="$HEALTH_LISTENER_DETAIL"
+  health_listener_check "$HEALTH_SS_TCP" "$SUBSCRIPTION_PORT" nginx
+  HEALTH_TCP8443_STATE="$HEALTH_LISTENER_STATE"
+  HEALTH_TCP8443_DETAIL="$HEALTH_LISTENER_DETAIL"
+  health_listener_check "$HEALTH_SS_TCP" "$SSH_PORT" sshd
+  HEALTH_SSH_LISTENER_STATE="$HEALTH_LISTENER_STATE"
+  HEALTH_SSH_LISTENER_DETAIL="$HEALTH_LISTENER_DETAIL"
+}
+
+health_managed_permissions_are_healthy() {
+  local specification path expected actual
+  for specification in \
+    "$SETTINGS_FILE|600:root:root" \
+    "$SECRETS_FILE|600:root:root" \
+    "$CLIENTS_FILE|600:root:root" \
+    "$CONFIG_FILE|640:root:sing-box" \
+    "${CERT_DIR}/fullchain.pem|640:root:sing-box" \
+    "${CERT_DIR}/privkey.pem|640:root:sing-box"; do
+    path="${specification%%|*}"
+    expected="${specification#*|}"
+    [[ -f "$path" && ! -L "$path" ]] || return 1
+    actual="$(stat -c '%a:%U:%G' "$path" 2>/dev/null || true)"
+    [[ "$actual" == "$expected" ]] || return 1
+  done
+}
+
+health_collect_system() {
+  local uptime_seconds ram_total ram_used swap_total swap_used disk_total disk_used ntp
+  HEALTH_OS="$(sed -n 's/^PRETTY_NAME=//p' /etc/os-release 2>/dev/null | tr -d '"' | sed -n '1p')"
+  HEALTH_OS="${HEALTH_OS:-unknown}"
+  HEALTH_KERNEL="$(uname -r 2>/dev/null || printf unknown)"
+  uptime_seconds="$(cut -d ' ' -f 1 /proc/uptime 2>/dev/null || true)"
+  HEALTH_UPTIME="$(health_format_uptime "$uptime_seconds")"
+  ram_total="$(free -b 2>/dev/null | awk '/^Mem:/ {print $2; exit}')"
+  ram_used="$(free -b 2>/dev/null | awk '/^Mem:/ {print $3; exit}')"
+  swap_total="$(free -b 2>/dev/null | awk '/^Swap:/ {print $2; exit}')"
+  swap_used="$(free -b 2>/dev/null | awk '/^Swap:/ {print $3; exit}')"
+  disk_total="$(df -B1 / 2>/dev/null | awk 'NR == 2 {print $2}')"
+  disk_used="$(df -B1 / 2>/dev/null | awk 'NR == 2 {print $3}')"
+  if [[ "$ram_total" =~ ^[0-9]+$ && "$ram_used" =~ ^[0-9]+$ &&
+        "$disk_total" =~ ^[0-9]+$ && "$disk_used" =~ ^[0-9]+$ ]]; then
+    HEALTH_RESOURCES="RAM $(health_human_size "$ram_used")/$(health_human_size "$ram_total")"
+    HEALTH_RESOURCES+=" · disk $(health_human_size "$disk_used")/$(health_human_size "$disk_total")"
+    if [[ "$swap_total" =~ ^[0-9]+$ && "$swap_used" =~ ^[0-9]+$ ]]; then
+      HEALTH_RESOURCES+=" · swap $(health_human_size "$swap_used")/$(health_human_size "$swap_total")"
+    fi
+  fi
+  ntp="$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)"
+  if [[ "$ntp" == yes ]]; then
+    HEALTH_CLOCK_STATE=PASS
+    HEALTH_CLOCK_DETAIL='NTP synchronized'
+  elif [[ "$ntp" == no ]]; then
+    HEALTH_CLOCK_STATE=WARN
+    HEALTH_CLOCK_DETAIL='NTP not synchronized'
+  fi
+}
+
+health_collect_network() {
+  local qdisc_output
+  HEALTH_CONGESTION="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || printf unknown)"
+  if [[ "$HEALTH_CONGESTION" == bbr ]]; then
+    HEALTH_CONGESTION_STATE=PASS
+  else
+    HEALTH_CONGESTION_STATE=WARN
+  fi
+  HEALTH_CONFIGURED_QDISC="$(sysctl -n net.core.default_qdisc 2>/dev/null || printf unknown)"
+  HEALTH_DEFAULT_INTERFACE="$(ip -4 route show default 2>/dev/null | awk '
     !found {
       for (i = 1; i <= NF; i++) {
         if ($i == "dev" && (i + 1) <= NF) {
-          interface=$(i + 1)
+          print $(i + 1)
           found=1
-          break
         }
       }
     }
-    END { if (found) print interface }
   ')"
-  if [[ -n "$default_interface" ]]; then
-    printf 'Default interface counters (%s):\n' "$default_interface"
-    link_stats="$(ip -s -j link show dev "$default_interface" 2>/dev/null || true)"
-    if jq -e 'type == "array" and length == 1' <<<"$link_stats" >/dev/null 2>&1; then
-      jq -r '.[0] |
-        "  RX bytes=\(.stats64.rx.bytes // .stats.rx.bytes // 0) packets=\(.stats64.rx.packets // .stats.rx.packets // 0) errors=\(.stats64.rx.errors // .stats.rx.errors // 0) dropped=\(.stats64.rx.dropped // .stats.rx.dropped // 0)",
-        "  TX bytes=\(.stats64.tx.bytes // .stats.tx.bytes // 0) packets=\(.stats64.tx.packets // .stats.tx.packets // 0) errors=\(.stats64.tx.errors // .stats.tx.errors // 0) dropped=\(.stats64.tx.dropped // .stats.tx.dropped // 0)"' \
-        <<<"$link_stats"
-    else
-      printf '  unavailable\n'
-    fi
-    printf 'Queue discipline counters:\n'
-    tc -s qdisc show dev "$default_interface" 2>/dev/null || true
+  if [[ -n "$HEALTH_DEFAULT_INTERFACE" ]]; then
+    qdisc_output="$(tc qdisc show dev "$HEALTH_DEFAULT_INTERFACE" 2>/dev/null || true)"
+    HEALTH_ACTIVE_QDISC="$(awk '$1 == "qdisc" && $0 ~ / root([[:space:]]|$)/ {print $2; exit}' <<<"$qdisc_output")"
+    HEALTH_ACTIVE_QDISC="${HEALTH_ACTIVE_QDISC:-unknown}"
   fi
-
-  print_fragmentation_guidance
-
-  print_section 'TLS CERTIFICATE'
-  if [[ -r "${CERT_DIR}/fullchain.pem" ]]; then
-    openssl x509 -in "${CERT_DIR}/fullchain.pem" -noout -dates 2>/dev/null || true
-    if openssl x509 -in "${CERT_DIR}/fullchain.pem" -noout -checkend 604800 >/dev/null 2>&1; then
-      cert_status='PASS (valid for more than 7 days)'
-    else
-      cert_status='WARN (expired or expires within 7 days)'
-    fi
+  if [[ "$HEALTH_ACTIVE_QDISC" == fq ]]; then
+    HEALTH_QUEUE_STATE=PASS
   else
-    cert_status='FAIL (certificate copy missing)'
+    HEALTH_QUEUE_STATE=WARN
   fi
-  printf 'Certificate status: %s\n' "$cert_status"
+}
+
+health_collect_certificate() {
+  local expiry_line expiry_value expiry_epoch now_epoch days_remaining
+  local timer_enabled timer_active hook_ok=0 renewal_ok=0 sync_ok=0
+  if [[ ! -r "${CERT_DIR}/fullchain.pem" ]]; then
+    HEALTH_CERT_DETAIL='certificate copy missing'
+    return
+  fi
+  if ! openssl x509 -in "${CERT_DIR}/fullchain.pem" -noout -checkend 0 >/dev/null 2>&1; then
+    HEALTH_CERT_DETAIL='certificate expired or invalid'
+    return
+  fi
+  expiry_line="$(openssl x509 -in "${CERT_DIR}/fullchain.pem" -noout -enddate 2>/dev/null || true)"
+  expiry_value="${expiry_line#notAfter=}"
+  expiry_epoch="$(date -d "$expiry_value" +%s 2>/dev/null || true)"
+  now_epoch="$(date +%s)"
+  if [[ "$expiry_epoch" =~ ^[0-9]+$ ]]; then
+    days_remaining=$(( (expiry_epoch - now_epoch) / 86400 ))
+    health_classify_certificate_expiry "$expiry_epoch" "$days_remaining"
+  else
+    HEALTH_CERT_STATE=PASS
+    HEALTH_CERT_DETAIL='valid; expiry date unavailable'
+  fi
+  if openssl x509 -in "${CERT_DIR}/fullchain.pem" -noout -checkhost "$TLS_DOMAIN" >/dev/null 2>&1; then
+    HEALTH_CERT_HOSTNAME_STATE=PASS
+  fi
+  if certificate_key_pair_matches "${CERT_DIR}/fullchain.pem" "${CERT_DIR}/privkey.pem"; then
+    HEALTH_CERT_KEYPAIR_STATE=PASS
+  fi
+
   timer_enabled="$(systemctl is-enabled certbot.timer 2>/dev/null || true)"
   timer_active="$(systemctl is-active certbot.timer 2>/dev/null || true)"
-  printf 'Certbot timer enabled: %s\n' "${timer_enabled:-unknown}"
-  printf 'Certbot timer active: %s\n' "${timer_active:-unknown}"
+  if [[ "$timer_enabled" == enabled && "$timer_active" == active ]]; then
+    renewal_ok=1
+  fi
   if [[ -f "$CERT_HOOK" && -x "$CERT_HOOK" ]] && sh -n "$CERT_HOOK" >/dev/null 2>&1; then
-    hook_status='PASS (present, executable, syntax valid)'
-  else
-    hook_status='FAIL'
+    hook_ok=1
   fi
-  printf 'Deploy hook: %s\n' "$hook_status"
-  if [[ -r "/etc/letsencrypt/renewal/${TLS_DOMAIN}.conf" ]]; then
-    renewal_status='PASS'
-  else
-    renewal_status='FAIL'
-  fi
-  printf 'Renewal configuration: %s\n' "$renewal_status"
-  if [[ -r "/etc/letsencrypt/live/${TLS_DOMAIN}/fullchain.pem" &&
+  if [[ -r "/etc/letsencrypt/renewal/${TLS_DOMAIN}.conf" &&
+        -r "/etc/letsencrypt/live/${TLS_DOMAIN}/fullchain.pem" &&
         -r "/etc/letsencrypt/live/${TLS_DOMAIN}/privkey.pem" &&
-        -r "${CERT_DIR}/fullchain.pem" && -r "${CERT_DIR}/privkey.pem" ]] &&
+        -r "${CERT_DIR}/privkey.pem" ]] &&
      cmp -s "/etc/letsencrypt/live/${TLS_DOMAIN}/fullchain.pem" "${CERT_DIR}/fullchain.pem" &&
      cmp -s "/etc/letsencrypt/live/${TLS_DOMAIN}/privkey.pem" "${CERT_DIR}/privkey.pem"; then
-    sync_status='PASS'
-  else
-    sync_status='FAIL'
+    sync_ok=1
   fi
-  printf 'Live/deployed certificate sync: %s\n' "$sync_status"
-  if certificate_key_pair_matches "${CERT_DIR}/fullchain.pem" "${CERT_DIR}/privkey.pem"; then
-    keypair_status='PASS'
+  if (( renewal_ok == 1 && hook_ok == 1 && sync_ok == 1 )); then
+    HEALTH_RENEWAL_STATE=PASS
+    HEALTH_RENEWAL_DETAIL='certbot timer · deploy hook · deployed cert synced'
   else
-    keypair_status='FAIL'
+    HEALTH_RENEWAL_DETAIL="timer $([[ $renewal_ok == 1 ]] && printf PASS || printf FAIL)"
+    HEALTH_RENEWAL_DETAIL+=" · hook $([[ $hook_ok == 1 ]] && printf PASS || printf FAIL)"
+    HEALTH_RENEWAL_DETAIL+=" · sync $([[ $sync_ok == 1 ]] && printf PASS || printf FAIL)"
   fi
-  printf 'Deployed certificate/key pair: %s\n' "$keypair_status"
+}
+
+health_classify_certificate_expiry() {
+  local expiry_epoch="$1" days_remaining="$2" day_word=days expiry_date
+  if (( days_remaining == 1 )); then
+    day_word=day
+  fi
+  expiry_date="$(date -d "@$expiry_epoch" +%F 2>/dev/null || date -r "$expiry_epoch" +%F 2>/dev/null || printf unknown)"
+  HEALTH_CERT_DETAIL="expires ${expiry_date} (${days_remaining} ${day_word})"
+  if (( days_remaining < 7 )); then
+    HEALTH_CERT_STATE=WARN
+  else
+    HEALTH_CERT_STATE=PASS
+  fi
+}
+
+health_generated_timestamp() {
+  date --iso-8601=seconds 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S%z'
+}
+
+health_dns_matches() {
+  local expected="$1" first_answers="$2" second_answers="$3"
+  grep -Fxq "$expected" <<<"$first_answers" || return 1
+  grep -Fxq "$expected" <<<"$second_answers"
+}
+
+health_reality_target_is_healthy() {
+  local probe_file status=0
+  if [[ -z "$TMP_DIR" || ! -d "$TMP_DIR" ]]; then
+    new_temp_dir
+  fi
+  probe_file="$(mktemp "${TMP_DIR}/health-reality.XXXXXX")"
+  chmod 0600 "$probe_file"
+  if timeout 15 openssl s_client -connect "${REALITY_TARGET}:443" \
+      -servername "$REALITY_TARGET" -verify_hostname "$REALITY_TARGET" \
+      -tls1_3 -alpn h2 -verify_return_error </dev/null >"$probe_file" 2>&1; then
+    status=0
+  else
+    status=$?
+  fi
+  (( status == 0 )) || return 1
+  LC_ALL=C grep -aEiq \
+    'New,[[:space:]]*TLSv1\.3|Protocol( version)?[[:space:]]*:[[:space:]]*TLSv1\.3' \
+    "$probe_file" || return 1
+  LC_ALL=C grep -aEiq \
+    'Verify return code:[[:space:]]*0[[:space:]]*\(ok\)|Verification:[[:space:]]*OK' \
+    "$probe_file" || return 1
+  LC_ALL=C grep -aEiq 'ALPN protocol:[[:space:]]*h2' "$probe_file"
+}
+
+health_collect_recent_errors() {
+  local raw_file
+  if [[ -z "$TMP_DIR" || ! -d "$TMP_DIR" ]]; then
+    new_temp_dir
+  fi
+  raw_file="$(mktemp "${TMP_DIR}/health-journal.raw.XXXXXX")"
+  HEALTH_RECENT_ERRORS_FILE="$(mktemp "${TMP_DIR}/health-journal.redacted.XXXXXX")"
+  chmod 0600 "$raw_file" "$HEALTH_RECENT_ERRORS_FILE"
+  journalctl -u sing-box.service --since '-30 minutes' -p warning..alert -n 5 \
+    --no-pager --output=short-iso >"$raw_file" 2>/dev/null || true
+  redact_health_stream <"$raw_file" | \
+    sed '/^-- No entries --$/d; /^-- Boot /d; /^$/d' >"$HEALTH_RECENT_ERRORS_FILE"
+  if [[ -s "$HEALTH_RECENT_ERRORS_FILE" ]]; then
+    HEALTH_RECENT_ERRORS_STATE=WARN
+  fi
+}
+
+health_collect_state() {
+  local dns_one dns_two vless_config=0 hy2_config=0
+  health_reset_state
+  HEALTH_CORE_VERSION="$(dpkg-query -W -f='${Version}' sing-box 2>/dev/null || printf missing)"
+  HEALTH_RUNTIME_VERSION="$(cat "$RUNTIME_VERSION_FILE" 2>/dev/null || printf missing)"
+  if sing_box_version_is_supported "$HEALTH_CORE_VERSION"; then
+    HEALTH_VERSION_STATE=PASS
+  fi
+  if [[ "$HEALTH_RUNTIME_VERSION" == "$SCRIPT_VERSION" ]]; then
+    HEALTH_RUNTIME_STATE=PASS
+  fi
+  if systemctl is-active --quiet sing-box.service; then
+    HEALTH_SERVICE_STATE=PASS
+  fi
+  if sing-box check -c "$CONFIG_FILE" >/dev/null 2>&1; then
+    HEALTH_CONFIG_STATE=PASS
+  fi
+  if [[ "$HEALTH_RUNTIME_STATE" != PASS || "$HEALTH_VERSION_STATE" != PASS ]] ||
+     [[ "$HEALTH_SERVICE_STATE" != PASS || "$HEALTH_CONFIG_STATE" != PASS ]]; then
+    HEALTH_CORE_STATE=FAIL
+  fi
+
+  HEALTH_CLIENT_COUNT="$(jq -r '.clients | length' "$CLIENTS_FILE" 2>/dev/null || printf unknown)"
+  [[ "$HEALTH_CLIENT_COUNT" =~ ^[0-9]+$ ]] || HEALTH_CLIENT_COUNT=unknown
+  HEALTH_VLESS_CLIENTS="$(jq -r '[.inbounds[] | select(.type == "vless" and .listen_port == 443 and .tls.enabled == true and .tls.reality.enabled == true) | .users | length] | first // 0' "$CONFIG_FILE" 2>/dev/null || printf 0)"
+  HEALTH_HY2_CLIENTS="$(jq -r '[.inbounds[] | select(.type == "hysteria2" and .listen_port == 443 and .tls.enabled == true) | .users | length] | first // 0' "$CONFIG_FILE" 2>/dev/null || printf 0)"
+  if [[ "$HEALTH_VLESS_CLIENTS" =~ ^[1-9][0-9]*$ ]]; then
+    vless_config=1
+  fi
+  if [[ "$HEALTH_HY2_CLIENTS" =~ ^[1-9][0-9]*$ ]]; then
+    hy2_config=1
+  fi
+
+  health_collect_listeners
+  if (( vless_config == 1 )) && [[ "$HEALTH_TCP443_STATE" == PASS ]]; then
+    HEALTH_VLESS_STATE=PASS
+  fi
+  if (( hy2_config == 1 )) && [[ "$HEALTH_UDP443_STATE" == PASS ]]; then
+    HEALTH_HY2_STATE=PASS
+  fi
+  if subscription_service_healthy && [[ "$HEALTH_TCP8443_STATE" == PASS ]]; then
+    HEALTH_SUBSCRIPTION_STATE=PASS
+    HEALTH_SUBSCRIPTION_DETAIL="tcp/${SUBSCRIPTION_PORT} · $(health_client_label "$HEALTH_CLIENT_COUNT")"
+  elif [[ "$HEALTH_TCP8443_STATE" != PASS ]]; then
+    HEALTH_SUBSCRIPTION_DETAIL="tcp/${SUBSCRIPTION_PORT} · $HEALTH_TCP8443_DETAIL"
+  fi
+
+  dns_one="$(timeout 5 dig +time=3 +tries=1 +short A "$TLS_DOMAIN" @1.1.1.1 2>/dev/null | sed '/^$/d' || true)"
+  dns_two="$(timeout 5 dig +time=3 +tries=1 +short A "$TLS_DOMAIN" @8.8.8.8 2>/dev/null | sed '/^$/d' || true)"
+  if health_dns_matches "$SERVER_IPV4" "$dns_one" "$dns_two"; then
+    HEALTH_DNS_STATE=PASS
+  fi
+  health_collect_certificate
+  if health_reality_target_is_healthy; then HEALTH_TARGET_STATE=PASS; fi
+  if managed_firewall_is_healthy; then HEALTH_FIREWALL_STATE=PASS; fi
+  if ssh_lockdown_is_effective; then HEALTH_SSH_STATE=PASS; fi
+  if health_managed_permissions_are_healthy; then HEALTH_PERMISSIONS_STATE=PASS; fi
+  health_collect_network
+  health_collect_system
+  health_collect_recent_errors
+  health_recalculate_result
+}
+
+health_recalculate_result() {
+  local state
+  HEALTH_FAILURES=0
+  HEALTH_WARNINGS=0
+  for state in \
+    "$HEALTH_CORE_STATE" "$HEALTH_VERSION_STATE" "$HEALTH_RUNTIME_STATE" \
+    "$HEALTH_VLESS_STATE" "$HEALTH_HY2_STATE" \
+    "$HEALTH_SUBSCRIPTION_STATE" "$HEALTH_DNS_STATE" "$HEALTH_CERT_STATE" \
+    "$HEALTH_CERT_HOSTNAME_STATE" "$HEALTH_CERT_KEYPAIR_STATE" "$HEALTH_RENEWAL_STATE" \
+    "$HEALTH_TARGET_STATE" "$HEALTH_FIREWALL_STATE" "$HEALTH_SSH_STATE" \
+    "$HEALTH_PERMISSIONS_STATE" "$HEALTH_TCP443_STATE" "$HEALTH_UDP443_STATE" \
+    "$HEALTH_TCP8443_STATE" "$HEALTH_SSH_LISTENER_STATE" "$HEALTH_CONGESTION_STATE" \
+    "$HEALTH_QUEUE_STATE" "$HEALTH_CLOCK_STATE" "$HEALTH_RECENT_ERRORS_STATE"; do
+    case "$state" in
+      FAIL) (( HEALTH_FAILURES += 1 )) ;;
+      WARN) (( HEALTH_WARNINGS += 1 )) ;;
+    esac
+  done
+}
+
+health_result_line() {
+  printf 'Result: '
+  if (( HEALTH_FAILURES > 0 )); then
+    print_status_value UNHEALTHY
+  elif (( HEALTH_WARNINGS > 0 )); then
+    print_status_value HEALTHY
+    printf ' (warnings)'
+  else
+    print_status_value HEALTHY
+  fi
+  printf '\n'
+}
+
+health_network_detail() {
+  local detail="$HEALTH_CONGESTION · $HEALTH_ACTIVE_QDISC"
+  if [[ "$HEALTH_ACTIVE_QDISC" != "$HEALTH_CONFIGURED_QDISC" ]]; then
+    detail+=" (configured $HEALTH_CONFIGURED_QDISC)"
+  fi
+  printf '%s\n' "$detail"
+}
+
+render_health_short() {
+  local protocol_state tls_state security_state network_state
+  protocol_state="$(health_join_states "$HEALTH_VLESS_STATE" "$HEALTH_HY2_STATE")"
+  tls_state="$(health_join_states "$HEALTH_DNS_STATE" "$HEALTH_CERT_STATE" \
+    "$HEALTH_CERT_HOSTNAME_STATE" "$HEALTH_CERT_KEYPAIR_STATE" "$HEALTH_RENEWAL_STATE")"
+  security_state="$(health_join_states "$HEALTH_FIREWALL_STATE" "$HEALTH_SSH_STATE" \
+    "$HEALTH_PERMISSIONS_STATE")"
+  network_state="$(health_join_states "$HEALTH_CONGESTION_STATE" "$HEALTH_QUEUE_STATE")"
+  print_title 'VPN health'
+  health_print_row Core "$HEALTH_CORE_STATE" "sing-box $HEALTH_CORE_VERSION"
+  health_print_row Protocols "$protocol_state" 'REALITY tcp/443 · Hysteria2 udp/443'
+  health_print_row Subscription "$HEALTH_SUBSCRIPTION_STATE" "$(health_client_label "$HEALTH_CLIENT_COUNT")"
+  health_print_row DNS/TLS "$tls_state" 'configured · DNS/certificate checked'
+  health_print_row REALITY "$HEALTH_TARGET_STATE" 'TLS 1.3 · certificate/SNI · ALPN h2'
+  health_print_row Security "$security_state" 'nftables · SSH key-only · permissions'
+  health_print_row Network "$network_state" "$(health_network_detail)"
+  printf '\n'
+  health_result_line
+}
+
+render_health_verbose() {
+  local queue_detail certificate_detail
+  queue_detail="active $HEALTH_ACTIVE_QDISC · configured default $HEALTH_CONFIGURED_QDISC"
+  certificate_detail="$HEALTH_CERT_DETAIL"
+  if [[ "$HEALTH_CERT_HOSTNAME_STATE" == PASS && "$HEALTH_CERT_KEYPAIR_STATE" == PASS ]]; then
+    certificate_detail+=' · hostname · key pair'
+  fi
+
+  print_title 'VPN health'
+  health_result_line
+  print_section 'SYSTEM'
+  health_print_info OS "$HEALTH_OS · Linux $HEALTH_KERNEL"
+  health_print_info Uptime "$HEALTH_UPTIME"
+  health_print_info Resources "$HEALTH_RESOURCES"
+  health_print_row Clock "$HEALTH_CLOCK_STATE" "$HEALTH_CLOCK_DETAIL"
+
+  print_section 'VPN'
+  if [[ "$HEALTH_SERVICE_STATE" == PASS ]]; then
+    health_print_row sing-box "$(health_join_states "$HEALTH_SERVICE_STATE" "$HEALTH_VERSION_STATE")" \
+      "$HEALTH_CORE_VERSION · active"
+  else
+    health_print_row sing-box "$(health_join_states "$HEALTH_SERVICE_STATE" "$HEALTH_VERSION_STATE")" \
+      "$HEALTH_CORE_VERSION · inactive"
+  fi
+  health_print_row Config "$HEALTH_CONFIG_STATE" 'sing-box configuration validation'
+  health_print_row Runtime "$HEALTH_RUNTIME_STATE" \
+    "installer $SCRIPT_VERSION · managed $HEALTH_RUNTIME_VERSION"
+  health_print_row 'VLESS REALITY' "$HEALTH_VLESS_STATE" "tcp/443 · $(health_client_label "$HEALTH_VLESS_CLIENTS")"
+  health_print_row Hysteria2 "$HEALTH_HY2_STATE" "udp/443 · $(health_client_label "$HEALTH_HY2_CLIENTS")"
+  health_print_row Subscription "$HEALTH_SUBSCRIPTION_STATE" "$HEALTH_SUBSCRIPTION_DETAIL"
+  health_print_row 'REALITY target' "$HEALTH_TARGET_STATE" '[DOMAIN-REDACTED] · TLS 1.3/h2'
+  health_print_info Fingerprint "$CLIENT_FINGERPRINT"
+  health_print_info 'HY2 obfs' "$HY2_OBFS_MODE"
+
+  print_section 'NETWORK'
+  if [[ "$HEALTH_DNS_STATE" == PASS ]]; then
+    health_print_row 'Public IPv4' PASS 'configured · DNS matches'
+  else
+    health_print_row 'Public IPv4' FAIL 'configured · DNS mismatch'
+  fi
+  health_print_row TCP/443 "$HEALTH_TCP443_STATE" "$HEALTH_TCP443_DETAIL"
+  health_print_row UDP/443 "$HEALTH_UDP443_STATE" "$HEALTH_UDP443_DETAIL"
+  health_print_row TCP/8443 "$HEALTH_TCP8443_STATE" "$HEALTH_TCP8443_DETAIL"
+  health_print_row Congestion "$HEALTH_CONGESTION_STATE" "kernel default $HEALTH_CONGESTION"
+  health_print_row Queue "$HEALTH_QUEUE_STATE" "$queue_detail"
+
+  print_section 'TLS'
+  health_print_row Certificate "$HEALTH_CERT_STATE" "$certificate_detail"
+  [[ "$HEALTH_CERT_HOSTNAME_STATE" == PASS ]] || health_print_row Hostname FAIL 'certificate does not match configured domain'
+  [[ "$HEALTH_CERT_KEYPAIR_STATE" == PASS ]] || health_print_row 'Key pair' FAIL 'certificate and private key do not match'
+  health_print_row Renewal "$HEALTH_RENEWAL_STATE" "$HEALTH_RENEWAL_DETAIL"
 
   print_section 'SECURITY'
-  if managed_firewall_is_healthy; then
-    printf 'nftables persistence and managed policy: PASS\n'
-  else
-    printf 'nftables persistence and managed policy: FAIL\n'
-  fi
-  if ssh_lockdown_is_effective; then
-    printf 'SSH key-only lockdown: PASS\n'
-  else
-    printf 'SSH key-only lockdown: FAIL\n'
-  fi
-  systemctl --failed --no-pager --no-legend 2>/dev/null || true
-  journalctl --disk-usage 2>/dev/null || true
+  health_print_row nftables "$HEALTH_FIREWALL_STATE" 'managed vpn_filter policy'
+  health_print_row SSH "$HEALTH_SSH_STATE" 'key-only policy'
+  health_print_row 'SSH listener' "$HEALTH_SSH_LISTENER_STATE" "tcp/$SSH_PORT · $HEALTH_SSH_LISTENER_DETAIL"
+  health_print_row Permissions "$HEALTH_PERMISSIONS_STATE" 'managed files'
 
-  print_section 'RECENT SING-BOX WARNINGS/ERRORS — REDACTED'
-  journalctl -u sing-box.service --since '-30 minutes' -p warning..alert -n 80 \
-    --no-pager --output=short-iso 2>/dev/null | redact_health_stream || true
-  printf '\nSecrets, client UUIDs, connection URIs, and IP addresses are redacted. Review before sharing.\n'
+  print_section 'RECENT ERRORS'
+  if [[ "$HEALTH_RECENT_ERRORS_STATE" == PASS ]]; then
+    printf '  None\n'
+  else
+    sed -n '1,5p' "$HEALTH_RECENT_ERRORS_FILE"
+  fi
+  printf '\nVersions: installer %s · runtime %s\n' "$SCRIPT_VERSION" "$HEALTH_RUNTIME_VERSION"
+  printf 'Generated: %s\n' "$(health_generated_timestamp)"
+  printf 'Sensitive values are redacted.\n'
+}
+
+render_health_debug_details() {
+  local active_congestion
+  print_section 'DEVELOPMENT DETAILS'
+  printf 'Relevant sysctl:\n'
+  sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc \
+    net.core.rmem_max net.core.wmem_max 2>/dev/null || true
+  printf '\nActive congestion samples (bounded):\n'
+  active_congestion="$(ss -H -tin 2>/dev/null | grep -Eio 'bbr|cubic|reno' | sort -u | paste -sd, - || true)"
+  printf '  %s\n' "${active_congestion:-no identifiable active TCP samples}"
+  printf '\nListener dump (bounded):\n'
+  ss -H -lntup 2>/dev/null | sed -n '1,80p' || true
+  if [[ -n "$HEALTH_DEFAULT_INTERFACE" ]]; then
+    printf '\nActive qdisc for default interface:\n'
+    tc -s qdisc show dev "$HEALTH_DEFAULT_INTERFACE" 2>/dev/null | sed -n '1,80p' || true
+    printf '\nDefault interface counters:\n'
+    ip -s link show dev "$HEALTH_DEFAULT_INTERFACE" 2>/dev/null | sed -n '1,80p' || true
+  fi
+  printf '\nCertificate timestamps:\n'
+  openssl x509 -in "${CERT_DIR}/fullchain.pem" -noout -dates 2>/dev/null || true
+  printf '\nSystemd state:\n'
+  systemctl show sing-box.service nginx.service nftables.service certbot.timer ssh.service \
+    -p Id -p LoadState -p ActiveState -p SubState --no-pager 2>/dev/null | sed -n '1,100p' || true
+  printf '\nRecent sing-box journal (bounded):\n'
+  journalctl -u sing-box.service --since '-30 minutes' -n 80 --no-pager \
+    --output=short-iso 2>/dev/null | sed -n '1,80p' || true
+}
+
+health_details() {
+  local health_status=0
+  require_root
+  health_collect_state
+  (( HEALTH_FAILURES == 0 )) || health_status=1
+  render_health_verbose | redact_health_stream | health_limit_output_width
+  return "$health_status"
+}
+
+health_debug() {
+  local health_status=0
+  require_root
+  health_collect_state
+  (( HEALTH_FAILURES == 0 )) || health_status=1
+  {
+    render_health_verbose
+    render_health_debug_details
+  } | redact_health_stream | health_limit_output_width
   return "$health_status"
 }
 
@@ -3834,105 +4470,12 @@ ssh_lockdown_is_effective() {
 }
 
 health_check() {
-  local failures=0 dns_one dns_two core_state=PASS protocol_state=PASS
-  local subscription_state=PASS tls_state=PASS security_state=PASS target_state=PASS
-  local core_version client_count
-  local -a problems=()
-
+  local health_status=0
   require_root
-  core_version="$(dpkg-query -W -f='${Version}' sing-box 2>/dev/null || printf missing)"
-  client_count="$(jq -r '.clients | length' "$CLIENTS_FILE" 2>/dev/null || printf unknown)"
-
-  if [[ "$(cat "$RUNTIME_VERSION_FILE" 2>/dev/null || true)" != "$SCRIPT_VERSION" ]] ||
-     ! sing_box_version_is_supported "$core_version" ||
-     ! systemctl is-active --quiet sing-box.service ||
-     ! sing-box check -c "$CONFIG_FILE" >/dev/null 2>&1; then
-    core_state=FAIL
-    (( failures += 1 ))
-    problems+=('sing-box service, configuration or managed version is unhealthy')
-  fi
-
-  if ! jq -e '
-      any(.inbounds[];
-        .type == "vless" and .listen_port == 443 and
-        .tls.enabled == true and .tls.reality.enabled == true and
-        ((.users | length) > 0))' "$CONFIG_FILE" >/dev/null 2>&1 ||
-     ! ss -H -lntp 2>/dev/null |
-       awk '$4 ~ /:443$/ && $0 ~ /sing-box/ { found=1 } END { exit !found }' ||
-     ! jq -e '
-      any(.inbounds[];
-        .type == "hysteria2" and .listen_port == 443 and
-        .tls.enabled == true and ((.users | length) > 0))' \
-       "$CONFIG_FILE" >/dev/null 2>&1 ||
-     ! ss -H -lnup 2>/dev/null |
-       awk '$4 ~ /:443$/ && $0 ~ /sing-box/ { found=1 } END { exit !found }'; then
-    protocol_state=FAIL
-    (( failures += 1 ))
-    problems+=('one or both VPN listeners on TCP/443 and UDP/443 are unhealthy')
-  fi
-
-  if ! subscription_service_healthy; then
-    subscription_state=FAIL
-    (( failures += 1 ))
-    problems+=('the private subscription service is unhealthy')
-  fi
-
-  dns_one="$(dig +short A "$TLS_DOMAIN" @1.1.1.1 2>/dev/null | sed '/^$/d' || true)"
-  dns_two="$(dig +short A "$TLS_DOMAIN" @8.8.8.8 2>/dev/null | sed '/^$/d' || true)"
-  if ! grep -Fxq "$SERVER_IPV4" <<<"$dns_one" ||
-     ! grep -Fxq "$SERVER_IPV4" <<<"$dns_two" ||
-     [[ ! -r "${CERT_DIR}/fullchain.pem" ]] ||
-     ! openssl x509 -in "${CERT_DIR}/fullchain.pem" -noout -checkend 604800 >/dev/null 2>&1 ||
-     ! certificate_key_pair_matches "${CERT_DIR}/fullchain.pem" "${CERT_DIR}/privkey.pem" ||
-     ! systemctl is-enabled --quiet certbot.timer 2>/dev/null ||
-     ! systemctl is-active --quiet certbot.timer 2>/dev/null ||
-     [[ ! -x "$CERT_HOOK" ]] ||
-     ! sh -n "$CERT_HOOK" >/dev/null 2>&1; then
-    tls_state=FAIL
-    (( failures += 1 ))
-    problems+=('DNS, TLS certificate or automatic renewal is unhealthy')
-  fi
-
-  if ! timeout 15 openssl s_client -connect "${REALITY_TARGET}:443" \
-      -servername "$REALITY_TARGET" -tls1_3 -alpn h2 -verify_return_error \
-      </dev/null >/dev/null 2>&1; then
-    target_state=FAIL
-    (( failures += 1 ))
-    problems+=('the REALITY target failed its TLS 1.3/h2 probe')
-  fi
-
-  if ! managed_firewall_is_healthy || ! ssh_lockdown_is_effective; then
-    security_state=FAIL
-    (( failures += 1 ))
-    problems+=('nftables persistence or SSH key-only lockdown is unhealthy')
-  fi
-
-  print_title 'VPN health'
-  print_status_row Core "$core_state" "sing-box ${core_version}"
-  print_status_row Protocols "$protocol_state" 'REALITY tcp/443 · Hysteria2 udp/443'
-  print_status_row Subscription "$subscription_state" "${client_count} client(s)"
-  print_status_row DNS/TLS "$tls_state" "$TLS_DOMAIN"
-  print_status_row REALITY "$target_state" "$REALITY_TARGET"
-  print_status_row Security "$security_state" 'nftables · SSH key-only'
-  printf '  %-14s %s\n' Profiles "${CLIENT_FINGERPRINT} · Hysteria2 obfs ${HY2_OBFS_MODE}"
-  printf '  %-14s %s\n' Network \
-    "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || printf unknown) · $(sysctl -n net.core.default_qdisc 2>/dev/null || printf unknown)"
-
-  if (( failures == 0 )); then
-    printf '\nResult: '
-    print_status_value HEALTHY
-    printf '\n'
-    return 0
-  fi
-
-  print_section 'Problems'
-  printf '  - %s\n' "${problems[@]}"
-  printf 'Result: '
-  print_status_value UNHEALTHY
-  printf ' (%d)\n' "$failures"
-  printf '\nServer-side checks do not prove reachability from a client network.\n'
-  printf 'Possible causes include path filtering, UDP filtering, or IP/subnet blocking.\n'
-  return 1
+  health_collect_state
+  (( HEALTH_FAILURES == 0 )) || health_status=1
+  render_health_short
+  return "$health_status"
 }
 write_install_completion_marker() {
   printf '%s\n' "completed $(date --iso-8601=seconds) version=${SCRIPT_VERSION}" >"${INSTALL_COMPLETE_FILE}.new"
@@ -4247,7 +4790,7 @@ main() {
       ;;
     *)
       usage >&2
-      die "Unknown command: $COMMAND"
+      cli_error "Unknown command: $COMMAND"
       ;;
   esac
   case "$COMMAND" in
@@ -4277,7 +4820,9 @@ main() {
       self_update_from_file
       ;;
     health)
-      if (( VERBOSE == 1 )); then
+      if (( DEBUG == 1 )); then
+        health_debug || exit 1
+      elif (( VERBOSE == 1 )); then
         health_details || exit 1
       else
         health_check || exit 1
@@ -4308,7 +4853,7 @@ main() {
       client_list
       ;;
     audit-target)
-      audit_reality_target || exit 1
+      audit_reality_target || exit $?
       ;;
     set-target)
       set_reality_target
@@ -4324,7 +4869,7 @@ main() {
       ;;
     *)
       usage >&2
-      die "Unknown command: $COMMAND"
+      cli_error "Unknown command: $COMMAND"
       ;;
   esac
 }

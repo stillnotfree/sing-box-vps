@@ -39,6 +39,7 @@ bash -n src/*.sh scripts/build-standalone.sh install-sing-box-server.sh tests/*.
 shellcheck --severity=style scripts/build-standalone.sh install-sing-box-server.sh tests/*.sh
 bash tests/static-smoke.sh
 bash tests/fingerprint-smoke.sh
+bash tests/health-smoke.sh
 ./install-sing-box-server.sh plan
 ```
 

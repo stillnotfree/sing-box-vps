@@ -63,6 +63,63 @@ die() {
   exit 1
 }
 
+cli_error() {
+  printf '[ERROR] %s\n' "$*" >&2
+  exit 1
+}
+
+cli_options_are_close() {
+  local candidate="$1" known="$2" candidate_length known_length index mismatches=0
+  candidate_length=${#candidate}
+  known_length=${#known}
+  (( candidate_length >= known_length - 1 && candidate_length <= known_length + 1 )) || return 1
+
+  if (( candidate_length == known_length )); then
+    for (( index=0; index<candidate_length; index++ )); do
+      if [[ "${candidate:index:1}" != "${known:index:1}" ]]; then
+        (( mismatches += 1 ))
+      fi
+    done
+    (( mismatches <= 1 )) && return 0
+    for (( index=0; index<candidate_length - 1; index++ )); do
+      if [[ "${candidate:index:1}" == "${known:index+1:1}" &&
+            "${candidate:index+1:1}" == "${known:index:1}" &&
+            "${candidate:0:index}${candidate:index+2}" == "${known:0:index}${known:index+2}" ]]; then
+        return 0
+      fi
+    done
+    return 1
+  fi
+
+  if (( candidate_length > known_length )); then
+    for (( index=0; index<candidate_length; index++ )); do
+      [[ "${candidate:0:index}${candidate:index+1}" == "$known" ]] && return 0
+    done
+  else
+    for (( index=0; index<known_length; index++ )); do
+      [[ "${known:0:index}${known:index+1}" == "$candidate" ]] && return 0
+    done
+  fi
+  return 1
+}
+
+cli_unknown_option() {
+  local option="$1" known
+  local -a known_options=(
+    --admin-user --public-key --server-ipv4 --domain --email --ssh-port
+    --reality-target --fingerprint --emoji --yes --verbose --debug --automatic
+    --help -h
+  )
+  printf '[ERROR] Unknown option: %s\n' "$option" >&2
+  for known in "${known_options[@]}"; do
+    if cli_options_are_close "$option" "$known"; then
+      printf 'Did you mean: %s?\n' "$known" >&2
+      break
+    fi
+  done
+  exit 1
+}
+
 on_error() {
   local exit_code=$?
   local failed_command="${BASH_COMMAND:-unknown}"
@@ -298,11 +355,11 @@ Usage:
   sudo ./install-sing-box-server.sh check
   sudo ./install-sing-box-server.sh install
   sudo ./install-sing-box-server.sh upgrade
-  vpn health [--verbose]
+  vpn health [--verbose|--debug]
   vpn add NAME
   vpn show [NAME]
   vpn delete NAME
-  vpn audit-target [DOMAIN]
+  vpn audit-target [DOMAIN] [--verbose]
   vpn set-target DOMAIN
   vpn set-fingerprint [VALUE]
   vpn set-obfs [off|salamander]
@@ -320,7 +377,8 @@ Install options (missing values are requested interactively):
   --fingerprint VALUE      Initial client TLS fingerprint (default: chrome).
   --emoji EMOJI            Server/country emoji for non-interactive installs.
   --yes                    Skip the final confirmation prompt for a mutating operation.
-  --verbose                Show a redacted report; review it before sharing.
+  --verbose                Show structured component diagnostics.
+  --debug                  Add bounded low-level diagnostics to verbose health output.
   --automatic              Internal use by the firewall rollback timer.
   -h, --help               Show this help.
 
@@ -333,7 +391,7 @@ parse_args() {
     case "$1" in
       add|delete)
         COMMAND="client-$1"
-        (( $# >= 2 )) || die "$1 requires a client name."
+        (( $# >= 2 )) || cli_error "$1 requires a client name."
         CLIENT_NAME="$2"
         shift 2
         ;;
@@ -349,7 +407,7 @@ parse_args() {
         ;;
       set-target)
         COMMAND="set-target"
-        (( $# >= 2 )) || die 'set-target requires a domain.'
+        (( $# >= 2 )) || cli_error 'set-target requires a domain.'
         NEW_REALITY_TARGET="$2"
         shift 2
         ;;
@@ -382,7 +440,7 @@ parse_args() {
         ;;
       self-update)
         COMMAND="self-update"
-        (( $# >= 2 )) || die 'self-update requires a path to a newer installer file.'
+        (( $# >= 2 )) || cli_error 'self-update requires a path to a newer installer file.'
         SELF_UPDATE_SOURCE="$2"
         shift 2
         ;;
@@ -396,47 +454,47 @@ parse_args() {
   while (( $# > 0 )); do
     case "$1" in
       --email)
-        (( $# >= 2 )) || die '--email requires a value.'
+        (( $# >= 2 )) || cli_error '--email requires a value.'
         ACME_EMAIL="$2"
         shift 2
         ;;
       --admin-user)
-        (( $# >= 2 )) || die '--admin-user requires a value.'
+        (( $# >= 2 )) || cli_error '--admin-user requires a value.'
         ADMIN_USER="$2"
         shift 2
         ;;
       --public-key)
-        (( $# >= 2 )) || die '--public-key requires a value.'
+        (( $# >= 2 )) || cli_error '--public-key requires a value.'
         ADMIN_PUBLIC_KEY="$2"
         shift 2
         ;;
       --server-ipv4)
-        (( $# >= 2 )) || die '--server-ipv4 requires a value.'
+        (( $# >= 2 )) || cli_error '--server-ipv4 requires a value.'
         SERVER_IPV4="$2"
         shift 2
         ;;
       --domain)
-        (( $# >= 2 )) || die '--domain requires a value.'
+        (( $# >= 2 )) || cli_error '--domain requires a value.'
         TLS_DOMAIN="$2"
         shift 2
         ;;
       --ssh-port)
-        (( $# >= 2 )) || die '--ssh-port requires a value.'
+        (( $# >= 2 )) || cli_error '--ssh-port requires a value.'
         SSH_PORT="$2"
         shift 2
         ;;
       --reality-target)
-        (( $# >= 2 )) || die '--reality-target requires a value.'
+        (( $# >= 2 )) || cli_error '--reality-target requires a value.'
         REALITY_TARGET="$2"
         shift 2
         ;;
       --fingerprint)
-        (( $# >= 2 )) || die '--fingerprint requires a value.'
+        (( $# >= 2 )) || cli_error '--fingerprint requires a value.'
         CLIENT_FINGERPRINT="$2"
         shift 2
         ;;
       --emoji)
-        (( $# >= 2 )) || die '--emoji requires a value.'
+        (( $# >= 2 )) || cli_error '--emoji requires a value.'
         COUNTRY_EMOJI="$2"
         shift 2
         ;;
@@ -445,6 +503,11 @@ parse_args() {
         shift
         ;;
       --verbose)
+        VERBOSE=1
+        shift
+        ;;
+      --debug)
+        DEBUG=1
         VERBOSE=1
         shift
         ;;
@@ -457,7 +520,10 @@ parse_args() {
         exit 0
         ;;
       *)
-        die "Unknown argument: $1"
+        if [[ "$1" == -* ]]; then
+          cli_unknown_option "$1"
+        fi
+        cli_error "Unknown argument: $1"
         ;;
     esac
   done

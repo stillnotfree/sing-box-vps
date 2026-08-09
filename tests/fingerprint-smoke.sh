@@ -113,26 +113,12 @@ fi
   [[ "$AUDIT_TARGET" == "cdn.example.com" ]]
 )
 
+# The audit parser receives only a filtered text representation of the raw
+# OpenSSL file. These fixtures cover its public states and exit statuses.
 (
   trap - ERR
   require_command() { :; }
-  AUDIT_TARGET="tickets.example.com"
-  capture_reality_target_audit_probe() {
-    printf 'New, TLSv1.3, Cipher is TLS_AES_128_GCM_SHA256\n' >"$2"
-    printf 'Verify return code: 0 (ok)\nALPN protocol: h2\n' >>"$2"
-    printf '<<< TLS 1.3, Handshake, NewSessionTicket\000binary-response\n' >>"$2"
-  }
-  if audit_output="$(audit_reality_target 2>&1)"; then
-    printf 'A target with a post-handshake ticket unexpectedly passed the audit.\n' >&2
-    exit 1
-  fi
-  grep -Fq '1 NewSessionTicket message(s) observed' <<<"$audit_output"
-  grep -Fq 'Usable; zero tickets is preferred' <<<"$audit_output"
-  [[ "$audit_output" != *'ignored null byte'* ]]
-)
-
-(
-  require_command() { :; }
+  VERBOSE=0
   AUDIT_TARGET="no-tickets.example.com"
   capture_reality_target_audit_probe() {
     printf '%s\n' \
@@ -141,37 +127,197 @@ fi
       'ALPN protocol: h2' >"$2"
   }
   audit_output="$(audit_reality_target 2>&1)"
-  grep -Fq '0 NewSessionTicket messages observed' <<<"$audit_output"
-  grep -Fq 'Preferred for this specific Aparecium-class heuristic' <<<"$audit_output"
+  grep -Fq 'TLS 1.3: PASS' <<<"$audit_output"
+  grep -Fq 'Certificate/SNI: PASS' <<<"$audit_output"
+  grep -Fq 'ALPN h2: PASS' <<<"$audit_output"
+  grep -Fq 'Post-handshake NewSessionTicket: 0' <<<"$audit_output"
+  grep -Fq 'Comparison signal: NOT OBSERVED' <<<"$audit_output"
+  grep -Fq 'Result: PASS — preferred' <<<"$audit_output"
 )
 
 (
   trap - ERR
   require_command() { :; }
-  AUDIT_TARGET="broken.example.com"
+  VERBOSE=0
+  AUDIT_TARGET="one-ticket.example.com"
   capture_reality_target_audit_probe() {
     printf '%s\n' \
       'New, TLSv1.3, Cipher is TLS_AES_128_GCM_SHA256' \
-      'Verify return code: 20 (unable to get local issuer certificate)' >"$2"
+      'Verify return code: 0 (ok)' \
+      'ALPN protocol: h2' \
+      '<<< TLS 1.3, Handshake, NewSessionTicket' >"$2"
   }
   if audit_output="$(audit_reality_target 2>&1)"; then
-    printf 'A target with failed certificate and ALPN checks unexpectedly passed.\n' >&2
-    exit 1
+    audit_status=0
+  else
+    audit_status=$?
   fi
-  grep -Eq 'Certificate[[:space:]]+FAIL' <<<"$audit_output"
-  grep -Eq 'ALPN h2[[:space:]]+FAIL' <<<"$audit_output"
-  grep -Eq 'Assessment[[:space:]]+FAIL' <<<"$audit_output"
+  (( audit_status == 1 ))
+  grep -Fq 'Post-handshake NewSessionTicket: 1' <<<"$audit_output"
+  grep -Fq 'Comparison signal: OBSERVED' <<<"$audit_output"
+  grep -Fq 'Result: WARN — target is usable, but 1 post-handshake ticket was observed.' <<<"$audit_output"
+)
+
+(
+  trap - ERR
+  require_command() { :; }
+  VERBOSE=0
+  AUDIT_TARGET="two-tickets.example.com"
+  capture_reality_target_audit_probe() {
+    printf '%s\n' \
+      'New, TLSv1.3, Cipher is TLS_AES_128_GCM_SHA256' \
+      'Verify return code: 0 (ok)' \
+      'ALPN protocol: h2' \
+      '<<< TLS 1.3, Handshake, NewSessionTicket' \
+      '<<< TLS 1.3, Handshake, NewSessionTicket' >"$2"
+  }
+  if audit_output="$(audit_reality_target 2>&1)"; then
+    audit_status=0
+  else
+    audit_status=$?
+  fi
+  (( audit_status == 1 ))
+  grep -Fq 'Post-handshake NewSessionTicket: 2' <<<"$audit_output"
+  grep -Fq 'Result: WARN — target is usable, but 2 post-handshake tickets were observed.' <<<"$audit_output"
+)
+
+(
+  trap - ERR
+  require_command() { :; }
+  VERBOSE=0
+  AUDIT_TARGET="no-alpn.example.com"
+  capture_reality_target_audit_probe() {
+    printf '%s\n' \
+      'New, TLSv1.3, Cipher is TLS_AES_128_GCM_SHA256' \
+      'SSL3 alert read:fatal:no application protocol' >"$2"
+    return 1
+  }
+  if audit_output="$(audit_reality_target 2>&1)"; then
+    audit_status=0
+  else
+    audit_status=$?
+  fi
+  (( audit_status == 2 ))
+  grep -Fq 'TLS 1.3: PASS' <<<"$audit_output"
+  grep -Fq 'Certificate/SNI: UNKNOWN' <<<"$audit_output"
+  grep -Fq 'ALPN h2: FAIL' <<<"$audit_output"
+  grep -Fq 'Reason: server returned TLS alert "no application protocol"' <<<"$audit_output"
+  grep -Fq 'Result: FAIL' <<<"$audit_output"
+)
+
+(
+  trap - ERR
+  require_command() { :; }
+  VERBOSE=0
+  AUDIT_TARGET="old-tls.example.com"
+  capture_reality_target_audit_probe() {
+    printf '%s\n' 'SSL3 alert read:fatal:protocol version' >"$2"
+    return 1
+  }
+  if audit_output="$(audit_reality_target 2>&1)"; then
+    audit_status=0
+  else
+    audit_status=$?
+  fi
+  (( audit_status == 2 ))
+  grep -Fq 'TLS 1.3: FAIL' <<<"$audit_output"
+  grep -Fq 'Certificate/SNI: UNKNOWN' <<<"$audit_output"
+  grep -Fq 'ALPN h2: UNKNOWN' <<<"$audit_output"
+  grep -Fq 'Reason: server returned TLS alert "protocol version"' <<<"$audit_output"
+)
+
+(
+  trap - ERR
+  require_command() { :; }
+  VERBOSE=0
+  AUDIT_TARGET="bad-certificate.example.com"
+  capture_reality_target_audit_probe() {
+    printf '%s\n' \
+      'New, TLSv1.3, Cipher is TLS_AES_128_GCM_SHA256' \
+      'Verify return code: 20 (unable to get local issuer certificate)' \
+      'certificate verify failed' \
+      'ALPN protocol: h2' >"$2"
+    return 1
+  }
+  if audit_output="$(audit_reality_target 2>&1)"; then
+    audit_status=0
+  else
+    audit_status=$?
+  fi
+  (( audit_status == 2 ))
+  grep -Fq 'TLS 1.3: PASS' <<<"$audit_output"
+  grep -Fq 'Certificate/SNI: FAIL' <<<"$audit_output"
+  grep -Fq 'ALPN h2: PASS' <<<"$audit_output"
+  grep -Fq 'Reason: certificate chain is not trusted' <<<"$audit_output"
+)
+
+(
+  trap - ERR
+  require_command() { :; }
+  VERBOSE=0
+  AUDIT_TARGET="timeout.example.com"
+  capture_reality_target_audit_probe() {
+    : >"$2"
+    return 124
+  }
+  if audit_output="$(audit_reality_target 2>&1)"; then
+    audit_status=0
+  else
+    audit_status=$?
+  fi
+  (( audit_status == 2 ))
+  grep -Fq 'TLS 1.3: UNKNOWN' <<<"$audit_output"
+  grep -Fq 'Certificate/SNI: UNKNOWN' <<<"$audit_output"
+  grep -Fq 'ALPN h2: UNKNOWN' <<<"$audit_output"
+  grep -Fq 'Reason: probe timed out after 12 seconds' <<<"$audit_output"
+)
+
+(
+  trap - ERR
+  require_command() { :; }
+  VERBOSE=0
+  AUDIT_TARGET="binary.example.com"
+  capture_reality_target_audit_probe() {
+    printf 'RAW-TRACE-SENTINEL\000ClientHello\n0000 - de ad be ef\nCertificate chain\n' >"$2"
+    printf '%s\n' \
+      'New, TLSv1.3, Cipher is TLS_AES_128_GCM_SHA256' \
+      'Verify return code: 0 (ok)' \
+      'ALPN protocol: h2' \
+      '<<< TLS 1.3, Handshake, NewSessionTicket' >>"$2"
+  }
+  if audit_output="$(audit_reality_target 2>&1)"; then
+    audit_status=0
+  else
+    audit_status=$?
+  fi
+  (( audit_status == 1 ))
+  [[ "$audit_output" != *'ignored null byte'* ]]
+  [[ "$audit_output" != *'RAW-TRACE-SENTINEL'* ]]
+  [[ "$audit_output" != *'ClientHello'* ]]
+  [[ "$audit_output" != *'0000 - de ad be ef'* ]]
+  [[ "$audit_output" != *'Certificate chain'* ]]
+
+  VERBOSE=1
+  if verbose_output="$(audit_reality_target 2>&1)"; then
+    verbose_status=0
+  else
+    verbose_status=$?
+  fi
+  (( verbose_status == 1 ))
+  grep -Fq 'OpenSSL exit status: 0' <<<"$verbose_output"
+  grep -Fq 'RAW-TRACE-SENTINEL' <<<"$verbose_output"
 )
 
 (
   interactive_stdin() { return 0; }
   audit_reality_target() {
-    [[ "$REALITY_TARGET" == "safe.example.com" ]]
+    [[ "$REALITY_TARGET" == "safe.example.com" ]] && return 0
+    return 1
   }
   ASSUME_YES=0
   REALITY_TARGET="tickets.example.com"
   REALITY_TARGET_AUDITED=0
-  select_audited_reality_target_for_install <<< $'n\nsafe.example.com'
+  select_audited_reality_target_for_install <<< $'t\nsafe.example.com'
   [[ "$REALITY_TARGET" == "safe.example.com" ]]
   (( REALITY_TARGET_AUDITED == 1 ))
 )
@@ -184,6 +330,33 @@ fi
   REALITY_TARGET_AUDITED=0
   select_audited_reality_target_for_install <<< $'\n'
   [[ "$REALITY_TARGET" == "reviewed.example.com" ]]
+  (( REALITY_TARGET_AUDITED == 1 ))
+)
+
+(
+  interactive_stdin() { return 0; }
+  audit_reality_target() { return 1; }
+  ASSUME_YES=0
+  REALITY_TARGET="reviewed.example.com"
+  REALITY_TARGET_AUDITED=0
+  selection_file="$(mktemp)"
+  select_audited_reality_target_for_install <<< $'?\nk' >"$selection_file" 2>&1
+  selection_output="$(cat "$selection_file")"
+  rm -f -- "$selection_file"
+  grep -Fq '[K] Keep this target' <<<"$selection_output"
+  grep -Fq '[T] Try another target' <<<"$selection_output"
+  grep -Fq '[?] Details' <<<"$selection_output"
+  grep -Fq '0 tickets is preferred only for this Aparecium-class comparison heuristic.' <<<"$selection_output"
+  (( REALITY_TARGET_AUDITED == 1 ))
+)
+
+(
+  interactive_stdin() { return 1; }
+  audit_reality_target() { return 1; }
+  ASSUME_YES=1
+  REALITY_TARGET="reviewed.example.com"
+  REALITY_TARGET_AUDITED=0
+  select_audited_reality_target_for_install
   (( REALITY_TARGET_AUDITED == 1 ))
 )
 
@@ -229,6 +402,7 @@ if grep -Eq 'vpn (status|diagnostic)([[:space:]]|$)' <<<"$help_output"; then
   exit 1
 fi
 grep -Fq 'vpn show [NAME]' <<<"$help_output"
+grep -Fq 'vpn audit-target [DOMAIN] [--verbose]' <<<"$help_output"
 [[ "$(style_text '1;32' PASS)" == "PASS" ]]
 
 for fingerprint in chrome firefox safari ios android edge 360 qq random; do
@@ -459,8 +633,9 @@ firewall_health_body="$(declare -f managed_firewall_is_healthy)"
 grep -Fq 'systemctl is-enabled --quiet nftables.service' <<<"$firewall_health_body"
 grep -Fq 'systemctl is-active --quiet nftables.service' <<<"$firewall_health_body"
 health_details_body="$(declare -f health_details)"
-grep -Fq 'printf '\''%s\n'\'' "$health_summary" | redact_health_stream' \
-  <<<"$health_details_body"
+grep -Fq 'render_health_verbose | redact_health_stream' <<<"$health_details_body"
+health_debug_body="$(declare -f health_debug)"
+grep -Fq 'render_health_debug_details' <<<"$health_debug_body"
 subscription_health_body="$(declare -f subscription_service_healthy)"
 grep -Fq -- '--resolve "${TLS_DOMAIN}:${SUBSCRIPTION_PORT}:127.0.0.1"' \
   <<<"$subscription_health_body"

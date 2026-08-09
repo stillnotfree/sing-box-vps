@@ -242,15 +242,35 @@ verify_dns() {
 }
 
 verify_reality_target() {
-  local tls_probe
+  local probe_file probe_status=0
   log "Checking TLS 1.3 reachability of the reviewed REALITY target ${REALITY_TARGET}."
-  if ! tls_probe="$(timeout 15 openssl s_client \
+  if [[ -z "$TMP_DIR" || ! -d "$TMP_DIR" ]]; then
+    new_temp_dir
+  fi
+  probe_file="$(mktemp "${TMP_DIR}/reality-target-verify.XXXXXX")"
+  chmod 0600 "$probe_file"
+  if timeout 15 openssl s_client \
     -connect "${REALITY_TARGET}:443" \
     -servername "$REALITY_TARGET" \
-    -tls1_3 -alpn h2 -verify_return_error </dev/null 2>&1)"; then
+    -verify_hostname "$REALITY_TARGET" \
+    -tls1_3 -alpn h2 -verify_return_error </dev/null >"$probe_file" 2>&1; then
+    probe_status=0
+  else
+    probe_status=$?
+  fi
+  if (( probe_status != 0 )); then
     die "REALITY target ${REALITY_TARGET} did not pass the TLS 1.3 verification test."
   fi
-  if ! grep -Eiq 'ALPN protocol:[[:space:]]*h2|ALPN[^[:alnum:]]+h2' <<<"$tls_probe"; then
+  if ! LC_ALL=C grep -aEiq \
+    'New,[[:space:]]*TLSv1\.3|Protocol( version)?[[:space:]]*:[[:space:]]*TLSv1\.3' "$probe_file"; then
+    die "REALITY target ${REALITY_TARGET} did not negotiate TLS 1.3."
+  fi
+  if ! LC_ALL=C grep -aEiq \
+    'Verify return code:[[:space:]]*0[[:space:]]*\(ok\)|Verification:[[:space:]]*OK' "$probe_file"; then
+    die "REALITY target ${REALITY_TARGET} failed certificate or SNI verification."
+  fi
+  if ! LC_ALL=C grep -aEiq \
+    'ALPN protocol:[[:space:]]*h2|ALPN[^[:alnum:]]+h2' "$probe_file"; then
     die "REALITY target ${REALITY_TARGET} did not negotiate HTTP/2 (ALPN h2)."
   fi
   log "REALITY target ${REALITY_TARGET} passed the basic certificate, TLS 1.3, and ALPN h2 checks."
@@ -258,68 +278,174 @@ verify_reality_target() {
 
 capture_reality_target_audit_probe() {
   local target="$1" destination="$2" status=0
-  if timeout 12 openssl s_client \
-    -connect "${target}:443" \
-    -servername "$target" \
-    -tls1_3 -alpn h2 -verify_return_error -msg -ign_eof \
-    <<< $'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n' >"$destination" 2>&1; then
-    return
+  if (
+    # Bound a hostile or unexpectedly verbose endpoint to 2 MiB of diagnostics.
+    ulimit -f 2048
+    timeout 12 openssl s_client \
+      -connect "${target}:443" \
+      -servername "$target" \
+      -verify_hostname "$target" \
+      -tls1_3 -alpn h2 -verify_return_error -msg -ign_eof \
+      <<< $'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n'
+  ) >"$destination" 2>&1; then
+    status=0
   else
     status=$?
   fi
-  (( status == 124 )) && return
   return "$status"
 }
 
+extract_reality_target_audit_text() {
+  local raw_file="$1" text_file="$2"
+  {
+    LC_ALL=C grep -aEio \
+      'New,[[:space:]]*TLSv1\.3|Protocol( version)?[[:space:]]*:[[:space:]]*TLSv1\.3' \
+      "$raw_file" || true
+    LC_ALL=C grep -aEio \
+      'Verify return code:[[:space:]]*[0-9]+[[:space:]]*\([^[:cntrl:]]{0,120}\)|Verification:[[:space:]]*(OK|FAILED)' \
+      "$raw_file" || true
+    LC_ALL=C grep -aEio \
+      'ALPN protocol:[[:space:]]*[^[:space:][:cntrl:]]+|No ALPN negotiated' \
+      "$raw_file" || true
+    LC_ALL=C grep -aEio 'NewSessionTicket' "$raw_file" || true
+    LC_ALL=C grep -aEio \
+      'alert[^[:cntrl:]]{0,160}|no application protocol|protocol version|wrong version number|unsupported protocol|certificate verify failed|unable to get local issuer certificate|hostname mismatch|certificate has expired|self-signed certificate|connection refused|name or service not known|temporary failure in name resolution|unexpected eof' \
+      "$raw_file" || true
+  } >"$text_file"
+}
+
+print_reality_target_audit_debug() {
+  local probe_status="$1" raw_file="$2" text_file="$3" raw_size
+  (( VERBOSE == 1 )) || return 0
+  print_section 'OpenSSL audit diagnostics (--verbose)'
+  printf 'OpenSSL exit status: %s\n' "$probe_status"
+  printf 'Parsed diagnostic tokens:\n'
+  sed -n '1,200p' "$text_file"
+  printf 'Raw OpenSSL trace excerpt (first 64 KiB, control bytes removed):\n'
+  LC_ALL=C head -c 65536 "$raw_file" | LC_ALL=C tr -cd '\11\12\15\40-\176'
+  printf '\n'
+  raw_size="$(wc -c <"$raw_file")"
+  if (( raw_size > 65536 )); then
+    printf '[Raw diagnostics truncated: %s bytes total]\n' "$raw_size"
+  fi
+}
+
+print_reality_target_audit_details() {
+  cat <<'EOF'
+Details:
+  0 tickets is preferred only for this Aparecium-class comparison heuristic.
+  1 or more tickets is normal TLS 1.3 server behavior and remains usable.
+  The warning means a REALITY server may be easier to compare with this target
+  if it does not reproduce the target's post-handshake ticket behavior.
+  This is not a general security or censorship-resistance verdict.
+EOF
+}
+
 audit_reality_target() {
-  local target="${AUDIT_TARGET:-$REALITY_TARGET}" probe_file probe_status=0 ticket_count
-  local tls_state=FAIL certificate_state=FAIL alpn_state=FAIL
+  local target="${AUDIT_TARGET:-$REALITY_TARGET}" raw_file text_file probe_status=0 ticket_count=0
+  local tls_state=UNKNOWN certificate_state=UNKNOWN alpn_state=UNKNOWN
+  local comparison_signal=UNKNOWN result reason="" ticket_word=tickets
   require_command openssl
   require_command timeout
   validate_domain "$target"
 
-  log "Auditing REALITY target ${target} for post-handshake TLS 1.3 session tickets."
-  new_temp_dir
-  probe_file="${TMP_DIR}/reality-target-audit.raw"
-  if capture_reality_target_audit_probe "$target" "$probe_file"; then
+  if [[ -z "$TMP_DIR" || ! -d "$TMP_DIR" ]]; then
+    new_temp_dir
+  fi
+  raw_file="$(mktemp "${TMP_DIR}/reality-target-audit.raw.XXXXXX")"
+  text_file="$(mktemp "${TMP_DIR}/reality-target-audit.text.XXXXXX")"
+  chmod 0600 "$raw_file" "$text_file"
+  if capture_reality_target_audit_probe "$target" "$raw_file"; then
     probe_status=0
   else
     probe_status=$?
   fi
+  extract_reality_target_audit_text "$raw_file" "$text_file"
 
-  if LC_ALL=C grep -aEiq \
-    'New,[[:space:]]*TLSv1\.3|Protocol( version)?[[:space:]]*:[[:space:]]*TLSv1\.3' "$probe_file"; then
+  if LC_ALL=C grep -Eiq \
+    'New,[[:space:]]*TLSv1\.3|Protocol( version)?[[:space:]]*:[[:space:]]*TLSv1\.3' "$text_file"; then
     tls_state=PASS
+  elif LC_ALL=C grep -Eiq 'protocol version|wrong version number|unsupported protocol' "$text_file"; then
+    tls_state=FAIL
   fi
-  if LC_ALL=C grep -aEiq \
-    'Verify return code:[[:space:]]*0[[:space:]]*\(ok\)|Verification:[[:space:]]*OK' "$probe_file"; then
+  if LC_ALL=C grep -Eiq \
+    'Verify return code:[[:space:]]*0[[:space:]]*\(ok\)|Verification:[[:space:]]*OK' "$text_file"; then
     certificate_state=PASS
+  elif LC_ALL=C grep -Eiq \
+    'Verify return code:[[:space:]]*[1-9][0-9]*|Verification:[[:space:]]*FAILED|certificate verify failed|unable to get local issuer certificate|hostname mismatch|certificate has expired|self-signed certificate' \
+    "$text_file"; then
+    certificate_state=FAIL
   fi
-  if LC_ALL=C grep -aEiq \
-    'ALPN protocol:[[:space:]]*h2|ALPN[^[:alnum:]]+h2' "$probe_file"; then
+  if LC_ALL=C grep -Eiq 'ALPN protocol:[[:space:]]*h2' "$text_file"; then
     alpn_state=PASS
+  elif LC_ALL=C grep -Eiq 'no application protocol|No ALPN negotiated|ALPN protocol:' "$text_file"; then
+    alpn_state=FAIL
+  elif [[ "$tls_state" == PASS && "$certificate_state" == PASS ]]; then
+    alpn_state=FAIL
   fi
 
   print_title 'REALITY target audit'
-  printf '  Target         %s\n' "$target"
-  print_status_row 'TLS 1.3' "$tls_state" 'negotiated'
-  print_status_row 'Certificate' "$certificate_state" 'trusted'
-  print_status_row 'ALPN h2' "$alpn_state" 'negotiated'
+  printf 'Target: %s\n' "$target"
+  printf 'TLS 1.3: %s\n' "$tls_state"
+  printf 'Certificate/SNI: %s\n' "$certificate_state"
+  printf 'ALPN h2: %s\n' "$alpn_state"
 
-  if (( probe_status != 0 )) || [[ "$tls_state" != PASS || "$certificate_state" != PASS || "$alpn_state" != PASS ]]; then
-    print_status_row Assessment FAIL 'Choose another target.'
+  if [[ "$tls_state" != PASS || "$certificate_state" != PASS || "$alpn_state" != PASS ]]; then
+    if LC_ALL=C grep -Eiq 'no application protocol' "$text_file"; then
+      reason='server returned TLS alert "no application protocol"'
+    elif LC_ALL=C grep -Eiq 'protocol version|wrong version number|unsupported protocol' "$text_file"; then
+      reason='server returned TLS alert "protocol version"'
+    elif LC_ALL=C grep -Eiq 'hostname mismatch' "$text_file"; then
+      reason='certificate does not match the requested SNI'
+    elif LC_ALL=C grep -Eiq 'certificate has expired' "$text_file"; then
+      reason='certificate has expired'
+    elif LC_ALL=C grep -Eiq 'unable to get local issuer certificate|self-signed certificate' "$text_file"; then
+      reason='certificate chain is not trusted'
+    elif LC_ALL=C grep -Eiq 'certificate verify failed|Verify return code:[[:space:]]*[1-9][0-9]*|Verification:[[:space:]]*FAILED' "$text_file"; then
+      reason='certificate/SNI verification failed'
+    elif (( probe_status == 124 )); then
+      reason='probe timed out after 12 seconds'
+    elif LC_ALL=C grep -Eiq 'connection refused' "$text_file"; then
+      reason='target refused the TCP connection'
+    elif LC_ALL=C grep -Eiq 'name or service not known|temporary failure in name resolution' "$text_file"; then
+      reason='target DNS resolution failed'
+    elif LC_ALL=C grep -Eiq 'unexpected eof' "$text_file"; then
+      reason='server closed the connection during the TLS handshake'
+    elif [[ "$alpn_state" == FAIL ]]; then
+      reason='server did not negotiate ALPN h2'
+    elif [[ "$tls_state" != PASS ]]; then
+      reason='TLS 1.3 handshake did not complete'
+    elif [[ "$certificate_state" != PASS ]]; then
+      reason='certificate/SNI status could not be verified'
+    else
+      reason="OpenSSL probe exited with status ${probe_status}"
+    fi
+    printf 'Reason: %s\n' "$reason"
+    printf 'Result: FAIL\n'
+    print_reality_target_audit_debug "$probe_status" "$raw_file" "$text_file"
     return 2
   fi
 
-  ticket_count="$(LC_ALL=C grep -aEc 'NewSessionTicket' "$probe_file" || true)"
+  ticket_count="$(LC_ALL=C grep -cFx 'NewSessionTicket' "$text_file" || true)"
+  printf 'Post-handshake NewSessionTicket: %s\n' "$ticket_count"
   if (( ticket_count == 0 )); then
-    print_status_row Tickets PASS '0 NewSessionTicket messages observed'
-    print_status_row Assessment PASS 'Preferred for this specific Aparecium-class heuristic.'
+    comparison_signal='NOT OBSERVED'
+    result='PASS — preferred'
+    printf 'Comparison signal: %s\n' "$comparison_signal"
+    printf 'Result: %s\n' "$result"
+    print_reality_target_audit_debug "$probe_status" "$raw_file" "$text_file"
     return
   fi
 
-  print_status_row Tickets WARN "${ticket_count} NewSessionTicket message(s) observed"
-  print_status_row Assessment WARN 'Usable; zero tickets is preferred for this specific heuristic.'
+  (( ticket_count == 1 )) && ticket_word=ticket
+  comparison_signal=OBSERVED
+  result="WARN — target is usable, but ${ticket_count} post-handshake ${ticket_word} were observed."
+  if (( ticket_count == 1 )); then
+    result='WARN — target is usable, but 1 post-handshake ticket was observed.'
+  fi
+  printf 'Comparison signal: %s\n' "$comparison_signal"
+  printf 'Result: %s\n' "$result"
+  print_reality_target_audit_debug "$probe_status" "$raw_file" "$text_file"
   return 1
 }
 
@@ -336,31 +462,42 @@ select_audited_reality_target_for_install() {
     fi
     AUDIT_TARGET=""
 
+    if (( audit_status == 1 )) && { (( ASSUME_YES == 1 )) || ! interactive_stdin; }; then
+      REALITY_TARGET_AUDITED=1
+      return
+    fi
     if (( ASSUME_YES == 1 )) || ! interactive_stdin; then
-      if (( audit_status == 1 )); then
-        die "REALITY target ${REALITY_TARGET} is usable but produced an audit warning; rerun interactively to accept it or choose a zero-ticket --reality-target."
-      fi
       die "REALITY target ${REALITY_TARGET} failed a required TLS 1.3, certificate, or ALPN h2 check; rerun with a different --reality-target."
     fi
 
     if (( audit_status == 1 )); then
       while true; do
-        read -r -p "Use ${REALITY_TARGET} anyway? [Y/n]: " answer
-        answer="${answer:-y}"
+        cat <<'EOF'
+
+[K] Keep this target
+[T] Try another target
+[?] Details
+
+EOF
+        read -r -p 'Choice [K]: ' answer
+        answer="${answer:-k}"
         answer="$(printf '%s' "$answer" | tr '[:upper:]' '[:lower:]')"
         case "$answer" in
-          y|yes|keep)
+          k|keep|y|yes)
             log "Keeping explicitly accepted REALITY target ${REALITY_TARGET} despite the audit warning."
             REALITY_TARGET_AUDITED=1
             return
             ;;
-          n|no|new)
+          t|try|n|no|new)
             REALITY_TARGET=""
             prompt_value REALITY_TARGET 'Replacement REALITY target' '' domain_is_valid
             break
             ;;
+          \?)
+            print_reality_target_audit_details
+            ;;
           *)
-            warn 'Answer yes to use this target or no to enter another one.'
+            warn 'Choose K to keep, T to try another target, or ? for details.'
             ;;
         esac
       done
