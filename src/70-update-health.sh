@@ -139,7 +139,7 @@ redact_health_stream() {
     -e 's/\[[0-9a-fA-F]*:[0-9a-fA-F:]*\]/[IPv6-REDACTED]/g' \
     -e 's/(^|[^0-9a-fA-F:])([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}([^0-9a-fA-F:]|$)/\1[IPv6-REDACTED]\3/g' \
     -e 's/(^|[^0-9a-fA-F:])([0-9a-fA-F]{0,4}:){1,7}:[0-9a-fA-F]{0,4}([^0-9a-fA-F:]|$)/\1[IPv6-REDACTED]\3/g' \
-    -e 's/((password|private_key|public_key|short_id|secret|token|pbk|sid)[^:=]*[:=][[:space:]]*)[^, }"]+/\1[REDACTED]/Ig' || status=$?
+    -e 's/(^|[^[:alnum:]_])((password|private_key|public_key|short_id|secret|token|pbk|sid)"?[[:space:]]*[:=][[:space:]]*"?)[^, }"]+/\1\2[REDACTED]/Ig' || status=$?
   rm -f -- "$literals_file"
   return "$status"
 }

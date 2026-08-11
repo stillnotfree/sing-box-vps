@@ -105,6 +105,7 @@ grep -Fq 'Provider firewall: UNKNOWN' <<<"$short_output"
 [[ "$short_output" != *$'\033['* ]]
 
 verbose_output="$(render_health_verbose | redact_health_stream)"
+grep -Fq 'Server-side health: HEALTHY' <<<"$verbose_output"
 for section in SYSTEM VPN NETWORK TLS 'REALITY TARGET (VPS -> TARGET)' SECURITY \
   'RECENT ACTIONABLE ERRORS'; do
   grep -Fxq "$section" <<<"$verbose_output"
@@ -454,6 +455,7 @@ TLS_DOMAIN="$fake_domain"
 REALITY_TARGET='reality-secret.example.net'
 redacted_output="$(printf '%s\n' \
   "$fake_uuid $fake_ip $fake_ipv6 $fake_domain $REALITY_TARGET $fake_token private_key=$fake_key" \
+  'Server-side health: HEALTHY' \
   'net.core.default_qdisc net.core.rmem_max net.core.wmem_max net.ipv4.tcp_congestion_control' \
   'sing-box.service nginx.service nftables.service certbot.timer systemd[123] sing-box[627]' \
   'MAC 52:54:00:12:34:56 PID 123 integer 627' | \
@@ -468,6 +470,7 @@ for literal in net.core.default_qdisc net.core.rmem_max net.core.wmem_max \
   'integer 627'; do
   [[ "$redacted_output" == *"$literal"* ]]
 done
+[[ "$redacted_output" == *'Server-side health: HEALTHY'* ]]
 
 for adjacent_ipv4_input in \
   '198.51.100.10 203.0.113.20 192.0.2.30' \

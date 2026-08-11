@@ -552,10 +552,15 @@ if grep -Fq 'Open one more new SSH session' <<<"$finalize_body"; then
   exit 1
 fi
 configure_auto_body="$(declare -f configure_auto_finalization)"
+grep -Fq 'ensure_sshd_runtime_directory' <<<"$configure_auto_body"
 grep -Fq '/usr/sbin/sshd -t' <<<"$configure_auto_body"
 grep -Fq '/usr/sbin/sshd -T -C' <<<"$configure_auto_body"
 grep -Fq 'forcecommand ${AUTO_FINALIZE_WRAPPER}' <<<"$configure_auto_body"
 grep -Fq 'reload_ssh_runtime' <<<"$configure_auto_body"
+ensure_sshd_runtime_body="$(declare -f ensure_sshd_runtime_directory)"
+grep -Fq "local runtime_dir='/run/sshd'" <<<"$ensure_sshd_runtime_body"
+grep -Fq '[[ -d "$runtime_dir" && ! -L "$runtime_dir" ]]' <<<"$ensure_sshd_runtime_body"
+grep -Fq 'install -d -o root -g root -m 0755 "$runtime_dir"' <<<"$ensure_sshd_runtime_body"
 create_admin_body="$(declare -f create_admin_account)"
 grep -Fq 'sudo -u "$ADMIN_USER" sudo -n /bin/true' <<<"$create_admin_body"
 grep -Fq 'path_has_symlink_component "$user_home"' <<<"$create_admin_body"

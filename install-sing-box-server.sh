@@ -3764,6 +3764,16 @@ Match all
 EOF
 }
 
+ensure_sshd_runtime_directory() {
+  local runtime_dir='/run/sshd'
+
+  if [[ -e "$runtime_dir" ]]; then
+    [[ -d "$runtime_dir" && ! -L "$runtime_dir" ]] || \
+      die "Refusing to use unexpected SSH runtime path: ${runtime_dir}"
+  fi
+  install -d -o root -g root -m 0755 "$runtime_dir"
+}
+
 reload_ssh_runtime() {
   if systemctl is-active --quiet ssh.service; then
     systemctl reload ssh.service
@@ -3796,6 +3806,7 @@ remove_auto_finalization() {
     restore_required=1
   fi
 
+  ensure_sshd_runtime_directory
   if ! /usr/sbin/sshd -t; then
     if (( restore_required == 1 )); then
       mv -- "$AUTO_FINALIZE_REMOVAL_STAGE" "$AUTO_FINALIZE_SSH_DROPIN"
@@ -3839,6 +3850,7 @@ configure_auto_finalization() {
       die "Refusing to replace an unmanaged SSH configuration: ${AUTO_FINALIZE_SSH_DROPIN}"
   fi
 
+  ensure_sshd_runtime_directory
   install -d -o root -g root -m 0755 "$(dirname "$AUTO_FINALIZE_WRAPPER")"
   wrapper_candidate="$(mktemp)"
   render_auto_finalize_wrapper "$wrapper_candidate"
@@ -3890,6 +3902,7 @@ lockdown_ssh() {
     die 'Admin authorized_keys is missing or unsafe.'
   ssh-keygen -l -f "$authorized_keys" >/dev/null
 
+  ensure_sshd_runtime_directory
   candidate="$(mktemp)"
   cat >"$candidate" <<EOF
 # Managed by VPN setup. Applied only after verified key login.
@@ -4103,7 +4116,7 @@ redact_health_stream() {
     -e 's/\[[0-9a-fA-F]*:[0-9a-fA-F:]*\]/[IPv6-REDACTED]/g' \
     -e 's/(^|[^0-9a-fA-F:])([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}([^0-9a-fA-F:]|$)/\1[IPv6-REDACTED]\3/g' \
     -e 's/(^|[^0-9a-fA-F:])([0-9a-fA-F]{0,4}:){1,7}:[0-9a-fA-F]{0,4}([^0-9a-fA-F:]|$)/\1[IPv6-REDACTED]\3/g' \
-    -e 's/((password|private_key|public_key|short_id|secret|token|pbk|sid)[^:=]*[:=][[:space:]]*)[^, }"]+/\1[REDACTED]/Ig' || status=$?
+    -e 's/(^|[^[:alnum:]_])((password|private_key|public_key|short_id|secret|token|pbk|sid)"?[[:space:]]*[:=][[:space:]]*"?)[^, }"]+/\1\2[REDACTED]/Ig' || status=$?
   rm -f -- "$literals_file"
   return "$status"
 }
