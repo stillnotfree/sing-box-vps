@@ -1,7 +1,32 @@
 validate_client_name() {
   local value="$1"
   [[ "$value" =~ ^[A-Za-z][A-Za-z0-9._-]{0,31}$ ]] || \
-    die 'Client name must start with a letter and contain only A-Z, a-z, 0-9, dot, underscore, or hyphen (maximum 32 characters).'
+    cli_error 'Client name must start with a letter and contain only A-Z, a-z, 0-9, dot, underscore, or hyphen (maximum 32 characters).'
+}
+
+require_client_name_available() {
+  local name="$1" existing_client="$2"
+  [[ -z "$existing_client" ]] || \
+    cli_error "Client ${name} already exists (names are case-insensitive)."
+}
+
+require_existing_client() {
+  local name="$1" existing_client="$2"
+  [[ -n "$existing_client" ]] || cli_error "Client ${name} does not exist."
+}
+
+append_client_to_database() {
+  local database="$1" client="$2" output="$3"
+  jq --argjson client "$client" '.clients += [$client]' "$database" >"$output"
+  validate_client_database "$output"
+}
+
+remove_client_from_database() {
+  local database="$1" name="$2" output="$3"
+  jq --arg name "$name" \
+    '.clients |= map(select((.name | ascii_downcase) != ($name | ascii_downcase)))' \
+    "$database" >"$output"
+  validate_client_database "$output"
 }
 
 validate_client_database() {
@@ -420,34 +445,33 @@ reconcile_managed_runtime() {
 client_add() {
   local candidate uuid hy2 token client
   require_client_runtime
+  validate_client_name "$CLIENT_NAME"
   acquire_operation_lock
   require_client_runtime
-  validate_client_name "$CLIENT_NAME"
   exec 9>"$CLIENT_LOCK_FILE"
   flock -x 9
+  require_client_name_available "$CLIENT_NAME" "$(find_client_json "$CLIENT_NAME")"
 
-  if [[ -n "$(find_client_json "$CLIENT_NAME")" ]]; then
-    die "Client ${CLIENT_NAME} already exists (names are case-insensitive)."
-  fi
-
+  CURRENT_STEP='client add transaction'
   new_temp_dir
   candidate="${TMP_DIR}/clients.candidate.json"
   uuid="$(cat /proc/sys/kernel/random/uuid)"
   hy2="$(openssl rand -hex 24)"
   token="$(openssl rand -hex 32)"
-  jq \
+  client="$(jq -cn \
     --arg name "$CLIENT_NAME" \
     --arg uuid "$uuid" \
     --arg hy2 "$hy2" \
     --arg token "$token" \
     --arg created "$(date --iso-8601=seconds)" \
-    '.clients += [{
+    '{
       name: $name,
       vless_uuid: $uuid,
       hy2_password: $hy2,
       subscription_token: $token,
       created_at: $created
-    }]' "$CLIENTS_FILE" >"$candidate"
+    }')"
+  append_client_to_database "$CLIENTS_FILE" "$client" "$candidate"
   apply_client_database "$candidate"
   log "Client ${CLIENT_NAME} added with independent VLESS and Hysteria2 credentials."
   client="$(find_client_json "$CLIENT_NAME")"
@@ -570,18 +594,32 @@ activate_subscription_tree() {
   local staged="$1" new_root="${SUBSCRIPTION_ROOT}.new.$$" old_root="${SUBSCRIPTION_ROOT}.old.$$" file
   [[ -d "$staged" ]] || return 1
   getent passwd www-data >/dev/null 2>&1 || return 1
-  install -d -o root -g root -m 0755 "$(dirname "$SUBSCRIPTION_ROOT")"
-  rm -rf -- "$new_root" "$old_root"
-  install -d -o root -g www-data -m 0750 "$new_root"
+  if ! install -d -o root -g root -m 0755 "$(dirname "$SUBSCRIPTION_ROOT")"; then
+    return 1
+  fi
+  if ! rm -rf -- "$new_root" "$old_root"; then
+    return 1
+  fi
+  if ! install -d -o root -g www-data -m 0750 "$new_root"; then
+    rm -rf -- "$new_root"
+    return 1
+  fi
   while IFS= read -r -d '' file; do
-    install -o root -g www-data -m 0640 "$file" "${new_root}/$(basename "$file")"
+    if ! install -o root -g www-data -m 0640 "$file" "${new_root}/$(basename "$file")"; then
+      rm -rf -- "$new_root"
+      return 1
+    fi
   done < <(find "$staged" -maxdepth 1 -type f -print0)
 
   if [[ -d "$SUBSCRIPTION_ROOT" ]]; then
-    mv -- "$SUBSCRIPTION_ROOT" "$old_root" || return 1
+    if ! mv -- "$SUBSCRIPTION_ROOT" "$old_root"; then
+      rm -rf -- "$new_root"
+      return 1
+    fi
   fi
   if ! mv -- "$new_root" "$SUBSCRIPTION_ROOT"; then
     [[ ! -d "$old_root" ]] || mv -- "$old_root" "$SUBSCRIPTION_ROOT"
+    rm -rf -- "$new_root"
     return 1
   fi
   rm -rf -- "$old_root"
@@ -682,7 +720,7 @@ subscription_service_healthy() {
   # Pass the bearer-token URL through curl's stdin config so it never appears
   # in the process argument list visible to other local users.
   links_payload="$(printf 'url = "%s"\n' "$url" | curl --noproxy '*' \
-    --fail --silent --show-error --connect-timeout 10 \
+    --fail --silent --show-error --connect-timeout 10 --max-time 15 \
     --resolve "${TLS_DOMAIN}:${SUBSCRIPTION_PORT}:127.0.0.1" \
     --user-agent 'Shadowrocket' --config -)" || return 1
   decoded_links="$(printf '%s' "$links_payload" | base64 --decode 2>/dev/null)" || return 1
@@ -695,7 +733,7 @@ subscription_service_healthy() {
     return 1
   fi
   mihomo_payload="$(printf 'url = "%s"\n' "$url" | curl --noproxy '*' \
-    --fail --silent --show-error --connect-timeout 10 \
+    --fail --silent --show-error --connect-timeout 10 --max-time 15 \
     --resolve "${TLS_DOMAIN}:${SUBSCRIPTION_PORT}:127.0.0.1" \
     --user-agent 'FlClash' --config -)" || return 1
   jq -e --arg fingerprint "$CLIENT_FINGERPRINT" --arg hy2_obfs_mode "$HY2_OBFS_MODE" \
@@ -746,28 +784,28 @@ client_show() {
   exec 9>"$CLIENT_LOCK_FILE"
   flock -s 9
   client="$(find_client_json "$CLIENT_NAME")"
-  [[ -n "$client" ]] || die "Client ${CLIENT_NAME} does not exist."
+  require_existing_client "$CLIENT_NAME" "$client"
   show_client_material "$client"
 }
 
 client_delete() {
-  local candidate stored_name count
-  require_client_runtime
-  acquire_operation_lock
+  local candidate stored_name count existing_client
   require_client_runtime
   validate_client_name "$CLIENT_NAME"
+  acquire_operation_lock
+  require_client_runtime
   exec 9>"$CLIENT_LOCK_FILE"
   flock -x 9
-  stored_name="$(find_client_json "$CLIENT_NAME" | jq -r '.name')"
-  [[ -n "$stored_name" ]] || die "Client ${CLIENT_NAME} does not exist."
+  existing_client="$(find_client_json "$CLIENT_NAME")"
+  require_existing_client "$CLIENT_NAME" "$existing_client"
+  stored_name="$(jq -r '.name' <<<"$existing_client")"
   count="$(jq '.clients | length' "$CLIENTS_FILE")"
-  (( count > 1 )) || die 'Refusing to delete the last VPN client. Add a replacement client first.'
+  (( count > 1 )) || cli_error 'Refusing to delete the last VPN client. Add a replacement client first.'
 
+  CURRENT_STEP='client delete transaction'
   new_temp_dir
   candidate="${TMP_DIR}/clients.candidate.json"
-  jq --arg name "$stored_name" \
-    '.clients |= map(select((.name | ascii_downcase) != ($name | ascii_downcase)))' \
-    "$CLIENTS_FILE" >"$candidate"
+  remove_client_from_database "$CLIENTS_FILE" "$stored_name" "$candidate"
   apply_client_database "$candidate"
   log "Client ${stored_name} deleted; its VLESS UUID and Hysteria2 password are no longer accepted."
 }
@@ -802,19 +840,36 @@ restore_target_transaction() {
 
 set_reality_target() {
   local old_target candidate_settings candidate_config candidate_subscriptions old_subscriptions
-  local settings_backup config_backup failed=0
+  local settings_backup config_backup previous_audit_target audit_status=0 failed=0
   require_client_runtime
-  validate_domain "$NEW_REALITY_TARGET"
+  domain_is_valid "$NEW_REALITY_TARGET" || \
+    cli_error "Invalid fully qualified domain: $NEW_REALITY_TARGET"
   old_target="$REALITY_TARGET"
   if [[ "$NEW_REALITY_TARGET" == "$old_target" ]]; then
     printf 'REALITY target is already %s; nothing changed.\n' "$old_target"
     return
   fi
 
+  previous_audit_target="$AUDIT_TARGET"
+  AUDIT_TARGET="$NEW_REALITY_TARGET"
+  if audit_reality_target; then
+    audit_status=0
+  else
+    audit_status=$?
+  fi
+  AUDIT_TARGET="$previous_audit_target"
+  if (( audit_status == 2 )); then
+    cli_error "REALITY target ${NEW_REALITY_TARGET} failed the shared audit; no changes were made."
+  fi
+
   printf 'REALITY target change: %s -> %s\n' "$old_target" "$NEW_REALITY_TARGET"
   printf 'All client subscriptions will be regenerated; their URLs will stay unchanged.\n'
+  if (( audit_status == 1 )); then
+    printf 'The target is usable but has the comparison-heuristic warning shown above.\n'
+  fi
   require_confirmation
 
+  CURRENT_STEP='REALITY target transaction'
   acquire_operation_lock
   load_settings
   require_client_runtime
@@ -838,7 +893,6 @@ set_reality_target() {
   install -o root -g root -m 0600 "$CONFIG_FILE" "$config_backup"
 
   REALITY_TARGET="$NEW_REALITY_TARGET"
-  verify_reality_target
   render_settings "$candidate_settings"
   build_sing_box_config "$CLIENTS_FILE" "$candidate_config"
   render_subscription_tree "$CLIENTS_FILE" "$candidate_subscriptions"
@@ -906,6 +960,7 @@ set_client_fingerprint() {
   printf 'Connected clients keep their current profile until their subscription is refreshed.\n'
   require_confirmation
 
+  CURRENT_STEP='client fingerprint transaction'
   acquire_operation_lock
   load_settings
   require_client_runtime
@@ -989,6 +1044,7 @@ set_hy2_obfs() {
   printf 'Subscription URLs will stay unchanged, but every Hysteria2 client must refresh.\n'
   require_confirmation
 
+  CURRENT_STEP='Hysteria2 obfuscation transaction'
   acquire_operation_lock
   load_settings
   require_client_runtime

@@ -5,7 +5,7 @@ main() {
       ;;
     *)
       usage >&2
-      die "Unknown command: $COMMAND"
+      cli_error "Unknown command: $COMMAND"
       ;;
   esac
   case "$COMMAND" in
@@ -35,7 +35,9 @@ main() {
       self_update_from_file
       ;;
     health)
-      if (( VERBOSE == 1 )); then
+      if (( DEBUG == 1 )); then
+        health_debug || exit 1
+      elif (( VERBOSE == 1 )); then
         health_details || exit 1
       else
         health_check || exit 1
@@ -66,7 +68,7 @@ main() {
       client_list
       ;;
     audit-target)
-      audit_reality_target || exit 1
+      audit_reality_target || exit $?
       ;;
     set-target)
       set_reality_target
@@ -82,7 +84,7 @@ main() {
       ;;
     *)
       usage >&2
-      die "Unknown command: $COMMAND"
+      cli_error "Unknown command: $COMMAND"
       ;;
   esac
 }
