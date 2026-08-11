@@ -479,7 +479,7 @@ for adjacent_ipv4_input in \
   [[ "$(grep -o '\[IP-REDACTED\]' <<<"$adjacent_ipv4_output" | wc -l | tr -d ' ')" == 3 ]]
 done
 
-health_reset_state
+seed_healthy_health_state
 health_classify_ntp_state no 120
 [[ "$HEALTH_CLOCK_STATE" == PENDING ]]
 [[ "$HEALTH_CLOCK_DETAIL" == 'waiting for NTP synchronization' ]]
