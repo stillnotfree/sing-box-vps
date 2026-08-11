@@ -488,14 +488,15 @@ health_collect_certificate() {
     HEALTH_RENEWAL_DETAIL+=" · hook $([[ $hook_ok == 1 ]] && printf PASS || printf FAIL)"
     HEALTH_RENEWAL_DETAIL+=" · sync $([[ $sync_ok == 1 ]] && printf PASS || printf FAIL)"
   fi
-  if health_live_subscription_certificate_matches; then
+  if health_live_subscription_certificate_matches \
+      "/etc/letsencrypt/live/${TLS_DOMAIN}/fullchain.pem"; then
     HEALTH_LIVE_CERT_STATE=PASS
     HEALTH_LIVE_CERT_DETAIL='subscription endpoint serves current ACME certificate'
   fi
 }
 
 health_live_subscription_certificate_matches() {
-  local expected_certificate="${1:-/etc/letsencrypt/live/${TLS_DOMAIN}/fullchain.pem}"
+  local expected_certificate="$1"
   local transcript served_pem expected_der served_der status=0
   [[ -r "$expected_certificate" ]] || return 1
   if [[ -z "$TMP_DIR" || ! -d "$TMP_DIR" ]]; then

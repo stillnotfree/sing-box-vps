@@ -733,7 +733,7 @@ verify_certificate_automation() {
   certificate_key_pair_matches "${CERT_DIR}/fullchain.pem" "${CERT_DIR}/privkey.pem" || die 'Deployed certificate and private key do not match.'
   cmp -s "${live_dir}/fullchain.pem" "${CERT_DIR}/fullchain.pem" || die 'Deployed certificate differs from the current ACME certificate.'
   cmp -s "${live_dir}/privkey.pem" "${CERT_DIR}/privkey.pem" || die 'Deployed private key differs from the current ACME private key.'
-  health_live_subscription_certificate_matches || \
+  health_live_subscription_certificate_matches "${live_dir}/fullchain.pem" || \
     die 'The subscription endpoint is not serving the current ACME certificate.'
 }
 

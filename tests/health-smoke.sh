@@ -260,7 +260,7 @@ fi
   health_reality_target_dns_probe() { return 0; }
   health_reality_target_tcp_probe() { return 0; }
   timeout() { shift; "$@"; }
-  # shellcheck disable=SC2329 # Invoked indirectly through the timeout test seam.
+  # shellcheck disable=SC2317,SC2329 # Invoked indirectly through the timeout test seam.
   openssl() {
     printf '%s\n' \
       'New, TLSv1.3, Cipher is TLS_AES_128_GCM_SHA256' \
@@ -317,7 +317,7 @@ fi
   health_reality_target_dns_probe() { return 0; }
   health_reality_target_tcp_probe() { return 0; }
   timeout() { shift; "$@"; }
-  # shellcheck disable=SC2329 # Invoked indirectly through the timeout test seam.
+  # shellcheck disable=SC2317,SC2329 # Invoked indirectly through the timeout test seam.
   openssl() {
     printf '%s\n' \
       'New, TLSv1.3, Cipher is TLS_AES_128_GCM_SHA256' \
@@ -340,7 +340,7 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj '/CN=stale.example' \
   TMP_DIR="${work}/live-cert-match"
   mkdir -p "$TMP_DIR"
   served_source="${work}/expected.pem"
-  # shellcheck disable=SC2329 # Invoked by the sourced certificate probe.
+  # shellcheck disable=SC2317,SC2329 # Invoked by the sourced certificate probe.
   timeout() { cat "$served_source"; }
   health_live_subscription_certificate_matches "${work}/expected.pem"
 )
@@ -348,7 +348,7 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj '/CN=stale.example' \
   TMP_DIR="${work}/live-cert-mismatch"
   mkdir -p "$TMP_DIR"
   served_source="${work}/stale.pem"
-  # shellcheck disable=SC2329 # Invoked by the sourced certificate probe.
+  # shellcheck disable=SC2317,SC2329 # Invoked by the sourced certificate probe.
   timeout() { cat "$served_source"; }
   if health_live_subscription_certificate_matches "${work}/expected.pem"; then
     printf 'A stale served certificate unexpectedly matched the deployed certificate.\n' >&2
