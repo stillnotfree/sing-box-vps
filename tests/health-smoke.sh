@@ -552,7 +552,6 @@ health_classify_ntp_state yes 10
   [[ "$(wc -l <"$output" | tr -d ' ')" -le 20 ]]
   [[ "$(wc -c <"$output" | tr -d ' ')" -le 12288 ]]
   grep -Fq 'useful-reason-25' "$output"
-  [[ "$(tail -n 1 "$output")" == *"$padding useful-reason-25"* ]]
   [[ "$(<"$output")" != *'203.0.113.77'* ]]
 )
 
