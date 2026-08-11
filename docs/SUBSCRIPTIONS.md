@@ -104,11 +104,13 @@ local health check; and restore the previous state on any failure. The stable
 subscription URL does not change, so the user only presses Update in the client.
 
 `audit-target` uses the configured target when `DOMAIN` is omitted. It performs
-a read-only TLS 1.3/h2 probe and looks for post-handshake `NewSessionTicket`
+a read-only probe from the VPS to the target for TLS 1.3/h2 and looks for
+post-handshake `NewSessionTicket`
 messages, following the detection insight demonstrated by Aparecium. No
 observed tickets returns success; observed tickets return a non-zero status and
 identify a comparison signal for that specific active-probing method. Neither
-result is a general censorship-resistance guarantee.
+result tests the client-to-VPS path or provides a general censorship-resistance
+guarantee.
 
 Fresh interactive installations run this audit before persisting the selected
 target. A failed TLS 1.3/h2 requirement asks for another target; an observed
@@ -126,7 +128,10 @@ because the REALITY server inbound has no client-fingerprint setting.
 The cross-format compatibility set is `chrome`, `firefox`, `safari`, `ios`,
 `android`, `edge`, `360`, `qq`, and `random`. `randomized` is excluded because
 current Mihomo documentation does not list it, even though Xray and sing-box do.
-The installer does not rotate fingerprints automatically.
+The installer does not rotate fingerprints automatically. Treat a fingerprint
+as a controlled client-compatibility A/B knob. Check the endpoint/IP path,
+TCP/443 reachability, and client implementation before attributing a failure to
+the fingerprint.
 
 `set-obfs` is a global Hysteria2 cutover. It stages settings, the sing-box
 server configuration, and all subscription representations; validates the

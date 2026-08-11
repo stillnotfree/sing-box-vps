@@ -720,7 +720,7 @@ subscription_service_healthy() {
   # Pass the bearer-token URL through curl's stdin config so it never appears
   # in the process argument list visible to other local users.
   links_payload="$(printf 'url = "%s"\n' "$url" | curl --noproxy '*' \
-    --fail --silent --show-error --connect-timeout 10 \
+    --fail --silent --show-error --connect-timeout 10 --max-time 15 \
     --resolve "${TLS_DOMAIN}:${SUBSCRIPTION_PORT}:127.0.0.1" \
     --user-agent 'Shadowrocket' --config -)" || return 1
   decoded_links="$(printf '%s' "$links_payload" | base64 --decode 2>/dev/null)" || return 1
@@ -733,7 +733,7 @@ subscription_service_healthy() {
     return 1
   fi
   mihomo_payload="$(printf 'url = "%s"\n' "$url" | curl --noproxy '*' \
-    --fail --silent --show-error --connect-timeout 10 \
+    --fail --silent --show-error --connect-timeout 10 --max-time 15 \
     --resolve "${TLS_DOMAIN}:${SUBSCRIPTION_PORT}:127.0.0.1" \
     --user-agent 'FlClash' --config -)" || return 1
   jq -e --arg fingerprint "$CLIENT_FINGERPRINT" --arg hy2_obfs_mode "$HY2_OBFS_MODE" \

@@ -51,6 +51,14 @@ Connect to the VPS as `root` and run:
 wget -qO vpn-install.sh https://raw.githubusercontent.com/stillnotfree/sing-box-vps/main/install-sing-box-server.sh && chmod 700 vpn-install.sh && ./vpn-install.sh install
 ```
 
+This convenience command downloads mutable `main` and executes the result as
+root. That is a bootstrap trust boundary, not an independently verified release.
+For a reviewed deployment, download a versioned release or reviewed commit,
+obtain its SHA-256 through a separately trusted channel, verify it locally,
+inspect the script, and only then execute it. A checksum downloaded from the
+same mutable source is not an independent trust anchor. See
+[development verification](docs/development.md#clean-install-and-release-evidence).
+
 The installer asks for the administrator, public SSH key, VPS address, domain,
 email, current SSH port, REALITY target, VPS country, and client fingerprint. It
 shows a short summary and asks for confirmation with `[Y/n]`; pressing Enter
@@ -136,10 +144,16 @@ Do not share this output: the links contain client credentials.
 The installed `vpn` command obtains its required administrative privileges
 automatically. You do not need to prefix it with `sudo`.
 
-`vpn health` is the short operational result. `--verbose` expands it into
-semantic SYSTEM, VPN, NETWORK, TLS, SECURITY, and RECENT ACTIONABLE ERRORS
-sections without raw system dumps. `--debug` adds bounded low-level listener,
-qdisc, interface, certificate, systemd, and journal data. Known invalid
+`vpn health` is the short server-side operational result. It always reports
+client-path reachability as `NOT TESTED` and the provider firewall as `UNKNOWN`;
+neither changes a successful exit code. `--verbose` expands the result into
+semantic SYSTEM, VPN, NETWORK, TLS, VPS-to-REALITY-target, SECURITY, and RECENT
+ACTIONABLE ERRORS sections without raw system dumps. It distinguishes the
+managed sing-box version, config validation, service, TCP/UDP listeners, local
+nftables, local subscription endpoint, DNS/certificate state, the certificate
+actually served by nginx, and bounded VPS-to-target DNS/TCP/TLS/ALPN probes.
+`--debug` adds bounded low-level listener, qdisc, interface, certificate,
+systemd, and journal data. Known invalid
 REALITY handshakes are treated as unauthenticated inbound noise, not a server
 failure; only debug output includes redacted bounded samples and 30-minute
 counts. Sensitive values remain redacted in both diagnostic modes.
@@ -191,6 +205,29 @@ split tunneling, and GeoIP policy remain the responsibility of the client.
 
 See [docs/SUBSCRIPTIONS.md](docs/SUBSCRIPTIONS.md) for compatibility details and
 the subscription threat model.
+
+## Connectivity troubleshooting
+
+`vpn health` proves only the managed server-side state. It cannot prove that an
+IP or protocol is reachable from a Russian network, that a provider firewall is
+open, or that traffic passes a particular ISP's filtering.
+
+1. Run `vpn health`, then `vpn health --verbose` if a server-side row fails.
+2. If the server is healthy, test the same VPS/IP from another access network.
+3. Test REALITY TCP/443 and Hysteria2 UDP/443 independently; they have different
+   failure domains.
+4. Check SSH or other traffic to the same IP.
+5. Compare another IP, VPS, or hoster while keeping protocol settings unchanged.
+6. Only then compare client implementations and protocol-specific settings.
+7. Treat the fingerprint as a controlled A/B compatibility knob, not a bypass
+   guarantee. Check IP/path, TCP/443, and client behavior first.
+8. Investigate MTU only for matching timeout/stall symptoms; do not guess or
+   change it globally without a reproduced case.
+
+A working Hysteria2 connection does not prove that REALITY, TCP/443, or the
+server IP is universally unblocked. A successful handshake also does not prove
+a usable tunnel. The field evidence behind this model is summarized in
+[docs/research/russia-network-findings.md](docs/research/russia-network-findings.md).
 
 ## Limitations
 

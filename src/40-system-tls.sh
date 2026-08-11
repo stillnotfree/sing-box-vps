@@ -682,6 +682,29 @@ fi
 if ! systemctl reload "\$nginx_service" || ! systemctl is-active --quiet "\$nginx_service"; then
   exit 1
 fi
+
+# A successful reload is not proof that nginx serves the renewed certificate.
+# Compare the leaf certificate from a bounded local TLS handshake with the new
+# ACME leaf before accepting the deployment transaction.
+served_transcript="\${work_dir}/served-transcript"
+served_pem="\${work_dir}/served.pem"
+served_der="\${work_dir}/served.der"
+expected_der="\${work_dir}/expected.der"
+if ! (ulimit -f 256; timeout 10 openssl s_client \
+    -connect '127.0.0.1:${SUBSCRIPTION_PORT}' -servername '${TLS_DOMAIN}' \
+    -verify_hostname '${TLS_DOMAIN}' -verify_return_error -showcerts \
+    </dev/null >"\$served_transcript" 2>&1); then
+  exit 1
+fi
+LC_ALL=C awk '
+  /-----BEGIN CERTIFICATE-----/ { copying=1 }
+  copying { print }
+  /-----END CERTIFICATE-----/ { exit }
+' "\$served_transcript" >"\$served_pem"
+[ -s "\$served_pem" ]
+openssl x509 -in "\${work_dir}/new-fullchain.pem" -outform DER >"\$expected_der"
+openssl x509 -in "\$served_pem" -outform DER >"\$served_der"
+cmp -s "\$expected_der" "\$served_der"
 commit_active=0
 EOF
   sh -n "$candidate" || die 'Generated certificate deploy hook failed shell syntax validation.'
@@ -710,6 +733,8 @@ verify_certificate_automation() {
   certificate_key_pair_matches "${CERT_DIR}/fullchain.pem" "${CERT_DIR}/privkey.pem" || die 'Deployed certificate and private key do not match.'
   cmp -s "${live_dir}/fullchain.pem" "${CERT_DIR}/fullchain.pem" || die 'Deployed certificate differs from the current ACME certificate.'
   cmp -s "${live_dir}/privkey.pem" "${CERT_DIR}/privkey.pem" || die 'Deployed private key differs from the current ACME private key.'
+  health_live_subscription_certificate_matches || \
+    die 'The subscription endpoint is not serving the current ACME certificate.'
 }
 
 smoke_test_certificate_hook() {

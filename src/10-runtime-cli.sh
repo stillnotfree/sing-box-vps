@@ -392,6 +392,10 @@ Install options (missing values are requested interactively):
   -h, --help               Show this help.
 
 The default command is "plan". Both "plan" and "check" are read-only.
+Health reports managed server-side state only. Client-path reachability is
+always NOT TESTED and the provider firewall is UNKNOWN without an external
+probe. For connectivity failures, compare access networks and test TCP/443 and
+UDP/443 separately before changing fingerprints or protocol settings.
 EOF
 }
 

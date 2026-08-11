@@ -227,9 +227,19 @@ health_reset_state() {
   HEALTH_CERT_DETAIL='certificate unavailable'
   HEALTH_CERT_HOSTNAME_STATE=FAIL
   HEALTH_CERT_KEYPAIR_STATE=FAIL
+  HEALTH_LIVE_CERT_STATE=FAIL
+  HEALTH_LIVE_CERT_DETAIL='served certificate unavailable'
   HEALTH_RENEWAL_STATE=FAIL
   HEALTH_RENEWAL_DETAIL='renewal checks failed'
   HEALTH_TARGET_STATE=FAIL
+  HEALTH_TARGET_DNS_STATE=FAIL
+  HEALTH_TARGET_DNS_DETAIL='target DNS resolution failed'
+  HEALTH_TARGET_TCP_STATE=FAIL
+  HEALTH_TARGET_TCP_DETAIL='outbound tcp/443 connection failed'
+  HEALTH_TARGET_TLS_STATE=FAIL
+  HEALTH_TARGET_TLS_DETAIL='TLS 1.3 or certificate/SNI verification failed'
+  HEALTH_TARGET_ALPN_STATE=FAIL
+  HEALTH_TARGET_ALPN_DETAIL='ALPN h2 was not negotiated'
   HEALTH_FIREWALL_STATE=FAIL
   HEALTH_SSH_STATE=FAIL
   HEALTH_PERMISSIONS_STATE=FAIL
@@ -478,6 +488,42 @@ health_collect_certificate() {
     HEALTH_RENEWAL_DETAIL+=" · hook $([[ $hook_ok == 1 ]] && printf PASS || printf FAIL)"
     HEALTH_RENEWAL_DETAIL+=" · sync $([[ $sync_ok == 1 ]] && printf PASS || printf FAIL)"
   fi
+  if health_live_subscription_certificate_matches; then
+    HEALTH_LIVE_CERT_STATE=PASS
+    HEALTH_LIVE_CERT_DETAIL='subscription endpoint serves current ACME certificate'
+  fi
+}
+
+health_live_subscription_certificate_matches() {
+  local expected_certificate="${1:-/etc/letsencrypt/live/${TLS_DOMAIN}/fullchain.pem}"
+  local transcript served_pem expected_der served_der status=0
+  [[ -r "$expected_certificate" ]] || return 1
+  if [[ -z "$TMP_DIR" || ! -d "$TMP_DIR" ]]; then
+    new_temp_dir
+  fi
+  transcript="$(mktemp "${TMP_DIR}/health-live-cert.XXXXXX")"
+  served_pem="$(mktemp "${TMP_DIR}/health-live-cert-pem.XXXXXX")"
+  expected_der="$(mktemp "${TMP_DIR}/health-expected-cert-der.XXXXXX")"
+  served_der="$(mktemp "${TMP_DIR}/health-served-cert-der.XXXXXX")"
+  chmod 0600 "$transcript" "$served_pem" "$expected_der" "$served_der"
+  if (ulimit -f 256; timeout 10 openssl s_client \
+      -connect "127.0.0.1:${SUBSCRIPTION_PORT}" -servername "$TLS_DOMAIN" \
+      -verify_hostname "$TLS_DOMAIN" -verify_return_error -showcerts \
+      </dev/null >"$transcript" 2>&1); then
+    status=0
+  else
+    status=$?
+  fi
+  (( status == 0 )) || return 1
+  LC_ALL=C awk '
+    /-----BEGIN CERTIFICATE-----/ { copying=1 }
+    copying { print }
+    /-----END CERTIFICATE-----/ { exit }
+  ' "$transcript" >"$served_pem"
+  [[ -s "$served_pem" ]] || return 1
+  openssl x509 -in "$expected_certificate" -outform DER >"$expected_der" 2>/dev/null || return 1
+  openssl x509 -in "$served_pem" -outform DER >"$served_der" 2>/dev/null || return 1
+  cmp -s "$expected_der" "$served_der"
 }
 
 health_classify_certificate_expiry() {
@@ -504,28 +550,61 @@ health_dns_matches() {
   grep -Fxq "$expected" <<<"$second_answers"
 }
 
-health_reality_target_is_healthy() {
+health_reality_target_dns_probe() {
+  timeout 5 getent ahosts "$1" >/dev/null 2>&1
+}
+
+health_reality_target_tcp_probe() {
+  # shellcheck disable=SC2016 # $1 is expanded by the bounded child Bash.
+  timeout 5 bash -c 'exec 3<>"/dev/tcp/$1/443"' bash "$1" >/dev/null 2>&1
+}
+
+health_collect_reality_target() {
   local probe_file status=0
+  if health_reality_target_dns_probe "$REALITY_TARGET"; then
+    HEALTH_TARGET_DNS_STATE=PASS
+    HEALTH_TARGET_DNS_DETAIL='target resolved from VPS'
+  else
+    return 0
+  fi
+  if health_reality_target_tcp_probe "$REALITY_TARGET"; then
+    HEALTH_TARGET_TCP_STATE=PASS
+    HEALTH_TARGET_TCP_DETAIL='outbound tcp/443 connected'
+  else
+    return 0
+  fi
   if [[ -z "$TMP_DIR" || ! -d "$TMP_DIR" ]]; then
     new_temp_dir
   fi
   probe_file="$(mktemp "${TMP_DIR}/health-reality.XXXXXX")"
   chmod 0600 "$probe_file"
-  if timeout 15 openssl s_client -connect "${REALITY_TARGET}:443" \
+  if (ulimit -f 256; timeout 15 openssl s_client -connect "${REALITY_TARGET}:443" \
       -servername "$REALITY_TARGET" -verify_hostname "$REALITY_TARGET" \
-      -tls1_3 -alpn h2 -verify_return_error </dev/null >"$probe_file" 2>&1; then
+      -tls1_3 -alpn h2 -verify_return_error </dev/null >"$probe_file" 2>&1); then
     status=0
   else
     status=$?
   fi
-  (( status == 0 )) || return 1
-  LC_ALL=C grep -aEiq \
+  if (( status == 124 )); then
+    HEALTH_TARGET_TLS_DETAIL='bounded TLS probe timed out; censorship was not inferred'
+    return 0
+  fi
+  (( status == 0 )) || return 0
+  if LC_ALL=C grep -aEiq \
     'New,[[:space:]]*TLSv1\.3|Protocol( version)?[[:space:]]*:[[:space:]]*TLSv1\.3' \
-    "$probe_file" || return 1
-  LC_ALL=C grep -aEiq \
+    "$probe_file" && LC_ALL=C grep -aEiq \
     'Verify return code:[[:space:]]*0[[:space:]]*\(ok\)|Verification:[[:space:]]*OK' \
-    "$probe_file" || return 1
-  LC_ALL=C grep -aEiq 'ALPN protocol:[[:space:]]*h2' "$probe_file"
+    "$probe_file"; then
+    HEALTH_TARGET_TLS_STATE=PASS
+    HEALTH_TARGET_TLS_DETAIL='TLS 1.3 · certificate/SNI verified'
+  else
+    return 0
+  fi
+  if LC_ALL=C grep -aEiq 'ALPN protocol:[[:space:]]*h2' "$probe_file"; then
+    HEALTH_TARGET_ALPN_STATE=PASS
+    HEALTH_TARGET_ALPN_DETAIL='h2 negotiated'
+    HEALTH_TARGET_STATE=PASS
+  fi
 }
 
 health_write_bounded_redacted_file() {
@@ -672,7 +751,7 @@ health_collect_state() {
     HEALTH_DNS_STATE=PASS
   fi
   health_collect_certificate
-  if health_reality_target_is_healthy; then HEALTH_TARGET_STATE=PASS; fi
+  health_collect_reality_target
   if managed_firewall_is_healthy; then HEALTH_FIREWALL_STATE=PASS; fi
   if ssh_lockdown_is_effective; then HEALTH_SSH_STATE=PASS; fi
   if health_managed_permissions_are_healthy; then HEALTH_PERMISSIONS_STATE=PASS; fi
@@ -692,7 +771,8 @@ health_recalculate_result() {
     "$HEALTH_CORE_UPDATES_STATE" "$HEALTH_SECURITY_UPDATES_STATE" \
     "$HEALTH_VLESS_STATE" "$HEALTH_HY2_STATE" \
     "$HEALTH_SUBSCRIPTION_STATE" "$HEALTH_DNS_STATE" "$HEALTH_CERT_STATE" \
-    "$HEALTH_CERT_HOSTNAME_STATE" "$HEALTH_CERT_KEYPAIR_STATE" "$HEALTH_RENEWAL_STATE" \
+    "$HEALTH_CERT_HOSTNAME_STATE" "$HEALTH_CERT_KEYPAIR_STATE" "$HEALTH_LIVE_CERT_STATE" \
+    "$HEALTH_RENEWAL_STATE" \
     "$HEALTH_TARGET_STATE" "$HEALTH_FIREWALL_STATE" "$HEALTH_SSH_STATE" \
     "$HEALTH_PERMISSIONS_STATE" "$HEALTH_TCP443_STATE" "$HEALTH_UDP443_STATE" \
     "$HEALTH_TCP8443_STATE" "$HEALTH_SSH_LISTENER_STATE" "$HEALTH_CONGESTION_STATE" \
@@ -705,7 +785,7 @@ health_recalculate_result() {
 }
 
 health_result_line() {
-  printf 'Result: '
+  printf 'Server-side health: '
   if (( HEALTH_FAILURES > 0 )); then
     print_status_value UNHEALTHY
   elif (( HEALTH_WARNINGS > 0 )); then
@@ -715,6 +795,11 @@ health_result_line() {
     print_status_value HEALTHY
   fi
   printf '\n'
+}
+
+health_scope_lines() {
+  printf 'Client-path reachability: NOT TESTED · no external client probe was run\n'
+  printf 'Provider firewall: UNKNOWN · not externally verified\n'
 }
 
 health_network_detail() {
@@ -740,11 +825,12 @@ render_health_short() {
   health_print_row Subscription "$HEALTH_SUBSCRIPTION_STATE" "$(health_client_label "$HEALTH_CLIENT_COUNT")"
   health_print_row DNS/TLS "$tls_state" 'configured · DNS/certificate checked'
   health_print_row 'REALITY target' "$HEALTH_TARGET_STATE" \
-    'TLS 1.3 · certificate/SNI · ALPN h2'
+    'VPS -> target · TLS 1.3 · certificate/SNI · ALPN h2'
   health_print_row Security "$security_state" 'nftables · SSH key-only · permissions'
   health_print_row Network "$network_state" "$(health_network_detail)"
   printf '\n'
   health_result_line
+  health_scope_lines
 }
 
 render_health_verbose() {
@@ -756,6 +842,7 @@ render_health_verbose() {
 
   print_title 'VPN health'
   health_result_line
+  health_scope_lines
   print_section 'SYSTEM'
   health_print_info OS "$HEALTH_OS · Linux $HEALTH_KERNEL"
   health_print_info Uptime "$HEALTH_UPTIME"
@@ -763,20 +850,18 @@ render_health_verbose() {
   health_print_row Clock "$HEALTH_CLOCK_STATE" "$HEALTH_CLOCK_DETAIL"
 
   print_section 'VPN'
-  if [[ "$HEALTH_SERVICE_STATE" == PASS ]]; then
-    health_print_row sing-box "$(health_join_states "$HEALTH_SERVICE_STATE" "$HEALTH_VERSION_STATE")" \
-      "$HEALTH_CORE_VERSION · active"
-  else
-    health_print_row sing-box "$(health_join_states "$HEALTH_SERVICE_STATE" "$HEALTH_VERSION_STATE")" \
-      "$HEALTH_CORE_VERSION · inactive"
-  fi
+  health_print_row Version "$HEALTH_VERSION_STATE" "managed sing-box $HEALTH_CORE_VERSION"
   health_print_row Config "$HEALTH_CONFIG_STATE" 'sing-box configuration validation'
+  if [[ "$HEALTH_SERVICE_STATE" == PASS ]]; then
+    health_print_row Service PASS 'sing-box.service active'
+  else
+    health_print_row Service FAIL 'sing-box.service inactive'
+  fi
   health_print_row Runtime "$HEALTH_RUNTIME_STATE" \
     "installer $SCRIPT_VERSION · managed $HEALTH_RUNTIME_VERSION"
   health_print_row 'VLESS REALITY' "$HEALTH_VLESS_STATE" "tcp/443 · $(health_client_label "$HEALTH_VLESS_CLIENTS")"
   health_print_row Hysteria2 "$HEALTH_HY2_STATE" "udp/443 · $(health_client_label "$HEALTH_HY2_CLIENTS")"
   health_print_row Subscription "$HEALTH_SUBSCRIPTION_STATE" "$HEALTH_SUBSCRIPTION_DETAIL"
-  health_print_row 'REALITY target' "$HEALTH_TARGET_STATE" '[DOMAIN-REDACTED] · TLS 1.3/h2'
   health_print_info Fingerprint "$CLIENT_FINGERPRINT"
   health_print_info 'HY2 obfs' "$HY2_OBFS_MODE"
 
@@ -796,7 +881,15 @@ render_health_verbose() {
   health_print_row Certificate "$HEALTH_CERT_STATE" "$certificate_detail"
   [[ "$HEALTH_CERT_HOSTNAME_STATE" == PASS ]] || health_print_row Hostname FAIL 'certificate does not match configured domain'
   [[ "$HEALTH_CERT_KEYPAIR_STATE" == PASS ]] || health_print_row 'Key pair' FAIL 'certificate and private key do not match'
+  health_print_row 'Live certificate' "$HEALTH_LIVE_CERT_STATE" "$HEALTH_LIVE_CERT_DETAIL"
   health_print_row Renewal "$HEALTH_RENEWAL_STATE" "$HEALTH_RENEWAL_DETAIL"
+
+  print_section 'REALITY TARGET (VPS -> TARGET)'
+  health_print_row DNS "$HEALTH_TARGET_DNS_STATE" "$HEALTH_TARGET_DNS_DETAIL"
+  health_print_row TCP/443 "$HEALTH_TARGET_TCP_STATE" "$HEALTH_TARGET_TCP_DETAIL"
+  health_print_row TLS "$HEALTH_TARGET_TLS_STATE" "$HEALTH_TARGET_TLS_DETAIL"
+  health_print_row ALPN "$HEALTH_TARGET_ALPN_STATE" "$HEALTH_TARGET_ALPN_DETAIL"
+  printf '  These probes do not test client-to-VPS reachability or censorship resistance.\n'
 
   print_section 'SECURITY'
   health_print_row nftables "$HEALTH_FIREWALL_STATE" 'managed vpn_filter policy'

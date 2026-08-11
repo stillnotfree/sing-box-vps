@@ -158,6 +158,30 @@ jq -e '
 HY2_OBFS_MODE="off"
 build_sing_box_config "$client_database" "${work}/sing-box-off.json"
 jq -e '
+  (.inbounds | length == 2) and
+  ([.inbounds[].type] | sort) == ["hysteria2", "vless"] and
+  ([.inbounds[].tag] | sort) == ["hysteria2-in", "vless-reality-in"] and
+  ([.outbounds[].type] | sort) == ["direct"] and
+  ([.outbounds[].tag] | sort) == ["direct"] and
+  ([.inbounds[] | select(
+    .type == "vless" and
+    .tag == "vless-reality-in" and
+    .listen == "0.0.0.0" and
+    .listen_port == 443 and
+    .tls.enabled == true and
+    .tls.reality.enabled == true and
+    .tls.reality.handshake.server_port == 443 and
+    (all(.users[]; .flow == "xtls-rprx-vision"))
+  )] | length) == 1 and
+  ([.inbounds[] | select(
+    .type == "hysteria2" and
+    .tag == "hysteria2-in" and
+    .listen == "0.0.0.0" and
+    .listen_port == 443 and
+    .tls.enabled == true and
+    .tls.min_version == "1.3" and
+    .tls.alpn == ["h3"]
+  )] | length) == 1 and
   ((.inbounds[] | select(.tag == "hysteria2-in") | has("obfs")) | not) and
   any(.route.rules[]; .ip_is_private == true and .action == "reject") and
   any(.route.rules[];
@@ -168,6 +192,8 @@ jq -e '
 ' "${work}/sing-box-off.json" >/dev/null
 
 render_nginx_subscription_site "${work}/nginx.conf"
+[[ "$(grep -Ec '^[[:space:]]*listen[[:space:]]+' "${work}/nginx.conf")" == 1 ]]
+grep -Eq '^[[:space:]]*listen[[:space:]]+8443[[:space:]]+ssl;' "${work}/nginx.conf"
 grep -Fq 'default links;' "${work}/nginx.conf"
 grep -Fq '~*(clash|mihomo|flclash|clash-verge|clashverge|stash) mihomo;' \
   "${work}/nginx.conf"
@@ -190,6 +216,10 @@ sh -n "${work}/certificate-hook"
 grep -Fq 'certificate-deploy.lock' "${work}/certificate-hook"
 grep -Fq 'commit_active=1' "${work}/certificate-hook"
 grep -Fq 'restore_previous' "${work}/certificate-hook"
+grep -Fq -- "-connect '127.0.0.1:8443'" "${work}/certificate-hook"
+grep -Fq -- "-servername 'vpn.example.com'" "${work}/certificate-hook"
+# shellcheck disable=SC2016 # Match literal generated-hook variables.
+grep -Fq 'cmp -s "$expected_der" "$served_der"' "${work}/certificate-hook"
 
 # The self-test feeds private URLs to curl through stdin rather than argv.
 printf 'payload' >"${work}/curl-source"

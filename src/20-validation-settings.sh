@@ -154,7 +154,7 @@ select_client_fingerprint() {
   cat <<'EOF'
 Select the client TLS fingerprint written to REALITY subscriptions:
   1) chrome   — broad compatibility; default profile
-  2) firefox  — useful alternative when chrome is filtered
+  2) firefox  — A/B compatibility alternative for supported clients
   3) safari   — fixed Safari browser profile
   4) ios      — fixed iOS profile
   5) android  — fixed Android profile
@@ -163,9 +163,11 @@ Select the client TLS fingerprint written to REALITY subscriptions:
   8) qq       — fixed QQ Browser profile
   9) random   — client chooses a modern browser profile at startup
 
-There is no universally best value. Change it only when testing indicates that
-the current profile is failing. "randomized" is deliberately excluded because
-current Mihomo profiles do not support it consistently.
+There is no universally best value. A fingerprint is a client compatibility
+knob, not a censorship guarantee. Check the server IP/path, TCP/443, and client
+behavior before changing it for a controlled A/B comparison. "randomized" is
+deliberately excluded because current Mihomo profiles do not support it
+consistently.
 EOF
   while true; do
     read -r -p '[Step 9 / 10] Fingerprint [1]: ' answer

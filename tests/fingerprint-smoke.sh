@@ -15,6 +15,7 @@ source "${repo_root}/install-sing-box-server.sh"
 [[ "$SING_BOX_MAX_EXCLUSIVE" == "1.14.0" ]]
 (( ${#SUPPORTED_CLIENT_FINGERPRINTS[@]} == 9 ))
 (( ${#SUPPORTED_HY2_OBFS_MODES[@]} == 2 ))
+(( ${#BASE_PACKAGES[@]} == 19 ))
 
 package_list="$(printf ' %s' "${BASE_PACKAGES[@]}")"
 for package in \
@@ -641,6 +642,7 @@ grep -Fq 'render_health_debug_details' <<<"$health_debug_body"
 subscription_health_body="$(declare -f subscription_service_healthy)"
 grep -Fq -- '--resolve "${TLS_DOMAIN}:${SUBSCRIPTION_PORT}:127.0.0.1"' \
   <<<"$subscription_health_body"
+grep -Fq -- '--max-time 15' <<<"$subscription_health_body"
 if grep -Fq -- '--resolve "${TLS_DOMAIN}:${SUBSCRIPTION_PORT}:${SERVER_IPV4}"' \
   <<<"$subscription_health_body"; then
   printf 'Subscription self-test still depends on public-IP hairpin routing.\n' >&2
