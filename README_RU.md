@@ -46,15 +46,17 @@ DNS-запись должна вести прямо на VPS. Не включа�
 Подключитесь к VPS как `root` и выполните:
 
 ```bash
-wget -qO vpn-install.sh https://raw.githubusercontent.com/stillnotfree/sing-box-vps/main/install-sing-box-server.sh && chmod 700 vpn-install.sh && ./vpn-install.sh install
+wget -qO vpn-install.sh https://github.com/stillnotfree/sing-box-vps/releases/latest/download/install-sing-box-server.sh && chmod 700 vpn-install.sh && ./vpn-install.sh install
 ```
 
-Эта удобная команда скачивает изменяемый `main` и запускает результат от root.
-Это граница доверия начальной установки, а не независимо проверенный release.
-Для проверенной установки скачайте файл из версионного release или проверенного
-commit, получите его SHA-256 через отдельно доверенный канал, проверьте и
-просмотрите файл, а затем запускайте. Контрольная сумма из того же изменяемого
-источника не является независимым trust anchor. Подробнее:
+Эта команда скачивает последний опубликованный GitHub release, а не изменяемый
+`main`. Для установки точно проверенной версии замените `latest/download` на
+`download/v1.0.10`; на странице текущего release также публикуется SHA-256
+установщика. Перед запуском кода от root получите ожидаемый SHA-256 через
+отдельно доверенный канал, проверьте файл локально командой
+`sha256sum vpn-install.sh` и прочитайте скрипт. Контрольная сумма из того же
+GitHub release полезна для проверки целостности, но не является независимым
+trust anchor. Подробнее:
 [docs/development.md](docs/development.md#clean-install-and-release-evidence).
 
 Установщик запросит администратора, публичный SSH-ключ, IPv4 сервера, домен,

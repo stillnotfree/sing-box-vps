@@ -48,15 +48,16 @@ for it, and do not add an `AAAA` record unless IPv6 is deliberately configured.
 Connect to the VPS as `root` and run:
 
 ```bash
-wget -qO vpn-install.sh https://raw.githubusercontent.com/stillnotfree/sing-box-vps/main/install-sing-box-server.sh && chmod 700 vpn-install.sh && ./vpn-install.sh install
+wget -qO vpn-install.sh https://github.com/stillnotfree/sing-box-vps/releases/latest/download/install-sing-box-server.sh && chmod 700 vpn-install.sh && ./vpn-install.sh install
 ```
 
-This convenience command downloads mutable `main` and executes the result as
-root. That is a bootstrap trust boundary, not an independently verified release.
-For a reviewed deployment, download a versioned release or reviewed commit,
-obtain its SHA-256 through a separately trusted channel, verify it locally,
-inspect the script, and only then execute it. A checksum downloaded from the
-same mutable source is not an independent trust anchor. See
+This downloads the latest published GitHub release rather than mutable `main`.
+To install an exact reviewed version, replace `latest/download` with
+`download/v1.0.10`; the current release page also publishes the installer
+SHA-256. Before executing code as root, obtain the expected SHA-256 through a
+separately trusted channel, verify it locally with `sha256sum vpn-install.sh`,
+and inspect the script. A checksum from the same GitHub release is useful for
+integrity checking but is not an independent trust anchor. See
 [development verification](docs/development.md#clean-install-and-release-evidence).
 
 The installer asks for the administrator, public SSH key, VPS address, domain,
