@@ -20,6 +20,7 @@
 #   vpn set-fingerprint
 #   vpn set-obfs off|salamander
 #   vpn update
+#   vpn self-update
 #   vpn self-update /path/to/new/install-sing-box-server.sh
 #
 # This script intentionally does not install a web panel, Docker, Xray, UFW,
@@ -30,13 +31,17 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly SCRIPT_VERSION="1.0.10"
+readonly SCRIPT_VERSION="1.0.11"
 readonly SING_BOX_MIN_VERSION="1.13.0"
 readonly SING_BOX_MAX_EXCLUSIVE="1.14.0"
 readonly PROJECT_NAME="vpn-setup"
 readonly SAGERNET_KEY_URL="https://sing-box.app/gpg.key"
 readonly SAGERNET_KEY_FILE="/etc/apt/keyrings/sagernet.asc"
 readonly SAGERNET_SOURCE_FILE="/etc/apt/sources.list.d/sagernet.sources"
+# Fresh Debian/Ubuntu images may have apt-daily-upgrade holding dpkg while the
+# reviewed package set is installed. Keep the wait finite and shared by every
+# package installation that needs the dpkg frontend lock.
+readonly APT_DPKG_LOCK_TIMEOUT_SECONDS="300"
 
 readonly STATE_DIR="/var/lib/${PROJECT_NAME}"
 readonly ROLLBACK_DIR="${STATE_DIR}/rollback"
@@ -51,6 +56,12 @@ readonly FIREWALL_LOCK_FILE="${STATE_DIR}/firewall.lock"
 readonly PACKAGE_CACHE_DIR="${STATE_DIR}/packages"
 readonly APT_DOWNLOAD_ROOT="/var/cache/${PROJECT_NAME}-apt-downloads"
 readonly INSTALLER_BACKUP_DIR="${STATE_DIR}/installer-backups"
+readonly SELF_UPDATE_STAGING_DIR="${STATE_DIR}/self-update"
+readonly OPERATION_OUTCOME_ROOT="${STATE_DIR}/operation-outcomes"
+readonly DEFERRED_MUTATION_ROOT="${STATE_DIR}/deferred-mutations"
+readonly SELF_UPDATE_RELEASE_BASE="https://github.com/stillnotfree/sing-box-vps/releases/latest/download"
+readonly SELF_UPDATE_INSTALLER_ASSET="install-sing-box-server.sh"
+readonly SELF_UPDATE_CHECKSUM_ASSET="install-sing-box-server.sh.sha256"
 readonly INITIAL_CLIENT_NAME="default"
 readonly DEFAULT_CLIENT_FINGERPRINT="chrome"
 readonly DEFAULT_HY2_OBFS_MODE="off"
@@ -66,12 +77,15 @@ readonly UDP_BUFFER_MAX="7340032"
 readonly CONFIG_DIR="/etc/sing-box"
 readonly CONFIG_FILE="${CONFIG_DIR}/config.json"
 readonly CERT_DIR="${CONFIG_DIR}/certs"
+readonly HY2_MASQUERADE_ROOT="${CONFIG_DIR}/masquerade"
 readonly SYSTEMD_DROPIN_DIR="/etc/systemd/system/sing-box.service.d"
 readonly SYSTEMD_DROPIN="${SYSTEMD_DROPIN_DIR}/10-vpn-hardening.conf"
 readonly JOURNAL_DROPIN_DIR="/etc/systemd/journald.conf.d"
 readonly JOURNAL_DROPIN="${JOURNAL_DROPIN_DIR}/90-vpn-limits.conf"
 readonly UDP_SYSCTL_FILE="/etc/sysctl.d/90-vpn-udp-buffers.conf"
 readonly NFT_CONFIG="/etc/nftables.conf"
+readonly NFTABLES_SYSTEMD_DROPIN_DIR="/etc/systemd/system/nftables.service.d"
+readonly NFTABLES_SYSTEMD_DROPIN="${NFTABLES_SYSTEMD_DROPIN_DIR}/90-vpn-table-boundary.conf"
 readonly SSH_DROPIN="/etc/ssh/sshd_config.d/00-vpn-hardening.conf"
 readonly AUTO_FINALIZE_SSH_DROPIN="/etc/ssh/sshd_config.d/99-vpn-auto-finalize.conf"
 readonly AUTO_FINALIZE_WRAPPER="/usr/local/libexec/vpn-auto-finalize-login"
@@ -117,6 +131,8 @@ AUDIT_TARGET=""
 NEW_CLIENT_FINGERPRINT=""
 NEW_HY2_OBFS_MODE=""
 SELF_UPDATE_SOURCE=""
+DEFERRED_JOB_DIR=""
+DEFERRED_OUTCOME_FILE=""
 OS_ID=""
 OS_VERSION=""
 OS_PRETTY_NAME=""
@@ -127,6 +143,17 @@ INSTALL_LOG_ACTIVE=0
 MUTATION_COMMIT_ACTIVE=0
 DEFERRED_MUTATION_SIGNAL=""
 DEFERRED_MUTATION_STATUS=0
+DEFERRED_MUTATION_QUEUED=0
+MANAGEMENT_SESSION_CLASS=""
+MANAGEMENT_SESSION_REASON=""
+MANAGEMENT_SSH_CONNECTION=""
+MANAGEMENT_SSH_ANCESTOR_PID=""
+MANAGEMENT_SSH_ANCESTOR_FOUND=0
+MANAGEMENT_TRANSPORT_LOCAL_ENDPOINT=""
+MANAGEMENT_TRANSPORT_REMOTE_ENDPOINT=""
+MANAGEMENT_TRANSPORT_SOCKET_COOKIE=""
+MANAGEMENT_TRANSPORT_SOCKET_INODE=""
+DEFERRED_BASELINE_MISMATCH=""
 ERROR_REPORTED=0
 UPGRADE_ROLLBACK_ACTIVE=0
 UPGRADE_ROLLBACK_FAILED=0
@@ -134,4 +161,5 @@ UPGRADE_BACKUP_DIR=""
 UPGRADE_ORIGINAL_RMEM=""
 UPGRADE_ORIGINAL_WMEM=""
 LAST_HELPER_BACKUP=""
+DEFERRED_HELPER_BACKUP=""
 BOOTSTRAP_LOCK_OWNED=0

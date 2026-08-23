@@ -1,7 +1,7 @@
 main() {
   parse_args "$@"
   case "$COMMAND" in
-    plan|check|install|upgrade|update|self-update|health|finalize|confirm-firewall|rollback-firewall|lockdown-ssh|client-add|client-show|client-delete|client-list|audit-target|set-target|set-fingerprint|set-obfs|help)
+    plan|check|install|upgrade|update|self-update|deferred-activate|health|finalize|confirm-firewall|rollback-firewall|lockdown-ssh|client-add|client-show|client-delete|client-list|audit-target|set-target|set-fingerprint|set-obfs|help)
       ;;
     *)
       usage >&2
@@ -33,6 +33,9 @@ main() {
       ;;
     self-update)
       self_update_from_file
+      ;;
+    deferred-activate)
+      deferred_activate_job "$DEFERRED_JOB_DIR"
       ;;
     health)
       if (( DEBUG == 1 )); then

@@ -10,7 +10,7 @@ repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck disable=SC1091
 source "${repo_root}/install-sing-box-server.sh"
 
-[[ "$SCRIPT_VERSION" == "1.0.10" ]]
+[[ "$SCRIPT_VERSION" == "1.0.11" ]]
 [[ "$SING_BOX_MIN_VERSION" == "1.13.0" ]]
 [[ "$SING_BOX_MAX_EXCLUSIVE" == "1.14.0" ]]
 (( ${#SUPPORTED_CLIENT_FINGERPRINTS[@]} == 9 ))
@@ -29,6 +29,10 @@ done
 (
   package_capture="$(mktemp)"
   apt-get() {
+    if [[ "$1" == '-o' ]]; then
+      [[ "$2" == "DPkg::Lock::Timeout=${APT_DPKG_LOCK_TIMEOUT_SECONDS}" ]]
+      shift 2
+    fi
     if [[ "$1" == "install" ]]; then
       shift
       printf '%s\n' "$@" >"$package_capture"
@@ -384,6 +388,13 @@ fi
 (
   COMMAND="plan"
   VERBOSE=0
+  parse_args health -v
+  [[ "$COMMAND" == "health" ]]
+  (( VERBOSE == 1 ))
+)
+(
+  COMMAND="plan"
+  VERBOSE=0
   parse_args health --verbose
   [[ "$COMMAND" == "health" ]]
   (( VERBOSE == 1 ))
@@ -606,6 +617,7 @@ fi
 upgrade_body="$(declare -f upgrade_existing_installation)"
 grep -Fq 'reconcile_managed_runtime' <<<"$upgrade_body"
 grep -Fq 'write_runtime_version_marker' <<<"$upgrade_body"
+grep -Fq 'configure_nftables_service_boundary' <<<"$upgrade_body"
 marker_line="$(awk 'index($0, "write_runtime_version_marker") && !found {
   line=NR
   found=1

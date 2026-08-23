@@ -114,6 +114,9 @@ bash tests/fingerprint-smoke.sh
 bash tests/health-smoke.sh
 bash tests/management-lifecycle-smoke.sh
 bash tests/package-policy-smoke.sh
+bash tests/self-update-smoke.sh
+bash tests/deferred-overlay-smoke.sh
+bash tests/same-version-reconciliation-smoke.sh
 ./install-sing-box-server.sh plan
 ```
 
@@ -121,6 +124,9 @@ On Linux with nftables, also run:
 
 ```bash
 sudo bash tests/firewall-smoke.sh
+sudo bash tests/self-update-systemd-smoke.sh
+sudo bash tests/deferred-ssh-systemd-smoke.sh
+sudo bash tests/certificate-lifecycle-smoke.sh
 ```
 
 Record separately whether a real clean VPS install, real sing-box binary check,

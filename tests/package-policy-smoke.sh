@@ -106,6 +106,43 @@ configure_body="$(declare -f configure_unattended_upgrades)"
 [[ "$configure_body" == *'systemctl is-active --quiet apt-daily-upgrade.timer'* ]]
 [[ "$configure_body" != *'50unattended-upgrades'* ]]
 
+apt_install_body="$(declare -f apt_install_with_lock_timeout)"
+base_install_body="$(declare -f install_base_packages)"
+sing_box_install_body="$(declare -f install_sing_box)"
+lock_option="DPkg::Lock::Timeout=\${APT_DPKG_LOCK_TIMEOUT_SECONDS}"
+[[ "$APT_DPKG_LOCK_TIMEOUT_SECONDS" == '300' ]]
+[[ "$apt_install_body" == *"$lock_option"* ]]
+[[ "$base_install_body" == *'apt_install_with_lock_timeout -y --no-install-recommends'* ]]
+[[ "$sing_box_install_body" == *'apt_install_with_lock_timeout -y --allow-change-held-packages'* ]]
+
+(
+  apt_calls=()
+  apt-get() {
+    apt_calls=("$@")
+    return 37
+  }
+  if apt_install_with_lock_timeout -y --no-install-recommends package-under-test; then
+    printf 'A mocked APT failure unexpectedly reported success.\n' >&2
+    exit 1
+  else
+    apt_status=$?
+  fi
+  [[ "$apt_status" == 37 ]]
+  [[ "${apt_calls[0]}" == '-o' ]]
+  [[ "${apt_calls[1]}" == "DPkg::Lock::Timeout=${APT_DPKG_LOCK_TIMEOUT_SECONDS}" ]]
+  [[ "${apt_calls[2]}" == 'install' ]]
+)
+
+package_source="$(<"${repo_root}/src/30-preflight-packages.sh")"
+[[ "$package_source" != *'/var/lib/dpkg/lock'* ]]
+[[ "$package_source" != *'lock-frontend'* ]]
+[[ "$package_source" != *'pkill'* ]]
+[[ "$package_source" != *'killall'* ]]
+[[ "$package_source" != *'systemctl stop apt-daily'* ]]
+[[ "$package_source" != *'systemctl disable apt-daily'* ]]
+[[ "$package_source" != *'systemctl stop unattended-upgrades'* ]]
+[[ "$package_source" != *'systemctl disable unattended-upgrades'* ]]
+
 staging_body="$(declare -f prepare_apt_download_dir)"
 download_body="$(declare -f download_sing_box_package)"
 install_body="$(declare -f install_sing_box)"
@@ -117,7 +154,74 @@ install_body="$(declare -f install_sing_box)"
 [[ "$download_body" == *"apt-get download \"sing-box=\${version}\""* ]]
 [[ "$download_body" != *'APT::Sandbox::User'* ]]
 [[ "$install_body" == *"\"sing-box=\${candidate}\""* ]]
-[[ "$install_body" == *'apt-mark hold sing-box'* ]]
+[[ "$install_body" == *'ensure_sing_box_package_hold'* ]]
+
+# A package update must not report success when apt-mark hold has not become a
+# verified postcondition. The failed case must restore the old package.
+(
+  old_package="${work}/sing-box-old.deb"
+  new_package="${work}/sing-box-new.deb"
+  installed_marker="${work}/installed-package"
+  printf old >"$old_package"
+  printf new >"$new_package"
+  if (
+    apt-mark() {
+      case "$1" in
+        hold) return 0 ;;
+        showhold) return 0 ;;
+        *) return 1 ;;
+      esac
+    }
+    dpkg() {
+      if [[ "$1" == --force-confold && "$2" == -i ]]; then
+        cp "$3" "$installed_marker"
+        return 0
+      fi
+      return 0
+    }
+    sing-box() { return 0; }
+    systemctl() { return 0; }
+    prune_sing_box_packages() { :; }
+    log() { :; }
+    activate_sing_box_package_update 1.13.16 1.13.17 \
+      "$new_package" "$old_package" >/dev/null 2>&1
+  ); then
+    printf 'Missing apt hold unexpectedly reported clean success.\n' >&2
+    exit 1
+  fi
+  cmp -s "$old_package" "$installed_marker"
+)
+
+(
+  held=0
+  old_package="${work}/sing-box-old-held.deb"
+  new_package="${work}/sing-box-new-held.deb"
+  installed_marker="${work}/installed-held-package"
+  printf old >"$old_package"
+  printf new >"$new_package"
+  apt-mark() {
+    case "$1" in
+      hold) held=1; return 0 ;;
+      showhold) (( held == 1 )) && printf 'sing-box\n' ;;
+      *) return 1 ;;
+    esac
+  }
+  dpkg() {
+    if [[ "$1" == --force-confold && "$2" == -i ]]; then
+      cp "$3" "$installed_marker"
+      return 0
+    fi
+    return 0
+  }
+  sing-box() { return 0; }
+  systemctl() { return 0; }
+  prune_sing_box_packages() { :; }
+  log() { :; }
+  activate_sing_box_package_update 1.13.16 1.13.17 \
+    "$new_package" "$old_package" >/dev/null
+  cmp -s "$new_package" "$installed_marker"
+  (( held == 1 ))
+)
 
 help_output="$(usage)"
 [[ "$help_output" != *'vpn list'* ]]

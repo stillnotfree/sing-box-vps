@@ -121,6 +121,73 @@ initialize_client_database() {
   log "Created initial independent VPN client: ${initial_name}."
 }
 
+render_hy2_masquerade_site() {
+  local output="$1"
+  cat >"$output" <<'EOF'
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Welcome</title>
+</head>
+<body>
+  <main>
+    <h1>Welcome</h1>
+    <p>This site is available.</p>
+  </main>
+</body>
+</html>
+EOF
+}
+
+install_hy2_masquerade() {
+  local candidate staged
+  install -d -o root -g sing-box -m 0750 "$CONFIG_DIR"
+  install -d -o root -g sing-box -m 0750 "$HY2_MASQUERADE_ROOT"
+  # The directory may already exist with drifted ownership or mode. Make the
+  # managed boundary explicit before publishing the replacement file.
+  chown root:sing-box "$HY2_MASQUERADE_ROOT"
+  chmod 0750 "$HY2_MASQUERADE_ROOT"
+  candidate="$(mktemp)"
+  render_hy2_masquerade_site "$candidate"
+  staged="${HY2_MASQUERADE_ROOT}/index.html.new"
+  install -o root -g sing-box -m 0644 "$candidate" \
+    "$staged"
+  chown root:sing-box "$staged"
+  chmod 0644 "$staged"
+  mv -f -- "$staged" \
+    "${HY2_MASQUERADE_ROOT}/index.html"
+  rm -f -- "$candidate"
+}
+
+hy2_masquerade_is_healthy() {
+  local actual
+  [[ -d "$HY2_MASQUERADE_ROOT" && ! -L "$HY2_MASQUERADE_ROOT" ]] || return 1
+  actual="$(stat -c '%a:%U:%G' "$HY2_MASQUERADE_ROOT" 2>/dev/null || true)"
+  [[ "$actual" == '750:root:sing-box' ]] || return 1
+  [[ -f "${HY2_MASQUERADE_ROOT}/index.html" &&
+     ! -L "${HY2_MASQUERADE_ROOT}/index.html" ]] || return 1
+  actual="$(stat -c '%a:%U:%G' "${HY2_MASQUERADE_ROOT}/index.html" 2>/dev/null || true)"
+  [[ "$actual" == '644:root:sing-box' ]]
+}
+
+reconcile_same_version_non_runtime_state() {
+  local changed=0
+  if ! hy2_masquerade_is_healthy; then
+    install_hy2_masquerade
+    hy2_masquerade_is_healthy || \
+      die 'Same-version managed masquerade reconciliation did not restore its ownership and mode invariant.'
+    changed=1
+  fi
+  if ! nftables_service_boundary_is_healthy; then
+    configure_nftables_service_boundary
+    changed=1
+  fi
+  (( changed == 1 )) || return 0
+  log 'Reconciled same-version non-runtime managed state without restarting sing-box.'
+}
+
 build_sing_box_config() {
   local database="$1"
   local output="$2"
@@ -208,13 +275,8 @@ ${hy2_obfs_block}
         "key_path": "${CERT_DIR}/privkey.pem"
       },
       "masquerade": {
-        "type": "string",
-        "status_code": 404,
-        "headers": {
-          "server": "nginx",
-          "content-type": "text/html; charset=utf-8"
-        },
-        "content": "<!doctype html><html><head><title>404 Not Found</title></head><body><h1>404 Not Found</h1></body></html>"
+        "type": "file",
+        "directory": "${HY2_MASQUERADE_ROOT}"
       }
     }
   ],
@@ -257,6 +319,7 @@ EOF
 write_sing_box_config() {
   local candidate
   initialize_client_database
+  install_hy2_masquerade
   install -d -o root -g sing-box -m 0750 "$CONFIG_DIR"
   candidate="$(mktemp)"
   build_sing_box_config "$CLIENTS_FILE" "$candidate"
@@ -321,6 +384,132 @@ require_client_runtime() {
   validate_client_database "$CLIENTS_FILE"
 }
 
+deferred_job_is_safe() {
+  local job="$1" resolved
+  [[ -n "$job" && "$job" == "${DEFERRED_MUTATION_ROOT}"/job.* ]] || return 1
+  [[ -d "$job" && ! -L "$job" ]] || return 1
+  resolved="$(readlink -f "$job" 2>/dev/null || true)"
+  [[ "$resolved" == "$job" ]] || return 1
+  [[ -f "${job}/metadata" && ! -L "${job}/metadata" ]] || return 1
+  return 0
+}
+
+activate_deferred_state_job() {
+  local job="$1" operation config_backup clients_backup settings_backup
+  local subscriptions_backup failed=0 restore_failed=0
+  operation="$(deferred_job_field operation "${job}/metadata")"
+
+  require_client_runtime
+  acquire_operation_lock
+  exec 9>"$CLIENT_LOCK_FILE"
+  flock -x 9
+  new_temp_dir
+  config_backup="${TMP_DIR}/config.deferred.before.json"
+  clients_backup="${TMP_DIR}/clients.deferred.before.json"
+  settings_backup="${TMP_DIR}/settings.deferred.before.json"
+  subscriptions_backup="${TMP_DIR}/subscriptions.deferred.before"
+
+  [[ -f "${job}/config.candidate" ]] || die 'Deferred activation is missing its candidate sing-box configuration.'
+  [[ -d "${job}/subscriptions" ]] || die 'Deferred activation is missing its candidate subscriptions.'
+  sing-box check -c "${job}/config.candidate" >/dev/null
+  if [[ -f "${job}/clients.candidate" ]]; then
+    validate_client_database "${job}/clients.candidate"
+    install -o root -g root -m 0600 "$CLIENTS_FILE" "$clients_backup"
+  fi
+  if [[ -f "${job}/settings.candidate" ]]; then
+    jq -e '.schema_version == 1' "${job}/settings.candidate" >/dev/null || \
+      die 'Deferred activation contains an invalid candidate settings file.'
+    install -o root -g root -m 0600 "$SETTINGS_FILE" "$settings_backup"
+  fi
+  install -o root -g sing-box -m 0640 "$CONFIG_FILE" "$config_backup"
+  install -d -o root -g root -m 0700 "$subscriptions_backup"
+  cp -a -- "${SUBSCRIPTION_ROOT}/." "$subscriptions_backup/"
+
+  begin_mutation_commit
+  if [[ -f "${job}/clients.candidate" ]]; then
+    install -o root -g root -m 0600 "${job}/clients.candidate" "${CLIENTS_FILE}.new" || failed=1
+    mv -f -- "${CLIENTS_FILE}.new" "$CLIENTS_FILE" || failed=1
+  fi
+  if (( failed == 0 )) && [[ -f "${job}/settings.candidate" ]]; then
+    install -o root -g root -m 0600 "${job}/settings.candidate" "${SETTINGS_FILE}.new" || failed=1
+    mv -f -- "${SETTINGS_FILE}.new" "$SETTINGS_FILE" || failed=1
+    if (( failed == 0 )); then
+      load_settings || failed=1
+    fi
+  fi
+  if (( failed == 0 )); then
+    install -o root -g sing-box -m 0640 "${job}/config.candidate" "${CONFIG_FILE}.new" || failed=1
+    mv -f -- "${CONFIG_FILE}.new" "$CONFIG_FILE" || failed=1
+  fi
+  if (( failed == 0 )); then
+    activate_subscription_tree "${job}/subscriptions" || failed=1
+  fi
+  if (( failed == 0 )); then
+    systemctl restart sing-box.service || failed=1
+    systemctl is-active --quiet sing-box.service || failed=1
+    sing-box check -c "$CONFIG_FILE" >/dev/null 2>&1 || failed=1
+    subscription_service_healthy || failed=1
+  fi
+
+  if (( failed == 1 )); then
+    warn "Deferred ${operation} activation failed; restoring the previous managed state."
+    if [[ -f "$clients_backup" ]]; then
+      install -o root -g root -m 0600 "$clients_backup" "${CLIENTS_FILE}.rollback" || restore_failed=1
+      mv -f -- "${CLIENTS_FILE}.rollback" "$CLIENTS_FILE" || restore_failed=1
+    fi
+    if [[ -f "$settings_backup" ]]; then
+      install -o root -g root -m 0600 "$settings_backup" "${SETTINGS_FILE}.rollback" || restore_failed=1
+      mv -f -- "${SETTINGS_FILE}.rollback" "$SETTINGS_FILE" || restore_failed=1
+      load_settings || restore_failed=1
+    fi
+    install -o root -g sing-box -m 0640 "$config_backup" "${CONFIG_FILE}.rollback" || restore_failed=1
+    mv -f -- "${CONFIG_FILE}.rollback" "$CONFIG_FILE" || restore_failed=1
+    activate_subscription_tree "$subscriptions_backup" || restore_failed=1
+    sing-box check -c "$CONFIG_FILE" >/dev/null 2>&1 || restore_failed=1
+    systemctl restart sing-box.service || restore_failed=1
+    systemctl is-active --quiet sing-box.service || restore_failed=1
+    subscription_service_healthy || restore_failed=1
+    if (( restore_failed == 1 )); then
+      die "Deferred ${operation} activation and rollback both failed; recovery files are preserved in ${TMP_DIR}."
+    fi
+    finish_mutation_commit
+    die "Deferred ${operation} activation failed; the previous state was restored."
+  fi
+
+  finish_mutation_commit
+}
+
+deferred_activate_job() {
+  local job="$1" operation
+  require_root
+  deferred_job_is_safe "$job" || die 'Refusing an unsafe deferred activation job path.'
+  operation="$(deferred_job_field operation "${job}/metadata")"
+  deferred_job_verify_baseline "$job" || \
+    die "Deferred ${operation:-operation} baseline mismatch: ${DEFERRED_BASELINE_MISMATCH}; the stale candidate was not applied."
+  case "$operation" in
+    client-add|client-delete|reality-target|fingerprint|hy2-obfs)
+      activate_deferred_state_job "$job"
+      ;;
+    overlay-upgrade)
+      [[ -f "${job}/config.candidate" && -d "${job}/subscriptions" ]] || \
+        die 'Deferred overlay upgrade is missing its validated candidate state.'
+      sing-box check -c "${job}/config.candidate" >/dev/null
+      ASSUME_YES=1
+      # The worker has already waited for the originating SSH transport. Do not
+      # let its inherited SSH_CONNECTION trigger a second deferral.
+      unset SSH_CONNECTION
+      upgrade_existing_installation
+      ;;
+    core-update)
+      ASSUME_YES=1
+      activate_deferred_core_update "$job"
+      ;;
+    *)
+      die "Unknown deferred activation operation: ${operation:-missing}."
+      ;;
+  esac
+}
+
 find_client_json() {
   local name="$1"
   jq -c --arg name "$name" \
@@ -337,14 +526,18 @@ restore_client_transaction() {
   install -o root -g sing-box -m 0640 "$config_backup" "${CONFIG_FILE}.rollback"
   mv -f -- "${CONFIG_FILE}.rollback" "$CONFIG_FILE"
   publish_subscription_tree "$CLIENTS_FILE"
+  validate_client_database "$CLIENTS_FILE"
   sing-box check -c "$CONFIG_FILE" || die 'Rollback configuration validation failed.'
   systemctl restart sing-box.service || die 'Rollback restored the files, but sing-box could not be restarted.'
   systemctl is-active --quiet sing-box.service || die 'Rollback restored the files, but sing-box is not active.'
+  subscription_service_healthy || die 'Rollback restored the files, but subscriptions failed their health check.'
 }
 
 apply_client_database() {
-  local candidate_database="$1"
+  local candidate_database="$1" operation="${2:-client-change}"
+  local description="${3:-Client configuration change; activation is pending.}"
   local candidate_config candidate_subscriptions database_backup config_backup
+  DEFERRED_MUTATION_QUEUED=0
   [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]] || die 'Internal client transaction directory is unavailable.'
   candidate_config="${TMP_DIR}/config.candidate.json"
   database_backup="${TMP_DIR}/clients.before.json"
@@ -354,6 +547,17 @@ apply_client_database() {
   validate_client_database "$candidate_database"
   build_sing_box_config "$candidate_database" "$candidate_config"
   render_subscription_tree "$candidate_database" "$candidate_subscriptions"
+
+  if management_ssh_requires_deferred_activation; then
+    sing-box check -c "$candidate_config" >/dev/null
+    deferred_job_create "$operation" "$description"
+    deferred_job_stage_file "$candidate_database" clients.candidate root root 0600
+    deferred_job_stage_file "$candidate_config" config.candidate root sing-box 0640
+    deferred_job_stage_tree "$candidate_subscriptions" subscriptions
+    queue_deferred_mutation
+    return 0
+  fi
+
   install -o root -g root -m 0600 "$CLIENTS_FILE" "$database_backup"
   install -o root -g root -m 0600 "$CONFIG_FILE" "$config_backup"
 
@@ -431,6 +635,8 @@ reconcile_managed_runtime() {
     activate_subscription_tree "$subscriptions_backup" || restore_failed=1
     systemctl restart sing-box.service || restore_failed=1
     systemctl is-active --quiet sing-box.service || restore_failed=1
+    sing-box check -c "$CONFIG_FILE" >/dev/null 2>&1 || restore_failed=1
+    subscription_service_healthy || restore_failed=1
     if (( restore_failed == 1 )); then
       die "Managed runtime reconciliation and its rollback both failed; recovery files are preserved in ${TMP_DIR}."
     fi
@@ -472,7 +678,13 @@ client_add() {
       created_at: $created
     }')"
   append_client_to_database "$CLIENTS_FILE" "$client" "$candidate"
-  apply_client_database "$candidate"
+  apply_client_database "$candidate" client-add \
+    "Client ${CLIENT_NAME} add; activation is pending until the SSH transport ends."
+  if (( DEFERRED_MUTATION_QUEUED == 1 )); then
+    printf 'Client %s is staged; run "vpn show %s" after activation to retrieve its credentials.\n' \
+      "$CLIENT_NAME" "$CLIENT_NAME"
+    return
+  fi
   log "Client ${CLIENT_NAME} added with independent VLESS and Hysteria2 credentials."
   client="$(find_client_json "$CLIENT_NAME")"
   show_client_material "$client"
@@ -806,7 +1018,13 @@ client_delete() {
   new_temp_dir
   candidate="${TMP_DIR}/clients.candidate.json"
   remove_client_from_database "$CLIENTS_FILE" "$stored_name" "$candidate"
-  apply_client_database "$candidate"
+  apply_client_database "$candidate" client-delete \
+    "Client ${stored_name} deletion; credential revocation is pending until the SSH transport ends."
+  if (( DEFERRED_MUTATION_QUEUED == 1 )); then
+    printf 'Client %s deletion is staged; credential revocation is pending until activation.\n' \
+      "$stored_name"
+    return
+  fi
   log "Client ${stored_name} deleted; its VLESS UUID and Hysteria2 password are no longer accepted."
 }
 
@@ -833,14 +1051,17 @@ restore_target_transaction() {
   mv -f -- "${SETTINGS_FILE}.rollback" "$SETTINGS_FILE"
   mv -f -- "${CONFIG_FILE}.rollback" "$CONFIG_FILE"
   activate_subscription_tree "$subscriptions_backup" || die 'Subscription rollback failed.'
+  load_settings || die 'Restored settings failed validation.'
   sing-box check -c "$CONFIG_FILE" || die 'Restored sing-box configuration validation failed.'
   systemctl restart sing-box.service || die 'Restored sing-box service could not be restarted.'
   systemctl is-active --quiet sing-box.service || die 'Restored sing-box service is inactive.'
+  subscription_service_healthy || die 'Restored subscriptions failed their health check.'
 }
 
 set_reality_target() {
   local old_target candidate_settings candidate_config candidate_subscriptions old_subscriptions
   local settings_backup config_backup previous_audit_target audit_status=0 failed=0
+  DEFERRED_MUTATION_QUEUED=0
   require_client_runtime
   domain_is_valid "$NEW_REALITY_TARGET" || \
     cli_error "Invalid fully qualified domain: $NEW_REALITY_TARGET"
@@ -897,6 +1118,17 @@ set_reality_target() {
   build_sing_box_config "$CLIENTS_FILE" "$candidate_config"
   render_subscription_tree "$CLIENTS_FILE" "$candidate_subscriptions"
 
+  if management_ssh_requires_deferred_activation; then
+    sing-box check -c "$candidate_config" >/dev/null
+    deferred_job_create reality-target \
+      "REALITY target ${NEW_REALITY_TARGET} change; sing-box activation is pending until the SSH transport ends."
+    deferred_job_stage_file "$candidate_settings" settings.candidate root root 0600
+    deferred_job_stage_file "$candidate_config" config.candidate root sing-box 0640
+    deferred_job_stage_tree "$candidate_subscriptions" subscriptions
+    queue_deferred_mutation
+    return 0
+  fi
+
   install -o root -g root -m 0600 "$candidate_settings" "${SETTINGS_FILE}.new"
   install -o root -g sing-box -m 0640 "$candidate_config" "${CONFIG_FILE}.new"
   begin_mutation_commit
@@ -925,6 +1157,10 @@ set_reality_target() {
   fi
 
   finish_mutation_commit
+  if (( DEFERRED_MUTATION_QUEUED == 1 )); then
+    log "REALITY target change staged: ${old_target} -> ${REALITY_TARGET}; activation is pending."
+    return
+  fi
   log "REALITY target changed transactionally: ${old_target} -> ${REALITY_TARGET}."
   printf 'Subscription URLs are unchanged. Refresh the subscription on each device.\n'
 }
@@ -935,13 +1171,15 @@ restore_fingerprint_transaction() {
   CLIENT_FINGERPRINT="$old_fingerprint"
   install -o root -g root -m 0600 "$settings_backup" "${SETTINGS_FILE}.rollback"
   mv -f -- "${SETTINGS_FILE}.rollback" "$SETTINGS_FILE"
+  load_settings || die 'Restored settings failed validation.'
   activate_subscription_tree "$subscriptions_backup" || die 'Subscription rollback failed.'
   subscription_service_healthy || die 'Restored subscriptions failed their health check.'
 }
 
 set_client_fingerprint() {
-  local old_fingerprint candidate_settings candidate_subscriptions old_subscriptions
+  local old_fingerprint candidate_settings candidate_config candidate_subscriptions old_subscriptions
   local settings_backup failed=0
+  DEFERRED_MUTATION_QUEUED=0
   require_client_runtime
 
   if [[ -z "$NEW_CLIENT_FINGERPRINT" ]]; then
@@ -973,6 +1211,7 @@ set_client_fingerprint() {
   flock -x 9
   new_temp_dir
   candidate_settings="${TMP_DIR}/settings.candidate.json"
+  candidate_config="${TMP_DIR}/config.candidate.json"
   candidate_subscriptions="${TMP_DIR}/subscriptions.candidate"
   old_subscriptions="${TMP_DIR}/subscriptions.before"
   settings_backup="${TMP_DIR}/settings.before.json"
@@ -982,7 +1221,19 @@ set_client_fingerprint() {
 
   CLIENT_FINGERPRINT="$NEW_CLIENT_FINGERPRINT"
   render_settings "$candidate_settings"
+  build_sing_box_config "$CLIENTS_FILE" "$candidate_config"
   render_subscription_tree "$CLIENTS_FILE" "$candidate_subscriptions"
+
+  if management_ssh_requires_deferred_activation; then
+    sing-box check -c "$candidate_config" >/dev/null
+    deferred_job_create fingerprint \
+      "Client fingerprint ${NEW_CLIENT_FINGERPRINT} change; activation is pending until the SSH transport ends."
+    deferred_job_stage_file "$candidate_settings" settings.candidate root root 0600
+    deferred_job_stage_file "$candidate_config" config.candidate root sing-box 0640
+    deferred_job_stage_tree "$candidate_subscriptions" subscriptions
+    queue_deferred_mutation
+    return 0
+  fi
 
   install -o root -g root -m 0600 "$candidate_settings" "${SETTINGS_FILE}.new"
   begin_mutation_commit
@@ -1005,7 +1256,7 @@ set_client_fingerprint() {
   finish_mutation_commit
   log "Client fingerprint changed transactionally: ${old_fingerprint} -> ${CLIENT_FINGERPRINT}."
   printf 'Subscription URLs are unchanged. Refresh the subscription on each device.\n'
-  printf 'If REALITY still fails, run "vpn health --verbose" before changing other settings.\n'
+  printf 'If REALITY still fails, run "vpn health -v" before changing other settings.\n'
 }
 
 restore_hy2_obfs_transaction() {
@@ -1017,6 +1268,7 @@ restore_hy2_obfs_transaction() {
   mv -f -- "${SETTINGS_FILE}.rollback" "$SETTINGS_FILE"
   mv -f -- "${CONFIG_FILE}.rollback" "$CONFIG_FILE"
   activate_subscription_tree "$subscriptions_backup" || die 'Subscription rollback failed.'
+  load_settings || die 'Restored settings failed validation.'
   sing-box check -c "$CONFIG_FILE" || die 'Restored sing-box configuration validation failed.'
   systemctl restart sing-box.service || die 'Restored sing-box service could not be restarted.'
   systemctl is-active --quiet sing-box.service || die 'Restored sing-box service is inactive.'
@@ -1026,6 +1278,7 @@ restore_hy2_obfs_transaction() {
 set_hy2_obfs() {
   local old_mode candidate_settings candidate_config candidate_subscriptions old_subscriptions
   local settings_backup config_backup failed=0
+  DEFERRED_MUTATION_QUEUED=0
   require_client_runtime
 
   if [[ -z "$NEW_HY2_OBFS_MODE" ]]; then
@@ -1071,6 +1324,17 @@ set_hy2_obfs() {
   render_settings "$candidate_settings"
   build_sing_box_config "$CLIENTS_FILE" "$candidate_config"
   render_subscription_tree "$CLIENTS_FILE" "$candidate_subscriptions"
+
+  if management_ssh_requires_deferred_activation; then
+    sing-box check -c "$candidate_config" >/dev/null
+    deferred_job_create hy2-obfs \
+      "Hysteria2 obfuscation ${NEW_HY2_OBFS_MODE} change; sing-box activation is pending until the SSH transport ends."
+    deferred_job_stage_file "$candidate_settings" settings.candidate root root 0600
+    deferred_job_stage_file "$candidate_config" config.candidate root sing-box 0640
+    deferred_job_stage_tree "$candidate_subscriptions" subscriptions
+    queue_deferred_mutation
+    return 0
+  fi
 
   install -o root -g root -m 0600 "$candidate_settings" "${SETTINGS_FILE}.new"
   install -o root -g sing-box -m 0640 "$candidate_config" "${CONFIG_FILE}.new"

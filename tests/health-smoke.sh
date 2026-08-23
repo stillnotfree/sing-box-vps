@@ -131,6 +131,51 @@ for forbidden in 'Listeners (addresses redacted)' 'Queue discipline counters' \
   [[ "$verbose_output" != *"$forbidden"* ]]
 done
 
+# Detached and deferred workers leave a bounded durable outcome that verbose
+# health can summarize without reading raw worker output.
+(
+  outcome_sandbox="${work}/health-outcome-installer"
+  cp "${repo_root}/install-sing-box-server.sh" "$outcome_sandbox"
+  sed -i.bak "s|^readonly OPERATION_OUTCOME_ROOT=.*|readonly OPERATION_OUTCOME_ROOT=\"${work}/operation-outcomes\"|" \
+    "$outcome_sandbox"
+  rm -f "${outcome_sandbox}.bak"
+  bash -c '
+    set -Eeuo pipefail
+    # shellcheck disable=SC1090
+    source "$1"
+    SERVER_IPV4=203.0.113.44
+    TLS_DOMAIN=private.example.com
+    REALITY_TARGET=target.example.com
+    mkdir -p "$OPERATION_OUTCOME_ROOT"
+    diagnostic="${OPERATION_OUTCOME_ROOT}/job.log"
+    printf "%s\\n" \
+      "worker failed for 203.0.113.44:8443 private.example.com unlisted.example.net password=abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdef" \
+      >"$diagnostic"
+    chmod 0600 "$diagnostic"
+    printf "%s\\n" \
+      operation=client-delete \
+      status=failure \
+      started=2026-08-20T20:00:00Z \
+      completed=2026-08-20T20:00:02Z \
+      old_version= \
+      candidate_version= \
+      unit=vpn-deferred-test \
+      exit_status=1 \
+      "diagnostic=$diagnostic" \
+      "detail=credential revocation is pending until activation" \
+      >"${OPERATION_OUTCOME_ROOT}/job.status"
+    chmod 0600 "${OPERATION_OUTCOME_ROOT}/job.status"
+    health_collect_operation_outcome
+    [[ "$HEALTH_OPERATION_STATE" == WARN ]]
+    grep -Fq "client-delete failed" <<<"$HEALTH_OPERATION_DETAIL"
+    grep -Fq "vpn-deferred-test.service" <<<"$HEALTH_OPERATION_DETAIL"
+    [[ "$HEALTH_OPERATION_DETAIL" != *"203.0.113.44"* ]]
+    [[ "$HEALTH_OPERATION_DETAIL" != *"private.example.com"* ]]
+    [[ "$HEALTH_OPERATION_DETAIL" != *"unlisted.example.net"* ]]
+    [[ "$HEALTH_OPERATION_DETAIL" != *"password=abcdef"* ]]
+  ' _ "$outcome_sandbox"
+)
+
 (
   seed_healthy_health_state
   sysctl() {

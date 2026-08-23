@@ -88,6 +88,21 @@ if grep -Fq 'nft flush ruleset' <<<"$rollback_firewall_body"; then
   exit 1
 fi
 grep -Fq 'nft delete table inet vpn_filter' <<<"$rollback_firewall_body"
+firewall_boundary_body="$(declare -f render_nftables_service_boundary)"
+grep -Fxq '# Managed by vpn-setup. Preserve unrelated nftables tables.' <<<"$firewall_boundary_body"
+grep -Fxq 'ExecStop=-/usr/sbin/nft delete table inet vpn_filter' <<<"$firewall_boundary_body"
+grep -Fq 'configure_nftables_service_boundary' <<<"$(declare -f apply_firewall)"
+# shellcheck disable=SC2016 # Match the literal source declaration.
+grep -Fxq 'readonly NFTABLES_SYSTEMD_DROPIN="${NFTABLES_SYSTEMD_DROPIN_DIR}/90-vpn-table-boundary.conf"' \
+  "${repo_root}/src/00-preamble.sh"
+if grep -R -Fq '10-vpn-table-boundary.conf' \
+  "${repo_root}/src" "${repo_root}/install-sing-box-server.sh"; then
+  printf 'Unpublished legacy nftables boundary cleanup remains in production files.\n' >&2
+  exit 1
+fi
+nftables_health_body="$(declare -f nftables_service_boundary_is_healthy)"
+grep -Fq 'nftables_effective_execstop_is_exact' <<<"$nftables_health_body"
+grep -Fq 'systemctl show -p ExecStop --value nftables.service' <<<"$nftables_health_body"
 
 token="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 client="$(jq -cn \
@@ -190,6 +205,92 @@ jq -e '
     (.ip_cidr | index("169.254.0.0/16")) != null and
     (.ip_cidr | index("fe80::/10")) != null)
 ' "${work}/sing-box-off.json" >/dev/null
+masquerade_directory="$(jq -r '.inbounds[] | select(.tag == "hysteria2-in") | .masquerade.directory' "${work}/sing-box-off.json")"
+[[ "$(jq -r '.inbounds[] | select(.tag == "hysteria2-in") | .masquerade.type' "${work}/sing-box-off.json")" == file ]]
+[[ "$masquerade_directory" == "$HY2_MASQUERADE_ROOT" ]]
+[[ "$HY2_MASQUERADE_ROOT" == "${CONFIG_DIR}/masquerade" ]]
+[[ "$HY2_MASQUERADE_ROOT" != /var/lib/sing-box/* ]]
+render_hy2_masquerade_site "${work}/hy2-index.html"
+grep -Fq '<title>Welcome</title>' "${work}/hy2-index.html"
+[[ "$(<"${work}/hy2-index.html")" != *'http://'* ]]
+[[ "$(<"${work}/hy2-index.html")" != *'https://'* ]]
+masquerade_body="$(declare -f install_hy2_masquerade)"
+# shellcheck disable=SC2016 # Match literal function text.
+grep -Fq 'install -d -o root -g sing-box -m 0750 "$CONFIG_DIR"' <<<"$masquerade_body"
+grep -Fq 'install -d -o root -g sing-box -m 0750' <<<"$masquerade_body"
+grep -Fq 'install -o root -g sing-box -m 0644' <<<"$masquerade_body"
+# shellcheck disable=SC2016 # Match literal function text.
+grep -Fq 'chown root:sing-box "$HY2_MASQUERADE_ROOT"' <<<"$masquerade_body"
+# shellcheck disable=SC2016 # Match literal function text.
+grep -Fq 'chmod 0750 "$HY2_MASQUERADE_ROOT"' <<<"$masquerade_body"
+# shellcheck disable=SC2016 # Match literal function text.
+grep -Fq 'chown root:sing-box "$staged"' <<<"$masquerade_body"
+# shellcheck disable=SC2016 # Match literal function text.
+grep -Fq 'chmod 0644 "$staged"' <<<"$masquerade_body"
+
+# The macOS runner cannot prove Linux uid/gid values. Exercise the complete
+# normalization command path instead, including an existing drifted tree and
+# a repeated reconciliation pass.
+(
+  permission_log="${work}/hy2-permissions.log"
+  masquerade_installer="${work}/masquerade-installer.sh"
+  cp "${repo_root}/install-sing-box-server.sh" "$masquerade_installer"
+  for mapping in \
+    "CONFIG_DIR:${work}/sing-box-config" \
+    "HY2_MASQUERADE_ROOT:${work}/hy2-masquerade"
+  do
+    constant="${mapping%%:*}"
+    path="${mapping#*:}"
+    sed -i.bak "s|^readonly ${constant}=.*|readonly ${constant}=\"${path}\"|" \
+      "$masquerade_installer"
+    rm -f -- "${masquerade_installer}.bak"
+  done
+  bash -c '
+    set -Eeuo pipefail
+    source "$1"
+    permission_log="$2"
+    install() {
+      local directory=0 source destination
+      while (( $# > 0 )); do
+        case "$1" in
+          -d) directory=1; shift ;;
+          -o|-g|-m) shift 2 ;;
+          *)
+            if (( directory == 1 )); then
+              destination="$1"
+            else
+              source="$1"
+              shift
+              destination="$1"
+            fi
+            break
+            ;;
+        esac
+      done
+      if (( directory == 1 )); then
+        command mkdir -p "$destination"
+      else
+        command cp "$source" "$destination"
+      fi
+    }
+    chown() { printf "chown %s %s\n" "$1" "$2" >>"$permission_log"; }
+    # shellcheck disable=SC2032 # This test intentionally shadows chmod.
+    chmod() { printf "chmod %s %s\n" "$1" "$2" >>"$permission_log"; }
+    command mkdir -p "$HY2_MASQUERADE_ROOT"
+    printf "drift\n" >"${HY2_MASQUERADE_ROOT}/index.html"
+    install_hy2_masquerade
+    [[ -f "${HY2_MASQUERADE_ROOT}/index.html" ]]
+    grep -Fxq "chown root:sing-box ${HY2_MASQUERADE_ROOT}" "$permission_log"
+    grep -Fxq "chmod 0750 ${HY2_MASQUERADE_ROOT}" "$permission_log"
+    grep -Fxq "chown root:sing-box ${HY2_MASQUERADE_ROOT}/index.html.new" "$permission_log"
+    grep -Fxq "chmod 0644 ${HY2_MASQUERADE_ROOT}/index.html.new" "$permission_log"
+    install_hy2_masquerade
+    [[ "$(grep -Fxc "chown root:sing-box ${HY2_MASQUERADE_ROOT}" "$permission_log")" == 2 ]]
+    [[ "$(grep -Fxc "chmod 0750 ${HY2_MASQUERADE_ROOT}" "$permission_log")" == 2 ]]
+    [[ "$(grep -Fxc "chown root:sing-box ${HY2_MASQUERADE_ROOT}/index.html.new" "$permission_log")" == 2 ]]
+    [[ "$(grep -Fxc "chmod 0644 ${HY2_MASQUERADE_ROOT}/index.html.new" "$permission_log")" == 2 ]]
+  ' _ "$masquerade_installer" "$permission_log"
+)
 
 render_nginx_subscription_site "${work}/nginx.conf"
 [[ "$(grep -Ec '^[[:space:]]*listen[[:space:]]+' "${work}/nginx.conf")" == 1 ]]
@@ -216,6 +317,13 @@ sh -n "${work}/certificate-hook"
 grep -Fq 'certificate-deploy.lock' "${work}/certificate-hook"
 grep -Fq 'commit_active=1' "${work}/certificate-hook"
 grep -Fq 'restore_previous' "${work}/certificate-hook"
+grep -Fq 'MainPID' "${work}/certificate-hook"
+grep -Fq 'wait_for_same_pid' "${work}/certificate-hook"
+if grep -Fq "reload-or-restart \"\$service\"" "${work}/certificate-hook" ||
+   grep -Fq "restart \"\$service\"" "${work}/certificate-hook"; then
+  printf 'Certificate deploy hook still deliberately restarts sing-box.\n' >&2
+  exit 1
+fi
 grep -Fq -- "-connect '127.0.0.1:8443'" "${work}/certificate-hook"
 grep -Fq -- "-servername 'vpn.example.com'" "${work}/certificate-hook"
 # shellcheck disable=SC2016 # Match literal generated-hook variables.

@@ -615,6 +615,19 @@ install -d -o root -g sing-box -m 0750 "\$cert_dir"
 work_dir="\$(mktemp -d "\${cert_dir}/.renew.XXXXXX")"
 had_previous=0
 commit_active=0
+original_pid="\$(systemctl show -p MainPID --value "\$service" 2>/dev/null || true)"
+
+wait_for_same_pid() {
+  expected="\$1"
+  attempt=0
+  while [ "\$attempt" -lt 30 ]; do
+    [ "\$(systemctl is-active "\$service" 2>/dev/null || true)" = active ] || return 1
+    [ "\$(systemctl show -p MainPID --value "\$service" 2>/dev/null || true)" = "\$expected" ] && return 0
+    attempt=\$((attempt + 1))
+    sleep 1
+  done
+  return 1
+}
 
 cleanup() {
   status=\$?
@@ -639,7 +652,8 @@ restore_previous() {
     install -o root -g sing-box -m 0640 "\${work_dir}/previous-privkey.pem" "\${cert_dir}/privkey.pem.restore" || restore_failed=1
     mv -f -- "\${cert_dir}/fullchain.pem.restore" "\${cert_dir}/fullchain.pem" || restore_failed=1
     mv -f -- "\${cert_dir}/privkey.pem.restore" "\${cert_dir}/privkey.pem" || restore_failed=1
-    systemctl restart "\$service" >/dev/null 2>&1 || restore_failed=1
+    sing-box check -c "\$config_file" >/dev/null 2>&1 || restore_failed=1
+    wait_for_same_pid "\$original_pid" || restore_failed=1
     systemctl reload-or-restart "\$nginx_service" >/dev/null 2>&1 || restore_failed=1
     systemctl is-active --quiet "\$nginx_service" || restore_failed=1
   else
@@ -650,6 +664,8 @@ restore_previous() {
 
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
+
+[ "\$original_pid" -gt 0 ] 2>/dev/null
 
 install -o root -g root -m 0600 "\${live_dir}/fullchain.pem" "\${work_dir}/new-fullchain.pem"
 install -o root -g root -m 0600 "\${live_dir}/privkey.pem" "\${work_dir}/new-privkey.pem"
@@ -676,7 +692,7 @@ mv -f -- "\${cert_dir}/privkey.pem.new" "\${cert_dir}/privkey.pem"
 if ! sing-box check -c "\$config_file" >/dev/null 2>&1; then
   exit 1
 fi
-if ! systemctl reload-or-restart "\$service" || ! systemctl is-active --quiet "\$service"; then
+if ! wait_for_same_pid "\$original_pid"; then
   exit 1
 fi
 if ! systemctl reload "\$nginx_service" || ! systemctl is-active --quiet "\$nginx_service"; then
@@ -742,7 +758,7 @@ smoke_test_certificate_hook() {
   verify_certificate_automation
   systemctl is-active --quiet sing-box.service || die 'sing-box is inactive after the certificate deploy-hook smoke test.'
   systemctl is-active --quiet nginx.service || die 'nginx is inactive after the certificate deploy-hook smoke test.'
-  log 'Certificate renewal hook, key pair, deployed copy, timer, sing-box, and nginx reload paths passed verification.'
+  log 'Certificate renewal hook, key pair, deployed copy, timer, unchanged sing-box PID, and nginx reload paths passed verification.'
 }
 
 obtain_certificate() {

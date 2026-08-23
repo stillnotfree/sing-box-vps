@@ -53,7 +53,7 @@ wget -qO vpn-install.sh https://github.com/stillnotfree/sing-box-vps/releases/la
 
 This downloads the latest published GitHub release rather than mutable `main`.
 To install an exact reviewed version, replace `latest/download` with
-`download/v1.0.10`; the current release page also publishes the installer
+`download/v1.0.11`; the current release page also publishes the installer
 SHA-256. Before executing code as root, obtain the expected SHA-256 through a
 separately trusted channel, verify it locally with `sha256sum vpn-install.sh`,
 and inspect the script. A checksum from the same GitHub release is useful for
@@ -127,7 +127,7 @@ Do not share this output: the links contain client credentials.
 | Task | Command |
 | --- | --- |
 | Check server health | `vpn health` |
-| Show semantic redacted diagnostics | `vpn health --verbose` |
+| Show semantic redacted diagnostics | `vpn health -v` |
 | Show bounded developer diagnostics | `vpn health --debug` |
 | Check installation compatibility | `vpn check` |
 | List clients | `vpn show` |
@@ -135,6 +135,7 @@ Do not share this output: the links contain client credentials.
 | Add an independent client | `vpn add NAME` |
 | Revoke a client | `vpn delete NAME --yes` |
 | Update sing-box safely | `vpn update` |
+| Update the installed VPN manager | `vpn self-update` |
 | Audit a REALITY target | `vpn audit-target [DOMAIN] [--verbose]` |
 | Change the REALITY target | `vpn set-target DOMAIN` |
 | Select a client fingerprint | `vpn set-fingerprint` |
@@ -163,6 +164,29 @@ Target, fingerprint, obfuscation, client, and update changes are validated and
 applied transactionally. Existing subscription URLs remain stable; refresh the
 subscription in clients after changing connection settings.
 
+### Management over SSH
+
+Before running a management command that may restart sing-box (`vpn add`,
+`vpn delete`, `vpn set-target`, `vpn set-fingerprint`, `vpn set-obfs`,
+`vpn update`, or `vpn upgrade`),
+prefer a client-side DIRECT rule for the VPS SSH connection. If the client
+supports destination-port routing, scope it to `VPS_IP:SSH_PORT`. If it can
+exclude only addresses at the TUN/routing layer, excluding `VPS_IP/32` is
+acceptable. Do not assume that every client supports port-specific TUN rules.
+
+If the current SSH transport cannot be positively classified as direct, the
+command stages the validated change and waits for that exact accepted SSH
+transport to end before activating it. A reconnect or unrelated SSH connection
+does not satisfy or extend this gate. `vpn health -v` shows the pending or final
+outcome. A staged client deletion is not revoked until activation completes.
+
+While a deferred operation is pending, other state-changing commands are
+refused. The staged candidate records hashes of the live managed state and is
+discarded if that state changes before activation. If a reboot or vanished
+transient worker leaves an orphaned job, the next privileged operation records
+a safe failure and removes the stale candidate; it is never applied
+automatically.
+
 ## System updates
 
 Normal operating-system updates are supported:
@@ -178,6 +202,46 @@ Only OS security origins are enabled for automatic unattended upgrades, and
 automatic reboot is disabled. sing-box is APT-held and updated separately by
 `vpn update`, which validates the current configuration and can restore the
 cached previous package if startup fails.
+
+## Installer updates
+
+Update the installed VPN manager from the latest normal published project
+release, then verify the resulting managed state:
+
+```bash
+vpn self-update
+vpn health
+```
+
+The command downloads `install-sing-box-server.sh` and its published SHA-256
+from the official GitHub Release, verifies that the bytes match, and validates
+the candidate's Bash syntax, project identity, and version before asking for
+confirmation. It refuses downgrades and makes no change when that release is
+already installed. The SHA-256 asset from the same GitHub Release detects
+accidental corruption or mismatched assets, but is not a trust anchor
+independent of GitHub.
+
+After confirmation, the existing transactional overlay upgrade runs in a
+one-time systemd unit independently of the SSH session. Settings, clients,
+credentials, certificates, SSH, and firewall state are preserved. sing-box may
+briefly restart; if SSH is routed through this same VPN, the connection may
+disconnect while the update continues on the server. Reconnect and run
+`vpn health`. If the SSH transport cannot be proven direct, the validated
+management helper is handed off before the command returns while the managed
+runtime and state markers remain at the previous version; a pending outcome is
+recorded and the candidate-compatible worker applies the overlay once after
+the session ends.
+
+For an exact reviewed or offline candidate, keep using:
+
+```bash
+vpn self-update /path/to/install-sing-box-server.sh
+```
+
+`vpn self-update --yes` selects the latest release without the final prompt;
+the same non-interactive mutation policy still applies. This command updates
+the installer and managed overlay only; `vpn update` remains the separate
+sing-box package update.
 
 ## What the installer configures
 
@@ -213,7 +277,7 @@ the subscription threat model.
 IP or protocol is reachable from a Russian network, that a provider firewall is
 open, or that traffic passes a particular ISP's filtering.
 
-1. Run `vpn health`, then `vpn health --verbose` if a server-side row fails.
+1. Run `vpn health`, then `vpn health -v` if a server-side row fails.
 2. If the server is healthy, test the same VPS/IP from another access network.
 3. Test REALITY TCP/443 and Hysteria2 UDP/443 independently; they have different
    failure domains.
@@ -271,6 +335,9 @@ bash tests/fingerprint-smoke.sh
 bash tests/health-smoke.sh
 bash tests/management-lifecycle-smoke.sh
 bash tests/package-policy-smoke.sh
+bash tests/self-update-smoke.sh
+bash tests/deferred-overlay-smoke.sh
+bash tests/same-version-reconciliation-smoke.sh
 sudo bash tests/firewall-smoke.sh
 ./install-sing-box-server.sh plan
 ```

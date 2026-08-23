@@ -113,7 +113,7 @@ cli_unknown_option() {
   local option="$1" known
   local -a known_options=(
     --admin-user --public-key --server-ipv4 --domain --email --ssh-port
-    --reality-target --fingerprint --emoji --yes --verbose --debug --automatic
+    --reality-target --fingerprint --emoji --yes --verbose -v --debug --automatic
     --help -h
   )
   printf '[ERROR] Unknown option: %s\n' "$option" >&2
@@ -297,6 +297,13 @@ acquire_operation_lock() {
   require_command flock
   exec 7>"$INSTALL_LOCK_FILE"
   flock -x 7
+  if declare -F deferred_recover_orphaned_jobs >/dev/null 2>&1 &&
+     [[ -z "$DEFERRED_JOB_DIR" ]]; then
+    deferred_recover_orphaned_jobs
+  fi
+  if declare -F deferred_refuse_if_pending >/dev/null 2>&1; then
+    deferred_refuse_if_pending
+  fi
 }
 
 acquire_bootstrap_lock() {
@@ -364,7 +371,7 @@ Usage:
   sudo ./install-sing-box-server.sh check
   sudo ./install-sing-box-server.sh install
   sudo ./install-sing-box-server.sh upgrade
-  vpn health [--verbose|--debug]
+  vpn health [-v|--verbose|--debug]
   vpn add NAME
   vpn show [NAME]
   vpn delete NAME
@@ -373,7 +380,8 @@ Usage:
   vpn set-fingerprint [VALUE]
   vpn set-obfs [off|salamander]
   vpn update
-  vpn self-update /path/to/new/install-sing-box-server.sh
+  vpn self-update [--yes]
+  vpn self-update /path/to/new/install-sing-box-server.sh [--yes]
 
 Install options (missing values are requested interactively):
   --admin-user NAME        Full administrative account with passwordless sudo.
@@ -386,7 +394,7 @@ Install options (missing values are requested interactively):
   --fingerprint VALUE      Initial client TLS fingerprint (default: chrome).
   --emoji EMOJI            Server/country emoji for non-interactive installs.
   --yes                    Skip the final confirmation prompt for a mutating operation.
-  --verbose                Show structured component diagnostics.
+  -v, --verbose            Show structured component diagnostics.
   --debug                  Add bounded low-level diagnostics to verbose health output.
   --automatic              Internal use by the firewall rollback timer.
   -h, --help               Show this help.
@@ -453,8 +461,17 @@ parse_args() {
         ;;
       self-update)
         COMMAND="self-update"
-        (( $# >= 2 )) || cli_error 'self-update requires a path to a newer installer file.'
-        SELF_UPDATE_SOURCE="$2"
+        if (( $# >= 2 )) && [[ "$2" != -* ]]; then
+          SELF_UPDATE_SOURCE="$2"
+          shift 2
+        else
+          shift
+        fi
+        ;;
+      deferred-activate)
+        COMMAND="deferred-activate"
+        (( $# >= 2 )) || cli_error 'deferred-activate requires an internal job directory.'
+        DEFERRED_JOB_DIR="$2"
         shift 2
         ;;
       *)
@@ -515,7 +532,7 @@ parse_args() {
         ASSUME_YES=1
         shift
         ;;
-      --verbose)
+      -v|--verbose)
         VERBOSE=1
         shift
         ;;

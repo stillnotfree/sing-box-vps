@@ -193,11 +193,17 @@ preflight_key() {
   done
 }
 
+apt_install_with_lock_timeout() {
+  DEBIAN_FRONTEND=noninteractive apt-get \
+    -o "DPkg::Lock::Timeout=${APT_DPKG_LOCK_TIMEOUT_SECONDS}" \
+    install "$@"
+}
+
 install_base_packages() {
   log 'Refreshing Debian package metadata.'
   apt-get update
   log 'Installing the reviewed dependency set.'
-  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+  apt_install_with_lock_timeout -y --no-install-recommends \
     "${BASE_PACKAGES[@]}"
   # Debian/Ubuntu may start the packaged default HTTP site immediately. Keep
   # nginx stopped until the certificate and restricted subscription site exist.
@@ -334,7 +340,7 @@ install_sing_box() {
       archive_sing_box_package "$package_path" >/dev/null
       cleanup_apt_download_dir
     fi
-    apt-mark hold sing-box >/dev/null
+    ensure_sing_box_package_hold || die 'Existing sing-box is current, but its APT hold could not be verified.'
     log "Verified existing stable sing-box ${installed_version}; reusing it."
     return
   fi
@@ -344,10 +350,10 @@ install_sing_box() {
   cleanup_apt_download_dir
 
   apt-mark unhold sing-box >/dev/null 2>&1 || true
-  DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-change-held-packages \
+  apt_install_with_lock_timeout -y --allow-change-held-packages \
     "sing-box=${candidate}"
   installed_version="$(dpkg-query -W -f='${Version}' sing-box 2>/dev/null || true)"
   [[ "$installed_version" == "$candidate" ]] || die "Unexpected installed sing-box version: ${installed_version:-missing}"
-  apt-mark hold sing-box >/dev/null
+  ensure_sing_box_package_hold || die 'Installed sing-box package is not held after installation.'
   log "Installed and held stable sing-box ${installed_version}; use 'vpn update' for reviewed updates."
 }

@@ -20,6 +20,7 @@
 #   vpn set-fingerprint
 #   vpn set-obfs off|salamander
 #   vpn update
+#   vpn self-update
 #   vpn self-update /path/to/new/install-sing-box-server.sh
 #
 # This script intentionally does not install a web panel, Docker, Xray, UFW,
@@ -30,13 +31,17 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly SCRIPT_VERSION="1.0.10"
+readonly SCRIPT_VERSION="1.0.11"
 readonly SING_BOX_MIN_VERSION="1.13.0"
 readonly SING_BOX_MAX_EXCLUSIVE="1.14.0"
 readonly PROJECT_NAME="vpn-setup"
 readonly SAGERNET_KEY_URL="https://sing-box.app/gpg.key"
 readonly SAGERNET_KEY_FILE="/etc/apt/keyrings/sagernet.asc"
 readonly SAGERNET_SOURCE_FILE="/etc/apt/sources.list.d/sagernet.sources"
+# Fresh Debian/Ubuntu images may have apt-daily-upgrade holding dpkg while the
+# reviewed package set is installed. Keep the wait finite and shared by every
+# package installation that needs the dpkg frontend lock.
+readonly APT_DPKG_LOCK_TIMEOUT_SECONDS="300"
 
 readonly STATE_DIR="/var/lib/${PROJECT_NAME}"
 readonly ROLLBACK_DIR="${STATE_DIR}/rollback"
@@ -51,6 +56,12 @@ readonly FIREWALL_LOCK_FILE="${STATE_DIR}/firewall.lock"
 readonly PACKAGE_CACHE_DIR="${STATE_DIR}/packages"
 readonly APT_DOWNLOAD_ROOT="/var/cache/${PROJECT_NAME}-apt-downloads"
 readonly INSTALLER_BACKUP_DIR="${STATE_DIR}/installer-backups"
+readonly SELF_UPDATE_STAGING_DIR="${STATE_DIR}/self-update"
+readonly OPERATION_OUTCOME_ROOT="${STATE_DIR}/operation-outcomes"
+readonly DEFERRED_MUTATION_ROOT="${STATE_DIR}/deferred-mutations"
+readonly SELF_UPDATE_RELEASE_BASE="https://github.com/stillnotfree/sing-box-vps/releases/latest/download"
+readonly SELF_UPDATE_INSTALLER_ASSET="install-sing-box-server.sh"
+readonly SELF_UPDATE_CHECKSUM_ASSET="install-sing-box-server.sh.sha256"
 readonly INITIAL_CLIENT_NAME="default"
 readonly DEFAULT_CLIENT_FINGERPRINT="chrome"
 readonly DEFAULT_HY2_OBFS_MODE="off"
@@ -66,12 +77,15 @@ readonly UDP_BUFFER_MAX="7340032"
 readonly CONFIG_DIR="/etc/sing-box"
 readonly CONFIG_FILE="${CONFIG_DIR}/config.json"
 readonly CERT_DIR="${CONFIG_DIR}/certs"
+readonly HY2_MASQUERADE_ROOT="${CONFIG_DIR}/masquerade"
 readonly SYSTEMD_DROPIN_DIR="/etc/systemd/system/sing-box.service.d"
 readonly SYSTEMD_DROPIN="${SYSTEMD_DROPIN_DIR}/10-vpn-hardening.conf"
 readonly JOURNAL_DROPIN_DIR="/etc/systemd/journald.conf.d"
 readonly JOURNAL_DROPIN="${JOURNAL_DROPIN_DIR}/90-vpn-limits.conf"
 readonly UDP_SYSCTL_FILE="/etc/sysctl.d/90-vpn-udp-buffers.conf"
 readonly NFT_CONFIG="/etc/nftables.conf"
+readonly NFTABLES_SYSTEMD_DROPIN_DIR="/etc/systemd/system/nftables.service.d"
+readonly NFTABLES_SYSTEMD_DROPIN="${NFTABLES_SYSTEMD_DROPIN_DIR}/90-vpn-table-boundary.conf"
 readonly SSH_DROPIN="/etc/ssh/sshd_config.d/00-vpn-hardening.conf"
 readonly AUTO_FINALIZE_SSH_DROPIN="/etc/ssh/sshd_config.d/99-vpn-auto-finalize.conf"
 readonly AUTO_FINALIZE_WRAPPER="/usr/local/libexec/vpn-auto-finalize-login"
@@ -117,6 +131,8 @@ AUDIT_TARGET=""
 NEW_CLIENT_FINGERPRINT=""
 NEW_HY2_OBFS_MODE=""
 SELF_UPDATE_SOURCE=""
+DEFERRED_JOB_DIR=""
+DEFERRED_OUTCOME_FILE=""
 OS_ID=""
 OS_VERSION=""
 OS_PRETTY_NAME=""
@@ -127,6 +143,17 @@ INSTALL_LOG_ACTIVE=0
 MUTATION_COMMIT_ACTIVE=0
 DEFERRED_MUTATION_SIGNAL=""
 DEFERRED_MUTATION_STATUS=0
+DEFERRED_MUTATION_QUEUED=0
+MANAGEMENT_SESSION_CLASS=""
+MANAGEMENT_SESSION_REASON=""
+MANAGEMENT_SSH_CONNECTION=""
+MANAGEMENT_SSH_ANCESTOR_PID=""
+MANAGEMENT_SSH_ANCESTOR_FOUND=0
+MANAGEMENT_TRANSPORT_LOCAL_ENDPOINT=""
+MANAGEMENT_TRANSPORT_REMOTE_ENDPOINT=""
+MANAGEMENT_TRANSPORT_SOCKET_COOKIE=""
+MANAGEMENT_TRANSPORT_SOCKET_INODE=""
+DEFERRED_BASELINE_MISMATCH=""
 ERROR_REPORTED=0
 UPGRADE_ROLLBACK_ACTIVE=0
 UPGRADE_ROLLBACK_FAILED=0
@@ -134,6 +161,7 @@ UPGRADE_BACKUP_DIR=""
 UPGRADE_ORIGINAL_RMEM=""
 UPGRADE_ORIGINAL_WMEM=""
 LAST_HELPER_BACKUP=""
+DEFERRED_HELPER_BACKUP=""
 BOOTSTRAP_LOCK_OWNED=0
 log() {
   printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
@@ -250,7 +278,7 @@ cli_unknown_option() {
   local option="$1" known
   local -a known_options=(
     --admin-user --public-key --server-ipv4 --domain --email --ssh-port
-    --reality-target --fingerprint --emoji --yes --verbose --debug --automatic
+    --reality-target --fingerprint --emoji --yes --verbose -v --debug --automatic
     --help -h
   )
   printf '[ERROR] Unknown option: %s\n' "$option" >&2
@@ -434,6 +462,13 @@ acquire_operation_lock() {
   require_command flock
   exec 7>"$INSTALL_LOCK_FILE"
   flock -x 7
+  if declare -F deferred_recover_orphaned_jobs >/dev/null 2>&1 &&
+     [[ -z "$DEFERRED_JOB_DIR" ]]; then
+    deferred_recover_orphaned_jobs
+  fi
+  if declare -F deferred_refuse_if_pending >/dev/null 2>&1; then
+    deferred_refuse_if_pending
+  fi
 }
 
 acquire_bootstrap_lock() {
@@ -501,7 +536,7 @@ Usage:
   sudo ./install-sing-box-server.sh check
   sudo ./install-sing-box-server.sh install
   sudo ./install-sing-box-server.sh upgrade
-  vpn health [--verbose|--debug]
+  vpn health [-v|--verbose|--debug]
   vpn add NAME
   vpn show [NAME]
   vpn delete NAME
@@ -510,7 +545,8 @@ Usage:
   vpn set-fingerprint [VALUE]
   vpn set-obfs [off|salamander]
   vpn update
-  vpn self-update /path/to/new/install-sing-box-server.sh
+  vpn self-update [--yes]
+  vpn self-update /path/to/new/install-sing-box-server.sh [--yes]
 
 Install options (missing values are requested interactively):
   --admin-user NAME        Full administrative account with passwordless sudo.
@@ -523,7 +559,7 @@ Install options (missing values are requested interactively):
   --fingerprint VALUE      Initial client TLS fingerprint (default: chrome).
   --emoji EMOJI            Server/country emoji for non-interactive installs.
   --yes                    Skip the final confirmation prompt for a mutating operation.
-  --verbose                Show structured component diagnostics.
+  -v, --verbose            Show structured component diagnostics.
   --debug                  Add bounded low-level diagnostics to verbose health output.
   --automatic              Internal use by the firewall rollback timer.
   -h, --help               Show this help.
@@ -590,8 +626,17 @@ parse_args() {
         ;;
       self-update)
         COMMAND="self-update"
-        (( $# >= 2 )) || cli_error 'self-update requires a path to a newer installer file.'
-        SELF_UPDATE_SOURCE="$2"
+        if (( $# >= 2 )) && [[ "$2" != -* ]]; then
+          SELF_UPDATE_SOURCE="$2"
+          shift 2
+        else
+          shift
+        fi
+        ;;
+      deferred-activate)
+        COMMAND="deferred-activate"
+        (( $# >= 2 )) || cli_error 'deferred-activate requires an internal job directory.'
+        DEFERRED_JOB_DIR="$2"
         shift 2
         ;;
       *)
@@ -652,7 +697,7 @@ parse_args() {
         ASSUME_YES=1
         shift
         ;;
-      --verbose)
+      -v|--verbose)
         VERBOSE=1
         shift
         ;;
@@ -1370,11 +1415,17 @@ preflight_key() {
   done
 }
 
+apt_install_with_lock_timeout() {
+  DEBIAN_FRONTEND=noninteractive apt-get \
+    -o "DPkg::Lock::Timeout=${APT_DPKG_LOCK_TIMEOUT_SECONDS}" \
+    install "$@"
+}
+
 install_base_packages() {
   log 'Refreshing Debian package metadata.'
   apt-get update
   log 'Installing the reviewed dependency set.'
-  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+  apt_install_with_lock_timeout -y --no-install-recommends \
     "${BASE_PACKAGES[@]}"
   # Debian/Ubuntu may start the packaged default HTTP site immediately. Keep
   # nginx stopped until the certificate and restricted subscription site exist.
@@ -1511,7 +1562,7 @@ install_sing_box() {
       archive_sing_box_package "$package_path" >/dev/null
       cleanup_apt_download_dir
     fi
-    apt-mark hold sing-box >/dev/null
+    ensure_sing_box_package_hold || die 'Existing sing-box is current, but its APT hold could not be verified.'
     log "Verified existing stable sing-box ${installed_version}; reusing it."
     return
   fi
@@ -1521,11 +1572,11 @@ install_sing_box() {
   cleanup_apt_download_dir
 
   apt-mark unhold sing-box >/dev/null 2>&1 || true
-  DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-change-held-packages \
+  apt_install_with_lock_timeout -y --allow-change-held-packages \
     "sing-box=${candidate}"
   installed_version="$(dpkg-query -W -f='${Version}' sing-box 2>/dev/null || true)"
   [[ "$installed_version" == "$candidate" ]] || die "Unexpected installed sing-box version: ${installed_version:-missing}"
-  apt-mark hold sing-box >/dev/null
+  ensure_sing_box_package_hold || die 'Installed sing-box package is not held after installation.'
   log "Installed and held stable sing-box ${installed_version}; use 'vpn update' for reviewed updates."
 }
 path_has_symlink_component() {
@@ -2145,6 +2196,19 @@ install -d -o root -g sing-box -m 0750 "\$cert_dir"
 work_dir="\$(mktemp -d "\${cert_dir}/.renew.XXXXXX")"
 had_previous=0
 commit_active=0
+original_pid="\$(systemctl show -p MainPID --value "\$service" 2>/dev/null || true)"
+
+wait_for_same_pid() {
+  expected="\$1"
+  attempt=0
+  while [ "\$attempt" -lt 30 ]; do
+    [ "\$(systemctl is-active "\$service" 2>/dev/null || true)" = active ] || return 1
+    [ "\$(systemctl show -p MainPID --value "\$service" 2>/dev/null || true)" = "\$expected" ] && return 0
+    attempt=\$((attempt + 1))
+    sleep 1
+  done
+  return 1
+}
 
 cleanup() {
   status=\$?
@@ -2169,7 +2233,8 @@ restore_previous() {
     install -o root -g sing-box -m 0640 "\${work_dir}/previous-privkey.pem" "\${cert_dir}/privkey.pem.restore" || restore_failed=1
     mv -f -- "\${cert_dir}/fullchain.pem.restore" "\${cert_dir}/fullchain.pem" || restore_failed=1
     mv -f -- "\${cert_dir}/privkey.pem.restore" "\${cert_dir}/privkey.pem" || restore_failed=1
-    systemctl restart "\$service" >/dev/null 2>&1 || restore_failed=1
+    sing-box check -c "\$config_file" >/dev/null 2>&1 || restore_failed=1
+    wait_for_same_pid "\$original_pid" || restore_failed=1
     systemctl reload-or-restart "\$nginx_service" >/dev/null 2>&1 || restore_failed=1
     systemctl is-active --quiet "\$nginx_service" || restore_failed=1
   else
@@ -2180,6 +2245,8 @@ restore_previous() {
 
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
+
+[ "\$original_pid" -gt 0 ] 2>/dev/null
 
 install -o root -g root -m 0600 "\${live_dir}/fullchain.pem" "\${work_dir}/new-fullchain.pem"
 install -o root -g root -m 0600 "\${live_dir}/privkey.pem" "\${work_dir}/new-privkey.pem"
@@ -2206,7 +2273,7 @@ mv -f -- "\${cert_dir}/privkey.pem.new" "\${cert_dir}/privkey.pem"
 if ! sing-box check -c "\$config_file" >/dev/null 2>&1; then
   exit 1
 fi
-if ! systemctl reload-or-restart "\$service" || ! systemctl is-active --quiet "\$service"; then
+if ! wait_for_same_pid "\$original_pid"; then
   exit 1
 fi
 if ! systemctl reload "\$nginx_service" || ! systemctl is-active --quiet "\$nginx_service"; then
@@ -2272,7 +2339,7 @@ smoke_test_certificate_hook() {
   verify_certificate_automation
   systemctl is-active --quiet sing-box.service || die 'sing-box is inactive after the certificate deploy-hook smoke test.'
   systemctl is-active --quiet nginx.service || die 'nginx is inactive after the certificate deploy-hook smoke test.'
-  log 'Certificate renewal hook, key pair, deployed copy, timer, sing-box, and nginx reload paths passed verification.'
+  log 'Certificate renewal hook, key pair, deployed copy, timer, unchanged sing-box PID, and nginx reload paths passed verification.'
 }
 
 obtain_certificate() {
@@ -2414,6 +2481,73 @@ initialize_client_database() {
   log "Created initial independent VPN client: ${initial_name}."
 }
 
+render_hy2_masquerade_site() {
+  local output="$1"
+  cat >"$output" <<'EOF'
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Welcome</title>
+</head>
+<body>
+  <main>
+    <h1>Welcome</h1>
+    <p>This site is available.</p>
+  </main>
+</body>
+</html>
+EOF
+}
+
+install_hy2_masquerade() {
+  local candidate staged
+  install -d -o root -g sing-box -m 0750 "$CONFIG_DIR"
+  install -d -o root -g sing-box -m 0750 "$HY2_MASQUERADE_ROOT"
+  # The directory may already exist with drifted ownership or mode. Make the
+  # managed boundary explicit before publishing the replacement file.
+  chown root:sing-box "$HY2_MASQUERADE_ROOT"
+  chmod 0750 "$HY2_MASQUERADE_ROOT"
+  candidate="$(mktemp)"
+  render_hy2_masquerade_site "$candidate"
+  staged="${HY2_MASQUERADE_ROOT}/index.html.new"
+  install -o root -g sing-box -m 0644 "$candidate" \
+    "$staged"
+  chown root:sing-box "$staged"
+  chmod 0644 "$staged"
+  mv -f -- "$staged" \
+    "${HY2_MASQUERADE_ROOT}/index.html"
+  rm -f -- "$candidate"
+}
+
+hy2_masquerade_is_healthy() {
+  local actual
+  [[ -d "$HY2_MASQUERADE_ROOT" && ! -L "$HY2_MASQUERADE_ROOT" ]] || return 1
+  actual="$(stat -c '%a:%U:%G' "$HY2_MASQUERADE_ROOT" 2>/dev/null || true)"
+  [[ "$actual" == '750:root:sing-box' ]] || return 1
+  [[ -f "${HY2_MASQUERADE_ROOT}/index.html" &&
+     ! -L "${HY2_MASQUERADE_ROOT}/index.html" ]] || return 1
+  actual="$(stat -c '%a:%U:%G' "${HY2_MASQUERADE_ROOT}/index.html" 2>/dev/null || true)"
+  [[ "$actual" == '644:root:sing-box' ]]
+}
+
+reconcile_same_version_non_runtime_state() {
+  local changed=0
+  if ! hy2_masquerade_is_healthy; then
+    install_hy2_masquerade
+    hy2_masquerade_is_healthy || \
+      die 'Same-version managed masquerade reconciliation did not restore its ownership and mode invariant.'
+    changed=1
+  fi
+  if ! nftables_service_boundary_is_healthy; then
+    configure_nftables_service_boundary
+    changed=1
+  fi
+  (( changed == 1 )) || return 0
+  log 'Reconciled same-version non-runtime managed state without restarting sing-box.'
+}
+
 build_sing_box_config() {
   local database="$1"
   local output="$2"
@@ -2501,13 +2635,8 @@ ${hy2_obfs_block}
         "key_path": "${CERT_DIR}/privkey.pem"
       },
       "masquerade": {
-        "type": "string",
-        "status_code": 404,
-        "headers": {
-          "server": "nginx",
-          "content-type": "text/html; charset=utf-8"
-        },
-        "content": "<!doctype html><html><head><title>404 Not Found</title></head><body><h1>404 Not Found</h1></body></html>"
+        "type": "file",
+        "directory": "${HY2_MASQUERADE_ROOT}"
       }
     }
   ],
@@ -2550,6 +2679,7 @@ EOF
 write_sing_box_config() {
   local candidate
   initialize_client_database
+  install_hy2_masquerade
   install -d -o root -g sing-box -m 0750 "$CONFIG_DIR"
   candidate="$(mktemp)"
   build_sing_box_config "$CLIENTS_FILE" "$candidate"
@@ -2614,6 +2744,132 @@ require_client_runtime() {
   validate_client_database "$CLIENTS_FILE"
 }
 
+deferred_job_is_safe() {
+  local job="$1" resolved
+  [[ -n "$job" && "$job" == "${DEFERRED_MUTATION_ROOT}"/job.* ]] || return 1
+  [[ -d "$job" && ! -L "$job" ]] || return 1
+  resolved="$(readlink -f "$job" 2>/dev/null || true)"
+  [[ "$resolved" == "$job" ]] || return 1
+  [[ -f "${job}/metadata" && ! -L "${job}/metadata" ]] || return 1
+  return 0
+}
+
+activate_deferred_state_job() {
+  local job="$1" operation config_backup clients_backup settings_backup
+  local subscriptions_backup failed=0 restore_failed=0
+  operation="$(deferred_job_field operation "${job}/metadata")"
+
+  require_client_runtime
+  acquire_operation_lock
+  exec 9>"$CLIENT_LOCK_FILE"
+  flock -x 9
+  new_temp_dir
+  config_backup="${TMP_DIR}/config.deferred.before.json"
+  clients_backup="${TMP_DIR}/clients.deferred.before.json"
+  settings_backup="${TMP_DIR}/settings.deferred.before.json"
+  subscriptions_backup="${TMP_DIR}/subscriptions.deferred.before"
+
+  [[ -f "${job}/config.candidate" ]] || die 'Deferred activation is missing its candidate sing-box configuration.'
+  [[ -d "${job}/subscriptions" ]] || die 'Deferred activation is missing its candidate subscriptions.'
+  sing-box check -c "${job}/config.candidate" >/dev/null
+  if [[ -f "${job}/clients.candidate" ]]; then
+    validate_client_database "${job}/clients.candidate"
+    install -o root -g root -m 0600 "$CLIENTS_FILE" "$clients_backup"
+  fi
+  if [[ -f "${job}/settings.candidate" ]]; then
+    jq -e '.schema_version == 1' "${job}/settings.candidate" >/dev/null || \
+      die 'Deferred activation contains an invalid candidate settings file.'
+    install -o root -g root -m 0600 "$SETTINGS_FILE" "$settings_backup"
+  fi
+  install -o root -g sing-box -m 0640 "$CONFIG_FILE" "$config_backup"
+  install -d -o root -g root -m 0700 "$subscriptions_backup"
+  cp -a -- "${SUBSCRIPTION_ROOT}/." "$subscriptions_backup/"
+
+  begin_mutation_commit
+  if [[ -f "${job}/clients.candidate" ]]; then
+    install -o root -g root -m 0600 "${job}/clients.candidate" "${CLIENTS_FILE}.new" || failed=1
+    mv -f -- "${CLIENTS_FILE}.new" "$CLIENTS_FILE" || failed=1
+  fi
+  if (( failed == 0 )) && [[ -f "${job}/settings.candidate" ]]; then
+    install -o root -g root -m 0600 "${job}/settings.candidate" "${SETTINGS_FILE}.new" || failed=1
+    mv -f -- "${SETTINGS_FILE}.new" "$SETTINGS_FILE" || failed=1
+    if (( failed == 0 )); then
+      load_settings || failed=1
+    fi
+  fi
+  if (( failed == 0 )); then
+    install -o root -g sing-box -m 0640 "${job}/config.candidate" "${CONFIG_FILE}.new" || failed=1
+    mv -f -- "${CONFIG_FILE}.new" "$CONFIG_FILE" || failed=1
+  fi
+  if (( failed == 0 )); then
+    activate_subscription_tree "${job}/subscriptions" || failed=1
+  fi
+  if (( failed == 0 )); then
+    systemctl restart sing-box.service || failed=1
+    systemctl is-active --quiet sing-box.service || failed=1
+    sing-box check -c "$CONFIG_FILE" >/dev/null 2>&1 || failed=1
+    subscription_service_healthy || failed=1
+  fi
+
+  if (( failed == 1 )); then
+    warn "Deferred ${operation} activation failed; restoring the previous managed state."
+    if [[ -f "$clients_backup" ]]; then
+      install -o root -g root -m 0600 "$clients_backup" "${CLIENTS_FILE}.rollback" || restore_failed=1
+      mv -f -- "${CLIENTS_FILE}.rollback" "$CLIENTS_FILE" || restore_failed=1
+    fi
+    if [[ -f "$settings_backup" ]]; then
+      install -o root -g root -m 0600 "$settings_backup" "${SETTINGS_FILE}.rollback" || restore_failed=1
+      mv -f -- "${SETTINGS_FILE}.rollback" "$SETTINGS_FILE" || restore_failed=1
+      load_settings || restore_failed=1
+    fi
+    install -o root -g sing-box -m 0640 "$config_backup" "${CONFIG_FILE}.rollback" || restore_failed=1
+    mv -f -- "${CONFIG_FILE}.rollback" "$CONFIG_FILE" || restore_failed=1
+    activate_subscription_tree "$subscriptions_backup" || restore_failed=1
+    sing-box check -c "$CONFIG_FILE" >/dev/null 2>&1 || restore_failed=1
+    systemctl restart sing-box.service || restore_failed=1
+    systemctl is-active --quiet sing-box.service || restore_failed=1
+    subscription_service_healthy || restore_failed=1
+    if (( restore_failed == 1 )); then
+      die "Deferred ${operation} activation and rollback both failed; recovery files are preserved in ${TMP_DIR}."
+    fi
+    finish_mutation_commit
+    die "Deferred ${operation} activation failed; the previous state was restored."
+  fi
+
+  finish_mutation_commit
+}
+
+deferred_activate_job() {
+  local job="$1" operation
+  require_root
+  deferred_job_is_safe "$job" || die 'Refusing an unsafe deferred activation job path.'
+  operation="$(deferred_job_field operation "${job}/metadata")"
+  deferred_job_verify_baseline "$job" || \
+    die "Deferred ${operation:-operation} baseline mismatch: ${DEFERRED_BASELINE_MISMATCH}; the stale candidate was not applied."
+  case "$operation" in
+    client-add|client-delete|reality-target|fingerprint|hy2-obfs)
+      activate_deferred_state_job "$job"
+      ;;
+    overlay-upgrade)
+      [[ -f "${job}/config.candidate" && -d "${job}/subscriptions" ]] || \
+        die 'Deferred overlay upgrade is missing its validated candidate state.'
+      sing-box check -c "${job}/config.candidate" >/dev/null
+      ASSUME_YES=1
+      # The worker has already waited for the originating SSH transport. Do not
+      # let its inherited SSH_CONNECTION trigger a second deferral.
+      unset SSH_CONNECTION
+      upgrade_existing_installation
+      ;;
+    core-update)
+      ASSUME_YES=1
+      activate_deferred_core_update "$job"
+      ;;
+    *)
+      die "Unknown deferred activation operation: ${operation:-missing}."
+      ;;
+  esac
+}
+
 find_client_json() {
   local name="$1"
   jq -c --arg name "$name" \
@@ -2630,14 +2886,18 @@ restore_client_transaction() {
   install -o root -g sing-box -m 0640 "$config_backup" "${CONFIG_FILE}.rollback"
   mv -f -- "${CONFIG_FILE}.rollback" "$CONFIG_FILE"
   publish_subscription_tree "$CLIENTS_FILE"
+  validate_client_database "$CLIENTS_FILE"
   sing-box check -c "$CONFIG_FILE" || die 'Rollback configuration validation failed.'
   systemctl restart sing-box.service || die 'Rollback restored the files, but sing-box could not be restarted.'
   systemctl is-active --quiet sing-box.service || die 'Rollback restored the files, but sing-box is not active.'
+  subscription_service_healthy || die 'Rollback restored the files, but subscriptions failed their health check.'
 }
 
 apply_client_database() {
-  local candidate_database="$1"
+  local candidate_database="$1" operation="${2:-client-change}"
+  local description="${3:-Client configuration change; activation is pending.}"
   local candidate_config candidate_subscriptions database_backup config_backup
+  DEFERRED_MUTATION_QUEUED=0
   [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]] || die 'Internal client transaction directory is unavailable.'
   candidate_config="${TMP_DIR}/config.candidate.json"
   database_backup="${TMP_DIR}/clients.before.json"
@@ -2647,6 +2907,17 @@ apply_client_database() {
   validate_client_database "$candidate_database"
   build_sing_box_config "$candidate_database" "$candidate_config"
   render_subscription_tree "$candidate_database" "$candidate_subscriptions"
+
+  if management_ssh_requires_deferred_activation; then
+    sing-box check -c "$candidate_config" >/dev/null
+    deferred_job_create "$operation" "$description"
+    deferred_job_stage_file "$candidate_database" clients.candidate root root 0600
+    deferred_job_stage_file "$candidate_config" config.candidate root sing-box 0640
+    deferred_job_stage_tree "$candidate_subscriptions" subscriptions
+    queue_deferred_mutation
+    return 0
+  fi
+
   install -o root -g root -m 0600 "$CLIENTS_FILE" "$database_backup"
   install -o root -g root -m 0600 "$CONFIG_FILE" "$config_backup"
 
@@ -2724,6 +2995,8 @@ reconcile_managed_runtime() {
     activate_subscription_tree "$subscriptions_backup" || restore_failed=1
     systemctl restart sing-box.service || restore_failed=1
     systemctl is-active --quiet sing-box.service || restore_failed=1
+    sing-box check -c "$CONFIG_FILE" >/dev/null 2>&1 || restore_failed=1
+    subscription_service_healthy || restore_failed=1
     if (( restore_failed == 1 )); then
       die "Managed runtime reconciliation and its rollback both failed; recovery files are preserved in ${TMP_DIR}."
     fi
@@ -2765,7 +3038,13 @@ client_add() {
       created_at: $created
     }')"
   append_client_to_database "$CLIENTS_FILE" "$client" "$candidate"
-  apply_client_database "$candidate"
+  apply_client_database "$candidate" client-add \
+    "Client ${CLIENT_NAME} add; activation is pending until the SSH transport ends."
+  if (( DEFERRED_MUTATION_QUEUED == 1 )); then
+    printf 'Client %s is staged; run "vpn show %s" after activation to retrieve its credentials.\n' \
+      "$CLIENT_NAME" "$CLIENT_NAME"
+    return
+  fi
   log "Client ${CLIENT_NAME} added with independent VLESS and Hysteria2 credentials."
   client="$(find_client_json "$CLIENT_NAME")"
   show_client_material "$client"
@@ -3099,7 +3378,13 @@ client_delete() {
   new_temp_dir
   candidate="${TMP_DIR}/clients.candidate.json"
   remove_client_from_database "$CLIENTS_FILE" "$stored_name" "$candidate"
-  apply_client_database "$candidate"
+  apply_client_database "$candidate" client-delete \
+    "Client ${stored_name} deletion; credential revocation is pending until the SSH transport ends."
+  if (( DEFERRED_MUTATION_QUEUED == 1 )); then
+    printf 'Client %s deletion is staged; credential revocation is pending until activation.\n' \
+      "$stored_name"
+    return
+  fi
   log "Client ${stored_name} deleted; its VLESS UUID and Hysteria2 password are no longer accepted."
 }
 
@@ -3126,14 +3411,17 @@ restore_target_transaction() {
   mv -f -- "${SETTINGS_FILE}.rollback" "$SETTINGS_FILE"
   mv -f -- "${CONFIG_FILE}.rollback" "$CONFIG_FILE"
   activate_subscription_tree "$subscriptions_backup" || die 'Subscription rollback failed.'
+  load_settings || die 'Restored settings failed validation.'
   sing-box check -c "$CONFIG_FILE" || die 'Restored sing-box configuration validation failed.'
   systemctl restart sing-box.service || die 'Restored sing-box service could not be restarted.'
   systemctl is-active --quiet sing-box.service || die 'Restored sing-box service is inactive.'
+  subscription_service_healthy || die 'Restored subscriptions failed their health check.'
 }
 
 set_reality_target() {
   local old_target candidate_settings candidate_config candidate_subscriptions old_subscriptions
   local settings_backup config_backup previous_audit_target audit_status=0 failed=0
+  DEFERRED_MUTATION_QUEUED=0
   require_client_runtime
   domain_is_valid "$NEW_REALITY_TARGET" || \
     cli_error "Invalid fully qualified domain: $NEW_REALITY_TARGET"
@@ -3190,6 +3478,17 @@ set_reality_target() {
   build_sing_box_config "$CLIENTS_FILE" "$candidate_config"
   render_subscription_tree "$CLIENTS_FILE" "$candidate_subscriptions"
 
+  if management_ssh_requires_deferred_activation; then
+    sing-box check -c "$candidate_config" >/dev/null
+    deferred_job_create reality-target \
+      "REALITY target ${NEW_REALITY_TARGET} change; sing-box activation is pending until the SSH transport ends."
+    deferred_job_stage_file "$candidate_settings" settings.candidate root root 0600
+    deferred_job_stage_file "$candidate_config" config.candidate root sing-box 0640
+    deferred_job_stage_tree "$candidate_subscriptions" subscriptions
+    queue_deferred_mutation
+    return 0
+  fi
+
   install -o root -g root -m 0600 "$candidate_settings" "${SETTINGS_FILE}.new"
   install -o root -g sing-box -m 0640 "$candidate_config" "${CONFIG_FILE}.new"
   begin_mutation_commit
@@ -3218,6 +3517,10 @@ set_reality_target() {
   fi
 
   finish_mutation_commit
+  if (( DEFERRED_MUTATION_QUEUED == 1 )); then
+    log "REALITY target change staged: ${old_target} -> ${REALITY_TARGET}; activation is pending."
+    return
+  fi
   log "REALITY target changed transactionally: ${old_target} -> ${REALITY_TARGET}."
   printf 'Subscription URLs are unchanged. Refresh the subscription on each device.\n'
 }
@@ -3228,13 +3531,15 @@ restore_fingerprint_transaction() {
   CLIENT_FINGERPRINT="$old_fingerprint"
   install -o root -g root -m 0600 "$settings_backup" "${SETTINGS_FILE}.rollback"
   mv -f -- "${SETTINGS_FILE}.rollback" "$SETTINGS_FILE"
+  load_settings || die 'Restored settings failed validation.'
   activate_subscription_tree "$subscriptions_backup" || die 'Subscription rollback failed.'
   subscription_service_healthy || die 'Restored subscriptions failed their health check.'
 }
 
 set_client_fingerprint() {
-  local old_fingerprint candidate_settings candidate_subscriptions old_subscriptions
+  local old_fingerprint candidate_settings candidate_config candidate_subscriptions old_subscriptions
   local settings_backup failed=0
+  DEFERRED_MUTATION_QUEUED=0
   require_client_runtime
 
   if [[ -z "$NEW_CLIENT_FINGERPRINT" ]]; then
@@ -3266,6 +3571,7 @@ set_client_fingerprint() {
   flock -x 9
   new_temp_dir
   candidate_settings="${TMP_DIR}/settings.candidate.json"
+  candidate_config="${TMP_DIR}/config.candidate.json"
   candidate_subscriptions="${TMP_DIR}/subscriptions.candidate"
   old_subscriptions="${TMP_DIR}/subscriptions.before"
   settings_backup="${TMP_DIR}/settings.before.json"
@@ -3275,7 +3581,19 @@ set_client_fingerprint() {
 
   CLIENT_FINGERPRINT="$NEW_CLIENT_FINGERPRINT"
   render_settings "$candidate_settings"
+  build_sing_box_config "$CLIENTS_FILE" "$candidate_config"
   render_subscription_tree "$CLIENTS_FILE" "$candidate_subscriptions"
+
+  if management_ssh_requires_deferred_activation; then
+    sing-box check -c "$candidate_config" >/dev/null
+    deferred_job_create fingerprint \
+      "Client fingerprint ${NEW_CLIENT_FINGERPRINT} change; activation is pending until the SSH transport ends."
+    deferred_job_stage_file "$candidate_settings" settings.candidate root root 0600
+    deferred_job_stage_file "$candidate_config" config.candidate root sing-box 0640
+    deferred_job_stage_tree "$candidate_subscriptions" subscriptions
+    queue_deferred_mutation
+    return 0
+  fi
 
   install -o root -g root -m 0600 "$candidate_settings" "${SETTINGS_FILE}.new"
   begin_mutation_commit
@@ -3298,7 +3616,7 @@ set_client_fingerprint() {
   finish_mutation_commit
   log "Client fingerprint changed transactionally: ${old_fingerprint} -> ${CLIENT_FINGERPRINT}."
   printf 'Subscription URLs are unchanged. Refresh the subscription on each device.\n'
-  printf 'If REALITY still fails, run "vpn health --verbose" before changing other settings.\n'
+  printf 'If REALITY still fails, run "vpn health -v" before changing other settings.\n'
 }
 
 restore_hy2_obfs_transaction() {
@@ -3310,6 +3628,7 @@ restore_hy2_obfs_transaction() {
   mv -f -- "${SETTINGS_FILE}.rollback" "$SETTINGS_FILE"
   mv -f -- "${CONFIG_FILE}.rollback" "$CONFIG_FILE"
   activate_subscription_tree "$subscriptions_backup" || die 'Subscription rollback failed.'
+  load_settings || die 'Restored settings failed validation.'
   sing-box check -c "$CONFIG_FILE" || die 'Restored sing-box configuration validation failed.'
   systemctl restart sing-box.service || die 'Restored sing-box service could not be restarted.'
   systemctl is-active --quiet sing-box.service || die 'Restored sing-box service is inactive.'
@@ -3319,6 +3638,7 @@ restore_hy2_obfs_transaction() {
 set_hy2_obfs() {
   local old_mode candidate_settings candidate_config candidate_subscriptions old_subscriptions
   local settings_backup config_backup failed=0
+  DEFERRED_MUTATION_QUEUED=0
   require_client_runtime
 
   if [[ -z "$NEW_HY2_OBFS_MODE" ]]; then
@@ -3364,6 +3684,17 @@ set_hy2_obfs() {
   render_settings "$candidate_settings"
   build_sing_box_config "$CLIENTS_FILE" "$candidate_config"
   render_subscription_tree "$CLIENTS_FILE" "$candidate_subscriptions"
+
+  if management_ssh_requires_deferred_activation; then
+    sing-box check -c "$candidate_config" >/dev/null
+    deferred_job_create hy2-obfs \
+      "Hysteria2 obfuscation ${NEW_HY2_OBFS_MODE} change; sing-box activation is pending until the SSH transport ends."
+    deferred_job_stage_file "$candidate_settings" settings.candidate root root 0600
+    deferred_job_stage_file "$candidate_config" config.candidate root sing-box 0640
+    deferred_job_stage_tree "$candidate_subscriptions" subscriptions
+    queue_deferred_mutation
+    return 0
+  fi
 
   install -o root -g root -m 0600 "$candidate_settings" "${SETTINGS_FILE}.new"
   install -o root -g sing-box -m 0640 "$candidate_config" "${CONFIG_FILE}.new"
@@ -3470,28 +3801,1148 @@ restore_installed_helper() {
   mv -f -- "${INSTALLED_HELPER}.restore" "$INSTALLED_HELPER"
 }
 
+handoff_deferred_helper() {
+  local candidate="$1" candidate_version backup timestamp
+  DEFERRED_HELPER_BACKUP=""
+  [[ -f "$candidate" && ! -L "$candidate" ]] || return 1
+  candidate_version="$(validate_installer_file "$candidate")"
+  [[ "$candidate_version" == "$SCRIPT_VERSION" ]] || return 1
+  [[ -f "$INSTALLED_HELPER" && ! -L "$INSTALLED_HELPER" ]] || return 1
+
+  timestamp="$(date '+%Y%m%d-%H%M%S')"
+  install -d -o root -g root -m 0700 "$INSTALLER_BACKUP_DIR" || return 1
+  backup="${INSTALLER_BACKUP_DIR}/vpn-${timestamp}-$(installed_helper_version || printf unknown)"
+  install -o root -g root -m 0700 "$INSTALLED_HELPER" "$backup" || return 1
+  DEFERRED_HELPER_BACKUP="$backup"
+
+  if ! install -o root -g root -m 0750 "$candidate" "${INSTALLED_HELPER}.new"; then
+    rollback_deferred_helper_handoff || true
+    return 1
+  fi
+  if ! bash -n "${INSTALLED_HELPER}.new"; then
+    rm -f -- "${INSTALLED_HELPER}.new"
+    rollback_deferred_helper_handoff || true
+    return 1
+  fi
+  if ! mv -f -- "${INSTALLED_HELPER}.new" "$INSTALLED_HELPER"; then
+    rm -f -- "${INSTALLED_HELPER}.new"
+    rollback_deferred_helper_handoff || true
+    return 1
+  fi
+  if [[ "$(installed_helper_version)" != "$candidate_version" ]]; then
+    rollback_deferred_helper_handoff || true
+    return 1
+  fi
+}
+
+rollback_deferred_helper_handoff() {
+  local backup="${DEFERRED_HELPER_BACKUP:-}"
+  [[ -z "$backup" ]] && return 0
+  restore_installed_helper "$backup" || return 1
+  rm -f -- "$backup"
+  DEFERRED_HELPER_BACKUP=""
+}
+
+commit_deferred_helper_handoff() {
+  local backup="${DEFERRED_HELPER_BACKUP:-}"
+  [[ -z "$backup" ]] && return 0
+  rm -f -- "$backup" || return 1
+  DEFERRED_HELPER_BACKUP=""
+}
+
+deferred_job_fail_and_remove() {
+  local detail="$1" operation started old_version candidate_version diagnostic
+  [[ -n "$DEFERRED_JOB_DIR" && -d "$DEFERRED_JOB_DIR" ]] || return 0
+  operation="$(deferred_job_field operation "${DEFERRED_JOB_DIR}/metadata")"
+  started="$(deferred_job_field created "${DEFERRED_JOB_DIR}/metadata")"
+  old_version="$(deferred_job_field old_version "${DEFERRED_JOB_DIR}/metadata")"
+  candidate_version="$(deferred_job_field candidate_version "${DEFERRED_JOB_DIR}/metadata")"
+  diagnostic="${OPERATION_OUTCOME_ROOT}/$(basename "$DEFERRED_JOB_DIR").log"
+  printf '%s\n' "$detail" >"${diagnostic}.new"
+  chmod 0600 "${diagnostic}.new"
+  mv -f -- "${diagnostic}.new" "$diagnostic"
+  write_operation_outcome "$DEFERRED_OUTCOME_FILE" "$operation" failure \
+    "$started" "$(operation_timestamp)" "$old_version" "$candidate_version" '' 1 \
+    "$detail" "$diagnostic"
+  rm -rf -- "$DEFERRED_JOB_DIR"
+  DEFERRED_JOB_DIR=""
+}
+
+restore_deferred_helper_or_die() {
+  rollback_deferred_helper_handoff || \
+    die 'Deferred activation queue failed and the previous management helper could not be restored; recovery state was preserved.'
+}
+
+download_self_update_asset() {
+  local url="$1" destination="$2" max_bytes="$3" label="$4"
+  local partial="${destination}.partial" error_file="${destination}.curl-error"
+  rm -f -- "$partial" "$error_file"
+  if ! curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error \
+      --connect-timeout 10 --max-time 120 --max-filesize "$max_bytes" \
+      --output "$partial" "$url" 2>"$error_file"; then
+    warn "Could not download ${label} from the official GitHub Release."
+    if [[ -s "$error_file" ]]; then
+      LC_ALL=C sed -n '1,5p' "$error_file" >&2
+    fi
+    rm -f -- "$partial" "$error_file"
+    die "Self-update download failed before any managed state was changed: ${label}"
+  fi
+  [[ -f "$partial" && ! -L "$partial" ]] || \
+    die "Self-update download did not produce a regular file: ${label}"
+  chmod 0600 "$partial"
+  mv -f -- "$partial" "$destination"
+  rm -f -- "$error_file"
+}
+
+installer_checksum_from_file() {
+  local file="$1" line pattern
+  [[ -f "$file" && ! -L "$file" && -r "$file" ]] || \
+    die 'Release checksum asset is not a readable regular file.'
+  [[ "$(LC_ALL=C wc -l <"$file" | tr -d '[:space:]')" == "1" ]] || \
+    die 'Release checksum asset must contain exactly one newline-terminated record.'
+  IFS= read -r line <"$file" || die 'Unable to read the release checksum asset.'
+  pattern='^([0-9A-Fa-f]{64})  install-sing-box-server\.sh$'
+  [[ "$line" =~ $pattern ]] || \
+    die 'Release checksum asset has an invalid format or filename.'
+  printf '%s\n' "${BASH_REMATCH[1]}" | tr 'A-F' 'a-f'
+}
+
+prune_self_update_staging() {
+  local staging_root="$1" stale
+  [[ -d "$staging_root" && ! -L "$staging_root" ]] || return 0
+  while IFS= read -r stale; do
+    [[ "$stale" == "${staging_root}/job."* ]] || continue
+    if ! rm -rf -- "$stale"; then
+      warn "Could not remove stale self-update staging directory: ${stale}"
+    fi
+  done < <(find "$staging_root" -mindepth 1 -maxdepth 1 -type d \
+    -name 'job.*' -mmin +60 -print 2>/dev/null)
+}
+
+render_self_update_runner() {
+  local output="$1"
+  cat >"$output" <<'EOF'
+#!/bin/sh
+set -eu
+umask 077
+
+candidate=$1
+job_dir=$2
+outcome=$3
+old_version=$4
+candidate_version=$5
+unit=$6
+diagnostic=${7:-${outcome}.log}
+outcome_written=0
+
+now() { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
+safe_detail() { printf '%s' "${1:-}" | tr '\r\n' '  ' | tr -cd '[:print:]' | cut -c1-240; }
+write_outcome() {
+  outcome_state=$1
+  completed_at=$2
+  result_code=$3
+  detail_text=$(safe_detail "${4:-}")
+  staged="${outcome}.new.$$"
+  {
+    printf 'operation=self-update\n'
+    printf 'status=%s\n' "$outcome_state"
+    printf 'started=%s\n' "$(sed -n 's/^started=//p' "$outcome" | sed -n '1p')"
+    printf 'completed=%s\n' "$completed_at"
+    printf 'old_version=%s\n' "$old_version"
+    printf 'candidate_version=%s\n' "$candidate_version"
+    printf 'unit=%s\n' "$unit"
+    printf 'exit_status=%s\n' "$result_code"
+    printf 'diagnostic=%s\n' "$diagnostic"
+    printf 'detail=%s\n' "$detail_text"
+  } >"$staged"
+  chmod 0600 "$staged"
+  mv -f -- "$staged" "$outcome"
+  outcome_written=1
+}
+
+capture_output() {
+  diagnostic_stage="${diagnostic}.new.$$"
+  command_status_file="${diagnostic}.exit.$$"
+  command_output_file="${diagnostic}.raw.$$"
+  rm -f -- "$command_status_file" "$command_output_file"
+  "$candidate" upgrade --yes >"$command_output_file" 2>&1 &
+  command_pid=$!
+  if wait "$command_pid"; then
+    command_status=0
+  else
+    command_status=$?
+  fi
+  command_pid=
+  printf '%s\n' "$command_status" >"$command_status_file"
+  awk -v max=32768 '
+    {
+      if (written < max) {
+        remaining=max-written
+        if (length($0) + 1 <= remaining) {
+          print
+          written += length($0) + 1
+        } else if (remaining > 1) {
+          print substr($0, 1, remaining - 1)
+          written=max
+        } else {
+          written=max
+        }
+      }
+    }
+  ' "$command_output_file" >"$diagnostic_stage" || true
+  if [ -r "$command_status_file" ]; then
+    command_status=$(sed -n '1p' "$command_status_file")
+  else
+    command_status=125
+  fi
+  case "$command_status" in
+    ''|*[!0-9]*) command_status=125 ;;
+  esac
+  chmod 0600 "$diagnostic_stage"
+  mv -f -- "$diagnostic_stage" "$diagnostic"
+  rm -f -- "$command_status_file" "$command_output_file"
+  return "$command_status"
+}
+
+cleanup() {
+  cleanup_status=$?
+  trap - EXIT HUP INT TERM
+  if [ -n "${command_pid:-}" ]; then
+    kill "$command_pid" 2>/dev/null || true
+  fi
+  if [ "$outcome_written" -eq 0 ]; then
+    printf '%s\n' 'self-update worker ended before recording a result' >"${diagnostic}.new"
+    chmod 0600 "${diagnostic}.new"
+    mv -f -- "${diagnostic}.new" "$diagnostic"
+    write_outcome failure "$(now)" "$cleanup_status" 'self-update worker ended before recording a result' || true
+  fi
+  rm -f -- "$candidate" "$job_dir/runner" \
+    "${command_status_file:-}" "${command_output_file:-}" "${diagnostic_stage:-}"
+  rmdir -- "$job_dir" 2>/dev/null || true
+  exit "$cleanup_status"
+}
+
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+unset SSH_CONNECTION
+worker_status=0
+if capture_output; then
+  worker_status=0
+else
+  worker_status=$?
+fi
+if [ "$worker_status" -eq 0 ]; then
+  write_outcome success "$(now)" 0 'detached upgrade completed and postconditions passed'
+else
+  write_outcome failure "$(now)" "$worker_status" "detached upgrade failed; inspect the bounded diagnostic for ${unit}.service"
+fi
+exit "$worker_status"
+EOF
+  sh -n "$output" || die 'Generated self-update runner failed shell syntax validation.'
+}
+
+# The optional staging root is a test seam. Production always uses the private
+# managed directory under STATE_DIR.
+launch_detached_self_update() {
+  local candidate="$1" candidate_version="$2"
+  local staging_root="${3:-$SELF_UPDATE_STAGING_DIR}"
+  local job_dir staged_candidate runner unit_base outcome_file diagnostic started old_version outcome_root
+
+  if [[ -e "$staging_root" ]]; then
+    [[ -d "$staging_root" && ! -L "$staging_root" ]] || \
+      die "Refusing unsafe self-update staging path: ${staging_root}"
+  fi
+  install -d -o root -g root -m 0700 "$staging_root"
+  prune_self_update_staging "$staging_root"
+  job_dir="$(mktemp -d "${staging_root}/job.XXXXXX")"
+  chmod 0700 "$job_dir"
+  staged_candidate="${job_dir}/installer"
+  runner="${job_dir}/runner"
+  old_version="$(installed_helper_version)"
+  unit_base="vpn-self-update-$(date +%s)-$$"
+  if [[ "$staging_root" == "$SELF_UPDATE_STAGING_DIR" ]]; then
+    outcome_root="$OPERATION_OUTCOME_ROOT"
+  else
+    outcome_root="${staging_root}.outcomes"
+  fi
+  install -d -o root -g root -m 0700 "$outcome_root"
+  outcome_file="${outcome_root}/self-update-${unit_base}.status"
+  diagnostic="${outcome_root}/self-update-${unit_base}.log"
+  started="$(operation_timestamp)"
+  write_operation_outcome "$outcome_file" self-update pending "$started" '' \
+    "$old_version" "$candidate_version" "$unit_base" '' \
+    "detached installer update staged; unit ${unit_base}.service" "$diagnostic"
+  install -o root -g root -m 0500 "$candidate" "$staged_candidate"
+  render_self_update_runner "$runner"
+  chmod 0500 "$runner"
+
+  if ! systemd-run --quiet --collect --unit="$unit_base" \
+      --property=Type=exec --property=RuntimeMaxSec=45min \
+      --property=StandardOutput=null --property=StandardError=null \
+      "$runner" "$staged_candidate" "$job_dir" "$outcome_file" \
+      "$old_version" "$candidate_version" "$unit_base" "$diagnostic"; then
+    printf '%s\n' 'systemd could not start the detached self-update worker; no upgrade is running' \
+      >"${diagnostic}.new"
+    chmod 0600 "${diagnostic}.new"
+    mv -f -- "${diagnostic}.new" "$diagnostic"
+    write_operation_outcome "$outcome_file" self-update failure "$started" \
+      "$(operation_timestamp)" "$old_version" "$candidate_version" "$unit_base" 1 \
+      'systemd could not start the detached self-update worker; no upgrade is running' "$diagnostic"
+    rm -rf -- "$job_dir"
+    die 'The detached self-update unit could not be started; no upgrade is running.'
+  fi
+
+  printf 'Detached installer update started: %s -> %s\n' \
+    "$(installed_helper_version)" "$candidate_version"
+  printf 'Transient systemd unit: %s.service\n' "$unit_base"
+  printf '%s\n' 'The update now continues independently on the server.'
+  printf '%s\n' 'sing-box may briefly restart; SSH routed through this VPN may disconnect.'
+  printf '%s\n' 'After reconnecting, run: vpn health -v'
+}
+
 self_update_from_file() {
-  local source_path candidate candidate_version current_version
+  local source_path candidate checksum_file expected_checksum actual_checksum
+  local candidate_version current_version
   require_root
   require_command dpkg
-  source_path="$(readlink -f "$SELF_UPDATE_SOURCE" 2>/dev/null || true)"
-  [[ -n "$source_path" ]] || die 'Unable to resolve the installer candidate path.'
+  acquire_operation_lock
 
   new_temp_dir
   candidate="${TMP_DIR}/installer-candidate"
-  install -o root -g root -m 0700 "$source_path" "$candidate"
-  candidate_version="$(validate_installer_file "$candidate")"
+  if [[ -n "$SELF_UPDATE_SOURCE" ]]; then
+    source_path="$(readlink -f "$SELF_UPDATE_SOURCE" 2>/dev/null || true)"
+    [[ -n "$source_path" ]] || die 'Unable to resolve the installer candidate path.'
+    install -o root -g root -m 0700 "$source_path" "$candidate"
+  else
+    require_command curl
+    require_command sha256sum
+    checksum_file="${TMP_DIR}/installer-candidate.sha256"
+    download_self_update_asset \
+      "${SELF_UPDATE_RELEASE_BASE}/${SELF_UPDATE_INSTALLER_ASSET}" \
+      "$candidate" 8388608 'installer asset'
+    download_self_update_asset \
+      "${SELF_UPDATE_RELEASE_BASE}/${SELF_UPDATE_CHECKSUM_ASSET}" \
+      "$checksum_file" 16384 'checksum asset'
+    if ! expected_checksum="$(installer_checksum_from_file "$checksum_file")"; then
+      exit 1
+    fi
+    if ! actual_checksum="$(sha256sum "$candidate" | awk '{ print tolower($1) }')"; then
+      die 'Unable to calculate the downloaded installer SHA-256.'
+    fi
+    [[ "$actual_checksum" =~ ^[0-9a-f]{64}$ ]] || \
+      die 'Unable to calculate a valid SHA-256 for the downloaded installer.'
+    [[ "$actual_checksum" == "$expected_checksum" ]] || \
+      die 'Downloaded installer SHA-256 does not match the published release asset.'
+  fi
+
+  if ! candidate_version="$(validate_installer_file "$candidate")"; then
+    exit 1
+  fi
   current_version="$(installed_helper_version)"
   [[ -n "$current_version" ]] || die 'The installed management helper version cannot be determined.'
-  dpkg --compare-versions "$candidate_version" gt "$current_version" || \
-    die "Self-update requires a newer version (installed ${current_version}, candidate ${candidate_version})."
+  dpkg --validate-version "$current_version" >/dev/null 2>&1 || \
+    die 'The installed management helper reports an invalid version.'
+  if dpkg --compare-versions "$candidate_version" lt "$current_version"; then
+    die "Refusing installer downgrade from ${current_version} to ${candidate_version}."
+  fi
+  if dpkg --compare-versions "$candidate_version" eq "$current_version"; then
+    log "Installer ${current_version} already matches the selected candidate; no changes were made."
+    return
+  fi
+  require_command systemd-run
 
   printf 'Installer self-update: %s -> %s\n' "$current_version" "$candidate_version"
-  printf 'Candidate was copied to a root-only temporary file and passed syntax/project/version validation.\n'
+  if [[ -n "$SELF_UPDATE_SOURCE" ]]; then
+    printf 'Local candidate passed syntax, project identity, and version validation.\n'
+  else
+    printf 'Release checksum matched; candidate passed syntax, project identity, and version validation.\n'
+  fi
+  printf '%s\n' 'sing-box may briefly restart during the update.'
+  printf '%s\n' 'If this SSH connection uses the same VPN, it may disconnect; the update will continue on the server.'
   require_confirmation
-  bash "$candidate" upgrade --yes
-  [[ "$(installed_helper_version)" == "$candidate_version" ]] || die 'Self-update command completed without activating the candidate version.'
-  log "Installer self-update completed successfully: ${current_version} -> ${candidate_version}."
+  launch_detached_self_update "$candidate" "$candidate_version"
+}
+
+operation_timestamp() {
+  date -u '+%Y-%m-%dT%H:%M:%SZ'
+}
+
+operation_safe_detail() {
+  printf '%s' "${1:-}" | tr '\r\n' '  ' | tr -cd '[:print:]' | cut -c1-240
+}
+
+write_operation_outcome() {
+  local output="$1" operation="$2" status="$3" started="$4" completed="$5"
+  local old_version="$6" candidate_version="$7" unit="$8" exit_status="$9" detail="${10:-}"
+  local diagnostic="${11:-}"
+  local staged
+  detail="$(operation_safe_detail "$detail")"
+  install -d -o root -g root -m 0700 "$(dirname "$output")"
+  staged="${output}.new.$$"
+  {
+    printf 'operation=%s\n' "$operation"
+    printf 'status=%s\n' "$status"
+    printf 'started=%s\n' "$started"
+    printf 'completed=%s\n' "$completed"
+    printf 'old_version=%s\n' "$old_version"
+    printf 'candidate_version=%s\n' "$candidate_version"
+    printf 'unit=%s\n' "$unit"
+    printf 'exit_status=%s\n' "$exit_status"
+    printf 'diagnostic=%s\n' "$diagnostic"
+    printf 'detail=%s\n' "$detail"
+  } >"$staged"
+  chmod 0600 "$staged"
+  mv -f -- "$staged" "$output"
+}
+
+management_address_is_local() {
+  local address="$1"
+  [[ -n "$address" ]] || return 1
+  ip -o addr show 2>/dev/null | awk -v needle="$address" '
+    {
+      value=$4
+      sub(/\/[0-9]+$/, "", value)
+      if (value == needle) found=1
+    }
+    END { exit found ? 0 : 1 }
+  '
+}
+
+management_normalize_endpoint() {
+  printf '%s\n' "$1" | sed -E 's/^\[//; s/\](:[0-9]+)$/\1/'
+}
+
+management_ss_established_connections() {
+  LC_ALL=C ss -HtanOep 2>/dev/null
+}
+
+management_ss_transport_connections() {
+  LC_ALL=C ss -HtanOe 2>/dev/null
+}
+
+management_capture_ssh_transport_identity() {
+  local local_endpoint remote_endpoint connections identity
+  local_endpoint="$(management_normalize_endpoint "$1")"
+  remote_endpoint="$(management_normalize_endpoint "$2")"
+  MANAGEMENT_TRANSPORT_LOCAL_ENDPOINT=""
+  MANAGEMENT_TRANSPORT_REMOTE_ENDPOINT=""
+  MANAGEMENT_TRANSPORT_SOCKET_COOKIE=""
+  MANAGEMENT_TRANSPORT_SOCKET_INODE=""
+  connections="$(management_ss_established_connections)" || return 1
+  identity="$(awk -v expected_local="$local_endpoint" -v expected_remote="$remote_endpoint" '
+    function normalize(value) {
+      sub(/^\[/, "", value)
+      sub(/\](:[0-9]+)$/, "\\1", value)
+      return value
+    }
+    {
+      if ($1 != "ESTAB" || normalize($4) != expected_local ||
+          normalize($5) != expected_remote || index($0, "users:((\"sshd") == 0) next
+      inode=""
+      cookie=""
+      for (i=6; i<=NF; i++) {
+        if ($i ~ /^ino:[0-9]+$/) inode=substr($i, 5)
+        if ($i ~ /^sk:[[:xdigit:]]+$/) cookie=substr($i, 4)
+      }
+      if (inode != "" && cookie != "") {
+        matches++
+        result=cookie "|" inode
+      }
+    }
+    END {
+      if (matches == 1) print result
+      else exit 1
+    }
+  ' <<<"$connections")" || return 1
+  MANAGEMENT_TRANSPORT_LOCAL_ENDPOINT="$local_endpoint"
+  MANAGEMENT_TRANSPORT_REMOTE_ENDPOINT="$remote_endpoint"
+  MANAGEMENT_TRANSPORT_SOCKET_COOKIE="${identity%%|*}"
+  MANAGEMENT_TRANSPORT_SOCKET_INODE="${identity#*|}"
+}
+
+management_transport_identity_is_present() {
+  local local_endpoint="$1" remote_endpoint="$2" cookie="$3" inode="$4" connections
+  connections="$(management_ss_transport_connections)" || return 2
+  awk -v expected_local="$(management_normalize_endpoint "$local_endpoint")" \
+      -v expected_remote="$(management_normalize_endpoint "$remote_endpoint")" \
+      -v expected_cookie="$cookie" -v expected_inode="$inode" '
+    function normalize(value) {
+      sub(/^\[/, "", value)
+      sub(/\](:[0-9]+)$/, "\\1", value)
+      return value
+    }
+    {
+      if (normalize($4) != expected_local || normalize($5) != expected_remote) next
+      tuple_found=1
+      inode=""
+      cookie=""
+      for (i=6; i<=NF; i++) {
+        if ($i ~ /^ino:[0-9]+$/) inode=substr($i, 5)
+        if ($i ~ /^sk:[[:xdigit:]]+$/) cookie=substr($i, 4)
+      }
+      if (inode != "" && cookie != "") identity_found=1
+      if (inode == expected_inode && cookie == expected_cookie) found=1
+    }
+    END {
+      if (found) exit 0
+      if (tuple_found && !identity_found) exit 2
+      exit 1
+    }
+  ' <<<"$connections"
+}
+
+management_proc_parent_pid_from_stat() {
+  local stat="$1" tail
+  local -a fields=()
+  tail="${stat##*) }"
+  [[ "$tail" != "$stat" ]] || return 1
+  IFS=' ' read -r -a fields <<<"$tail"
+  [[ "${fields[1]:-}" =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "${fields[1]}"
+}
+
+management_proc_parent_pid() {
+  local pid="$1" stat
+  [[ "$pid" =~ ^[0-9]+$ && -r "/proc/${pid}/stat" ]] || return 1
+  IFS= read -r stat <"/proc/${pid}/stat" || return 1
+  management_proc_parent_pid_from_stat "$stat"
+}
+
+management_proc_command_name() {
+  local pid="$1"
+  [[ "$pid" =~ ^[0-9]+$ && -r "/proc/${pid}/comm" ]] || return 1
+  tr -d '\r\n' <"/proc/${pid}/comm"
+}
+
+management_proc_environment_value() {
+  local pid="$1" key="$2" value
+  [[ "$pid" =~ ^[0-9]+$ && -r "/proc/${pid}/environ" ]] || return 1
+  value="$(tr '\0' '\n' <"/proc/${pid}/environ" 2>/dev/null |
+    sed -n "s/^${key}=//p" | sed -n '1p' || true)"
+  [[ -n "$value" ]] || return 1
+  printf '%s\n' "$value"
+}
+
+management_ssh_context_from_ancestry() {
+  local pid="$$" parent command value depth=0
+  MANAGEMENT_SSH_ANCESTOR_FOUND=0
+  MANAGEMENT_SSH_ANCESTOR_PID=""
+  while [[ "$pid" =~ ^[0-9]+$ && "$pid" != 0 && $depth -lt 64 ]]; do
+    command="$(management_proc_command_name "$pid" 2>/dev/null || true)"
+    case "$command" in
+      sshd|sshd:*|sshd-*)
+        MANAGEMENT_SSH_ANCESTOR_FOUND=1
+        [[ -n "$MANAGEMENT_SSH_ANCESTOR_PID" ]] || MANAGEMENT_SSH_ANCESTOR_PID="$pid"
+        ;;
+    esac
+    if [[ -z "$MANAGEMENT_SSH_CONNECTION" ]]; then
+      value="$(management_proc_environment_value "$pid" SSH_CONNECTION 2>/dev/null || true)"
+      if [[ -n "$value" ]]; then
+        MANAGEMENT_SSH_CONNECTION="$value"
+      fi
+    fi
+    parent="$(management_proc_parent_pid "$pid" 2>/dev/null || true)"
+    [[ "$parent" =~ ^[0-9]+$ && "$parent" != "$pid" ]] || break
+    pid="$parent"
+    depth=$(( depth + 1 ))
+  done
+  (( MANAGEMENT_SSH_ANCESTOR_FOUND == 1 ))
+}
+
+management_sing_box_connection_to_ssh_endpoint() {
+  local expected_endpoint connections
+  [[ -n "$SERVER_IPV4" && "$SSH_PORT" =~ ^[0-9]+$ ]] || return 1
+  expected_endpoint="${SERVER_IPV4}:${SSH_PORT}"
+  connections="$(ss -Htnp 2>/dev/null || true)"
+  awk -v expected="$expected_endpoint" '
+    function normalize(value) {
+      sub(/^\[/, "", value)
+      sub(/\](:[0-9]+)$/, "\\1", value)
+      return value
+    }
+    { if (normalize($5) == expected && index($0, "users:((\"sing-box\"") > 0) found=1 }
+    END { exit found ? 0 : 1 }
+  ' <<<"$connections"
+}
+
+classify_management_ssh_session() {
+  local remote remote_port local_address local_port
+  MANAGEMENT_SESSION_CLASS=console
+  MANAGEMENT_SESSION_REASON='non-SSH invocation'
+  MANAGEMENT_TRANSPORT_LOCAL_ENDPOINT=""
+  MANAGEMENT_TRANSPORT_REMOTE_ENDPOINT=""
+  MANAGEMENT_TRANSPORT_SOCKET_COOKIE=""
+  MANAGEMENT_TRANSPORT_SOCKET_INODE=""
+  MANAGEMENT_SSH_CONNECTION="${SSH_CONNECTION:-}"
+  management_ssh_context_from_ancestry >/dev/null 2>&1 || true
+
+  if [[ -z "$MANAGEMENT_SSH_CONNECTION" ]]; then
+    if (( MANAGEMENT_SSH_ANCESTOR_FOUND == 1 )); then
+      MANAGEMENT_SESSION_CLASS=deferred
+      MANAGEMENT_SESSION_REASON='an SSH ancestor was found but SSH_CONNECTION could not be recovered'
+    fi
+    return 0
+  fi
+  MANAGEMENT_SESSION_CLASS=deferred
+  MANAGEMENT_SESSION_REASON='SSH transport could not be positively classified as direct'
+  IFS=' ' read -r remote remote_port local_address local_port _ <<<"$MANAGEMENT_SSH_CONNECTION"
+  if [[ -z "$remote" || -z "$remote_port" || -z "$local_address" || -z "$local_port" ||
+        ! "$remote_port" =~ ^[0-9]+$ || ! "$local_port" =~ ^[0-9]+$ ]]; then
+    MANAGEMENT_SESSION_REASON='SSH_CONNECTION is missing or malformed after ancestry recovery'
+    return 0
+  fi
+  if (( MANAGEMENT_SSH_ANCESTOR_FOUND == 0 )); then
+    MANAGEMENT_SESSION_REASON='SSH_CONNECTION was present but no sshd ancestor was positively identified'
+    return 0
+  fi
+
+  if ! management_address_is_local "$local_address"; then
+    MANAGEMENT_SESSION_REASON='SSH local endpoint is not a verified address on this host'
+    return 0
+  fi
+  if ! management_capture_ssh_transport_identity \
+      "${local_address}:${local_port}" "${remote}:${remote_port}"; then
+    MANAGEMENT_SESSION_REASON='the exact sshd-owned SSH socket identity was not positively observed'
+    return 0
+  fi
+  if [[ "$remote" == "$SERVER_IPV4" ]] || management_address_is_local "$remote" ||
+     [[ "$remote" == 127.* || "$remote" == ::1 || "$remote" == 0.0.0.0 ]]; then
+    MANAGEMENT_SESSION_REASON='SSH peer is a local/server address consistent with a self-tunneled connection'
+    return 0
+  fi
+  if management_sing_box_connection_to_ssh_endpoint; then
+    MANAGEMENT_SESSION_REASON='a sing-box-owned outbound connection to the managed SSH endpoint indicates 1:1 NAT self-tunneling'
+    return 0
+  fi
+
+  # A public/non-loopback peer alone is never sufficient. The exact established
+  # socket, its local address, sshd ownership, and kernel socket identity must
+  # positively establish the direct transport before a restart-requiring
+  # mutation is applied now.
+  MANAGEMENT_SESSION_CLASS=direct
+  # shellcheck disable=SC2034 # This is a deliberate global classification result.
+  MANAGEMENT_SESSION_REASON='exact SSH socket and local endpoint positively establish a direct transport'
+}
+
+management_ssh_requires_deferred_activation() {
+  classify_management_ssh_session
+  [[ "$MANAGEMENT_SESSION_CLASS" == deferred ]]
+}
+
+deferred_job_field() {
+  local key="$1" file="$2"
+  sed -n "s/^${key}=//p" "$file" | sed -n '1p'
+}
+
+deferred_tree_hash() {
+  local path="$1" file
+  [[ -d "$path" && ! -L "$path" ]] || return 1
+  if find "$path" -type l -print -quit 2>/dev/null | grep -q .; then
+    return 1
+  fi
+  (
+    cd -- "$path" || exit 1
+    find . -type f -print0 | sort -z |
+      while IFS= read -r -d '' file; do
+        sha256sum -- "$file"
+      done
+  ) | sha256sum | awk '{print $1}'
+}
+
+deferred_current_identity() {
+  local kind="$1" path="$2" hash version
+  case "$kind" in
+    file)
+      if [[ ! -e "$path" ]]; then
+        printf 'absent|\n'
+        return
+      fi
+      [[ -f "$path" && ! -L "$path" ]] || return 1
+      hash="$(sha256sum -- "$path" | awk '{print $1}')"
+      printf 'present|%s\n' "$hash"
+      ;;
+    tree)
+      if [[ ! -e "$path" ]]; then
+        printf 'absent|\n'
+        return
+      fi
+      hash="$(deferred_tree_hash "$path")" || return 1
+      printf 'present|%s\n' "$hash"
+      ;;
+    package)
+      version="$(dpkg-query -W -f='${Version}' "$path" 2>/dev/null || true)"
+      if [[ -n "$version" ]]; then
+        printf 'present|%s\n' "$version"
+      else
+        printf 'absent|\n'
+      fi
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+deferred_job_baseline_artifacts() {
+  local operation="$1"
+  case "$operation" in
+    client-add|client-delete)
+      printf 'file|%s\n' "$CLIENTS_FILE" "$CONFIG_FILE"
+      printf 'tree|%s\n' "$SUBSCRIPTION_ROOT"
+      ;;
+    reality-target|fingerprint|hy2-obfs)
+      printf 'file|%s\n' "$SETTINGS_FILE" "$CONFIG_FILE"
+      printf 'tree|%s\n' "$SUBSCRIPTION_ROOT"
+      ;;
+    core-update)
+      printf 'package|sing-box\n'
+      printf 'file|%s\n' "$CONFIG_FILE"
+      ;;
+    overlay-upgrade)
+      printf 'file|%s\n' "$CONFIG_FILE" "$UDP_SYSCTL_FILE" \
+        "$UNATTENDED_UPGRADES_CONFIG" "$CERT_HOOK" "$INSTALLED_HELPER" \
+        "$USER_COMMAND" "$INSTALL_COMPLETE_FILE" "$RUNTIME_VERSION_FILE" \
+        "$SETTINGS_FILE" "$CLIENTS_FILE"
+      printf 'tree|%s\n' "$SUBSCRIPTION_ROOT" "$HY2_MASQUERADE_ROOT"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+deferred_job_capture_baseline() {
+  local job="$1" output="$2" operation kind path identity state hash
+  operation="$(deferred_job_field operation "${job}/metadata")"
+  deferred_job_baseline_artifacts "$operation" >/dev/null || return 1
+  : >"$output"
+  while IFS='|' read -r kind path; do
+    identity="$(deferred_current_identity "$kind" "$path")" || return 1
+    state="${identity%%|*}"
+    hash="${identity#*|}"
+    printf '%s|%s|%s|%s\n' "$kind" "$path" "$state" "$hash" >>"$output"
+  done < <(deferred_job_baseline_artifacts "$operation")
+  chmod 0600 "$output"
+}
+
+deferred_job_verify_baseline() {
+  local job="$1" kind path expected_state expected_hash identity
+  DEFERRED_BASELINE_MISMATCH=""
+  [[ -f "${job}/baseline" && ! -L "${job}/baseline" ]] || {
+    DEFERRED_BASELINE_MISMATCH='baseline manifest is missing'
+    return 1
+  }
+  while IFS='|' read -r kind path expected_state expected_hash; do
+    identity="$(deferred_current_identity "$kind" "$path" 2>/dev/null || true)"
+    if [[ "$identity" != "${expected_state}|${expected_hash}" ]]; then
+      DEFERRED_BASELINE_MISMATCH="$(basename "$path") changed since staging"
+      return 1
+    fi
+  done <"${job}/baseline"
+  return 0
+}
+
+deferred_job_unit_is_active() {
+  local job="$1" unit load active
+  unit="$(deferred_job_field unit "${job}/metadata")"
+  [[ -n "$unit" ]] || return 1
+  command -v systemctl >/dev/null 2>&1 || return 2
+  load="$(systemctl show -p LoadState --value "${unit}.service" 2>/dev/null)" || return 2
+  active="$(systemctl show -p ActiveState --value "${unit}.service" 2>/dev/null)" || return 2
+  [[ "$load" != not-found && -n "$load" ]] || return 1
+  case "$active" in
+    active|activating|reloading|deactivating) return 0 ;;
+    inactive|failed|dead) return 1 ;;
+    *) return 2 ;;
+  esac
+}
+
+deferred_job_transport_state() {
+  local job="$1" local_endpoint remote_endpoint cookie inode
+  local_endpoint="$(deferred_job_field transport_local "${job}/metadata")"
+  remote_endpoint="$(deferred_job_field transport_remote "${job}/metadata")"
+  cookie="$(deferred_job_field transport_cookie "${job}/metadata")"
+  inode="$(deferred_job_field transport_inode "${job}/metadata")"
+  [[ -n "$local_endpoint" && -n "$remote_endpoint" && "$cookie" =~ ^[[:xdigit:]]+$ &&
+        "$inode" =~ ^[0-9]+$ ]] || return 2
+  management_transport_identity_is_present "$local_endpoint" "$remote_endpoint" "$cookie" "$inode"
+}
+
+deferred_job_is_orphaned() {
+  local job="$1" unit unit_status
+  unit="$(deferred_job_field unit "${job}/metadata")"
+  if [[ -n "$unit" ]]; then
+    if deferred_job_unit_is_active "$job"; then
+      return 1
+    else
+      unit_status=$?
+    fi
+    case "$unit_status" in
+      0) return 1 ;;
+      2) return 2 ;;
+      1) return 0 ;;
+    esac
+  fi
+  if deferred_job_transport_state "$job"; then
+    return 1
+  else
+    unit_status=$?
+  fi
+  case "$unit_status" in
+    1) return 0 ;;
+    *) return 2 ;;
+  esac
+}
+
+deferred_job_mark_orphaned() {
+  local job="$1" job_id operation started unit outcome diagnostic detail
+  job_id="$(basename "$job")"
+  operation="$(deferred_job_field operation "${job}/metadata")"
+  started="$(deferred_job_field created "${job}/metadata")"
+  unit="$(deferred_job_field unit "${job}/metadata")"
+  outcome="${OPERATION_OUTCOME_ROOT}/${job_id}.status"
+  diagnostic="${OPERATION_OUTCOME_ROOT}/${job_id}.log"
+  if deferred_job_verify_baseline "$job"; then
+    detail='deferred worker/session disappeared before activation; candidate was discarded and live state was unchanged'
+  else
+    detail="deferred worker/session disappeared and baseline verification failed (${DEFERRED_BASELINE_MISMATCH}); candidate was discarded"
+  fi
+  printf '%s\n' "$detail" >"${diagnostic}.new"
+  chmod 0600 "${diagnostic}.new"
+  mv -f -- "${diagnostic}.new" "$diagnostic"
+  write_operation_outcome "$outcome" "$operation" failure "$started" \
+    "$(operation_timestamp)" \
+    "$(deferred_job_field old_version "${job}/metadata")" \
+    "$(deferred_job_field candidate_version "${job}/metadata")" \
+    "$unit" 125 "$detail" "$diagnostic"
+  rm -rf -- "$job"
+}
+
+deferred_recover_orphaned_jobs() {
+  local job
+  [[ -d "$DEFERRED_MUTATION_ROOT" && ! -L "$DEFERRED_MUTATION_ROOT" ]] || return 0
+  while IFS= read -r job; do
+    [[ -n "$job" ]] || continue
+    if deferred_job_is_orphaned "$job"; then
+      deferred_job_mark_orphaned "$job"
+    fi
+  done < <(find "$DEFERRED_MUTATION_ROOT" -mindepth 1 -maxdepth 1 -type d \
+    -name 'job.*' -print 2>/dev/null | sort)
+}
+
+deferred_refuse_if_pending() {
+  local job
+  [[ -d "$DEFERRED_MUTATION_ROOT" && ! -L "$DEFERRED_MUTATION_ROOT" ]] || return 0
+  while IFS= read -r job; do
+    [[ -n "$job" ]] || continue
+    [[ "$job" == "$DEFERRED_JOB_DIR" ]] && continue
+    die "A deferred management operation is already pending; inspect vpn health -v before starting another."
+  done < <(find "$DEFERRED_MUTATION_ROOT" -mindepth 1 -maxdepth 1 -type d \
+    -name 'job.*' -print -quit 2>/dev/null)
+}
+
+deferred_job_create() {
+  local operation="$1" description="$2" started job_id
+  [[ "$MANAGEMENT_SESSION_CLASS" == deferred ]] || \
+    die 'Internal error: deferred mutation requested without an ambiguous SSH session.'
+  [[ -n "$MANAGEMENT_TRANSPORT_LOCAL_ENDPOINT" &&
+        -n "$MANAGEMENT_TRANSPORT_REMOTE_ENDPOINT" &&
+        "$MANAGEMENT_TRANSPORT_SOCKET_COOKIE" =~ ^[[:xdigit:]]+$ &&
+        "$MANAGEMENT_TRANSPORT_SOCKET_INODE" =~ ^[0-9]+$ ]] || \
+    die 'The exact controlling SSH transport identity is unavailable; refusing restart-requiring activation.'
+  install -d -o root -g root -m 0700 "$DEFERRED_MUTATION_ROOT" "$OPERATION_OUTCOME_ROOT"
+  deferred_recover_orphaned_jobs
+  deferred_refuse_if_pending
+  DEFERRED_JOB_DIR="$(mktemp -d "${DEFERRED_MUTATION_ROOT}/job.XXXXXX")"
+  chmod 0700 "$DEFERRED_JOB_DIR"
+  job_id="$(basename "$DEFERRED_JOB_DIR")"
+  DEFERRED_OUTCOME_FILE="${OPERATION_OUTCOME_ROOT}/${job_id}.status"
+  started="$(operation_timestamp)"
+  {
+    printf 'operation=%s\n' "$operation"
+    printf 'description=%s\n' "$(operation_safe_detail "$description")"
+    printf 'transport_local=%s\n' "$MANAGEMENT_TRANSPORT_LOCAL_ENDPOINT"
+    printf 'transport_remote=%s\n' "$MANAGEMENT_TRANSPORT_REMOTE_ENDPOINT"
+    printf 'transport_cookie=%s\n' "$MANAGEMENT_TRANSPORT_SOCKET_COOKIE"
+    printf 'transport_inode=%s\n' "$MANAGEMENT_TRANSPORT_SOCKET_INODE"
+    printf 'created=%s\n' "$started"
+  } >"${DEFERRED_JOB_DIR}/metadata"
+  chmod 0600 "${DEFERRED_JOB_DIR}/metadata"
+  if ! deferred_job_capture_baseline "$DEFERRED_JOB_DIR" "${DEFERRED_JOB_DIR}/baseline"; then
+    rm -rf -- "$DEFERRED_JOB_DIR"
+    DEFERRED_JOB_DIR=""
+    die 'Could not capture a safe deferred-operation baseline; no live state was changed.'
+  fi
+  printf 'baseline=%s\n' "${DEFERRED_JOB_DIR}/baseline" >>"${DEFERRED_JOB_DIR}/metadata"
+  write_operation_outcome "$DEFERRED_OUTCOME_FILE" "$operation" pending \
+    "$started" '' '' '' '' '' 'validated activation is waiting for the originating SSH transport to end' \
+    "${OPERATION_OUTCOME_ROOT}/${job_id}.log"
+}
+
+deferred_job_stage_file() {
+  local source="$1" name="$2" owner="$3" group="$4" mode="$5"
+  [[ -f "$source" && ! -L "$source" ]] || die "Deferred candidate is not a regular file: ${source}"
+  install -o "$owner" -g "$group" -m "$mode" "$source" "${DEFERRED_JOB_DIR}/${name}"
+}
+
+deferred_job_stage_tree() {
+  local source="$1" name="$2" file
+  [[ -d "$source" && ! -L "$source" ]] || die "Deferred candidate tree is not a directory: ${source}"
+  install -d -o root -g root -m 0700 "${DEFERRED_JOB_DIR}/${name}"
+  while IFS= read -r -d '' file; do
+    [[ -f "$file" && ! -L "$file" ]] || die "Deferred subscription tree contains an unsafe entry: ${file}"
+    install -o root -g www-data -m 0640 "$file" \
+      "${DEFERRED_JOB_DIR}/${name}/$(basename "$file")"
+  done < <(find "$source" -mindepth 1 -maxdepth 1 -type f -print0)
+}
+
+deferred_job_stage_activator() {
+  local source version
+  source="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || true)"
+  [[ -f "$source" && ! -L "$source" ]] || return 1
+  version="$(validate_installer_file "$source")"
+  [[ "$version" == "$SCRIPT_VERSION" ]] || return 1
+  install -o root -g root -m 0500 "$source" "${DEFERRED_JOB_DIR}/activator"
+}
+
+render_deferred_mutation_runner() {
+  local output="$1"
+  cat >"$output" <<'EOF'
+#!/bin/sh
+set -eu
+umask 077
+
+job_dir=$1
+outcome=$2
+unit=$3
+helper=$4
+activator=${5:-}
+diagnostic=${6:-${outcome}.log}
+transport_local=$(sed -n 's/^transport_local=//p' "$job_dir/metadata" | sed -n '1p')
+transport_remote=$(sed -n 's/^transport_remote=//p' "$job_dir/metadata" | sed -n '1p')
+transport_cookie=$(sed -n 's/^transport_cookie=//p' "$job_dir/metadata" | sed -n '1p')
+transport_inode=$(sed -n 's/^transport_inode=//p' "$job_dir/metadata" | sed -n '1p')
+outcome_written=0
+
+now() { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
+safe_detail() { printf '%s' "${1:-}" | tr '\r\n' '  ' | tr -cd '[:print:]' | cut -c1-240; }
+write_outcome() {
+  outcome_state=$1
+  completed_at=$2
+  result_code=$3
+  detail_text=$(safe_detail "${4:-}")
+  staged="${outcome}.new.$$"
+  {
+    printf 'operation=%s\n' "$(sed -n 's/^operation=//p' "$job_dir/metadata" | sed -n '1p')"
+    printf 'status=%s\n' "$outcome_state"
+    printf 'started=%s\n' "$(sed -n 's/^created=//p' "$job_dir/metadata" | sed -n '1p')"
+    printf 'completed=%s\n' "$completed_at"
+    printf 'old_version=%s\n' "$(sed -n 's/^old_version=//p' "$job_dir/metadata" | sed -n '1p')"
+    printf 'candidate_version=%s\n' "$(sed -n 's/^candidate_version=//p' "$job_dir/metadata" | sed -n '1p')"
+    printf 'unit=%s\n' "$unit"
+    printf 'exit_status=%s\n' "$result_code"
+    printf 'diagnostic=%s\n' "$diagnostic"
+    printf 'detail=%s\n' "$detail_text"
+  } >"$staged"
+  chmod 0600 "$staged"
+  mv -f -- "$staged" "$outcome"
+  outcome_written=1
+}
+transport_identity_is_present() {
+  connections=$(LC_ALL=C ss -HtanOe 2>/dev/null) || return 2
+  awk -v expected_local="$transport_local" -v expected_remote="$transport_remote" \
+      -v expected_cookie="$transport_cookie" -v expected_inode="$transport_inode" '
+    function normalize(value) {
+      sub(/^\[/, "", value)
+      sub(/\](:[0-9]+)$/, "\\1", value)
+      return value
+    }
+    {
+      if (normalize($4) != expected_local || normalize($5) != expected_remote) next
+      tuple_found=1
+      inode=""
+      cookie=""
+      for (i=6; i<=NF; i++) {
+        if ($i ~ /^ino:[0-9]+$/) inode=substr($i, 5)
+        if ($i ~ /^sk:[[:xdigit:]]+$/) cookie=substr($i, 4)
+      }
+      if (inode != "" && cookie != "") identity_found=1
+      if (inode == expected_inode && cookie == expected_cookie) found=1
+    }
+    END {
+      if (found) exit 0
+      if (tuple_found && !identity_found) exit 2
+      exit 1
+    }
+  ' <<EOF_CONNECTIONS
+$connections
+EOF_CONNECTIONS
+}
+
+capture_output() {
+  diagnostic_stage="${diagnostic}.new.$$"
+  command_status_file="${diagnostic}.exit.$$"
+  command_output_file="${diagnostic}.raw.$$"
+  rm -f -- "$command_status_file" "$command_output_file"
+  if [ -n "$activator" ] && [ -x "$activator" ]; then
+    "$activator" deferred-activate "$job_dir" >"$command_output_file" 2>&1 &
+  else
+    "$helper" deferred-activate "$job_dir" >"$command_output_file" 2>&1 &
+  fi
+  command_pid=$!
+  if wait "$command_pid"; then
+    command_status=0
+  else
+    command_status=$?
+  fi
+  command_pid=
+  printf '%s\n' "$command_status" >"$command_status_file"
+  awk -v max=32768 '
+    {
+      if (written < max) {
+        remaining=max-written
+        if (length($0) + 1 <= remaining) {
+          print
+          written += length($0) + 1
+        } else if (remaining > 1) {
+          print substr($0, 1, remaining - 1)
+          written=max
+        } else {
+          written=max
+        }
+      }
+    }
+  ' "$command_output_file" >"$diagnostic_stage" || true
+  if [ -r "$command_status_file" ]; then
+    command_status=$(sed -n '1p' "$command_status_file")
+  else
+    command_status=125
+  fi
+  case "$command_status" in
+    ''|*[!0-9]*) command_status=125 ;;
+  esac
+  chmod 0600 "$diagnostic_stage"
+  mv -f -- "$diagnostic_stage" "$diagnostic"
+  rm -f -- "$command_status_file" "$command_output_file"
+  return "$command_status"
+}
+
+cleanup() {
+  cleanup_status=$?
+  trap - EXIT HUP INT TERM
+  if [ -n "${command_pid:-}" ]; then
+    kill "$command_pid" 2>/dev/null || true
+  fi
+  if [ "$outcome_written" -eq 0 ]; then
+    printf '%s\n' 'deferred activation worker ended before recording a result' >"${diagnostic}.new"
+    chmod 0600 "${diagnostic}.new"
+    mv -f -- "${diagnostic}.new" "$diagnostic"
+    write_outcome failure "$(now)" "$cleanup_status" "deferred activation worker ended before recording a result" || true
+  fi
+  rm -f -- "${command_status_file:-}" "${command_output_file:-}" "${diagnostic_stage:-}"
+  rm -rf -- "$job_dir"
+  exit "$cleanup_status"
+}
+trap cleanup EXIT
+trap 'exit 143' HUP INT TERM
+
+case "$transport_cookie" in ''|*[!0-9A-Fa-f]*) transport_metadata_valid=0 ;; *) transport_metadata_valid=1 ;; esac
+case "$transport_inode" in ''|*[!0-9]*) transport_metadata_valid=0 ;; esac
+if [ -z "$transport_local" ] || [ -z "$transport_remote" ] || [ "$transport_metadata_valid" -ne 1 ]; then
+  write_outcome failure "$(now)" 125 'controlling SSH transport metadata is invalid; activation was not attempted'
+  exit 125
+fi
+
+probe_failures=0
+while :; do
+  if transport_identity_is_present; then
+    probe_failures=0
+    sleep 1
+    continue
+  else
+    transport_status=$?
+  fi
+  if [ "$transport_status" -eq 1 ]; then
+    break
+  fi
+  probe_failures=$((probe_failures + 1))
+  if [ "$probe_failures" -ge 30 ]; then
+    write_outcome failure "$(now)" 125 'controlling SSH transport could not be observed; activation was not attempted'
+    exit 125
+  fi
+  sleep 1
+done
+unset SSH_CONNECTION
+worker_status=0
+if capture_output; then
+  worker_status=0
+else
+  worker_status=$?
+fi
+if [ "$worker_status" -eq 0 ]; then
+  write_outcome success "$(now)" 0 'deferred activation completed and postconditions passed'
+else
+  write_outcome failure "$(now)" "$worker_status" "deferred activation failed; inspect the bounded diagnostic for ${unit}.service"
+fi
+exit "$worker_status"
+EOF
+  sh -n "$output" || die 'Generated deferred mutation runner failed shell syntax validation.'
+}
+
+queue_deferred_mutation() {
+  local operation description job_id unit_base runner activator diagnostic started old_version candidate_version
+  operation="$(deferred_job_field operation "${DEFERRED_JOB_DIR}/metadata")"
+  description="$(deferred_job_field description "${DEFERRED_JOB_DIR}/metadata")"
+  job_id="$(basename "$DEFERRED_JOB_DIR")"
+  unit_base="vpn-deferred-${job_id#job.}-$(date +%s)"
+  runner="${DEFERRED_JOB_DIR}/runner"
+  activator="${DEFERRED_JOB_DIR}/activator"
+  diagnostic="${OPERATION_OUTCOME_ROOT}/${job_id}.log"
+  started="$(deferred_job_field created "${DEFERRED_JOB_DIR}/metadata")"
+  old_version="$(deferred_job_field old_version "${DEFERRED_JOB_DIR}/metadata")"
+  candidate_version="$(deferred_job_field candidate_version "${DEFERRED_JOB_DIR}/metadata")"
+  if [[ ! -f "$activator" ]]; then
+    deferred_job_stage_activator || {
+      restore_deferred_helper_or_die
+      printf '%s\n' 'The candidate-compatible deferred activator could not be staged; no live state was changed.' \
+        >"${diagnostic}.new"
+      chmod 0600 "${diagnostic}.new"
+      mv -f -- "${diagnostic}.new" "$diagnostic"
+      write_operation_outcome "$DEFERRED_OUTCOME_FILE" "$operation" failure "$started" \
+        "$(operation_timestamp)" "$old_version" "$candidate_version" "$unit_base" 1 \
+        'The candidate-compatible deferred activator could not be staged; no live state was changed.' "$diagnostic"
+      rm -rf -- "$DEFERRED_JOB_DIR"
+      die 'The candidate-compatible deferred activator could not be staged; no live state was changed.'
+    }
+  fi
+  printf 'unit=%s\n' "$unit_base" >>"${DEFERRED_JOB_DIR}/metadata"
+  printf 'diagnostic=%s\n' "$diagnostic" >>"${DEFERRED_JOB_DIR}/metadata"
+  render_deferred_mutation_runner "$runner"
+  chmod 0500 "$runner"
+  if ! systemd-run --quiet --collect --unit="$unit_base" \
+      --property=Type=exec --property=RuntimeMaxSec=24h \
+      --property=StandardOutput=null --property=StandardError=null \
+      "$runner" "$DEFERRED_JOB_DIR" "$DEFERRED_OUTCOME_FILE" \
+      "$unit_base" "$INSTALLED_HELPER" "$activator" "$diagnostic"; then
+    restore_deferred_helper_or_die
+    printf '%s\n' 'systemd could not start the deferred activation worker; no live state was changed' \
+      >"${diagnostic}.new"
+    chmod 0600 "${diagnostic}.new"
+    mv -f -- "${diagnostic}.new" "$diagnostic"
+    write_operation_outcome "$DEFERRED_OUTCOME_FILE" "$operation" failure \
+      "$started" "$(operation_timestamp)" "$old_version" "$candidate_version" "$unit_base" 1 \
+      'systemd could not start the deferred activation worker; no live state was changed' "$diagnostic"
+    rm -rf -- "$DEFERRED_JOB_DIR"
+    die 'The deferred activation worker could not be started; no live state was changed.'
+  fi
+  write_operation_outcome "$DEFERRED_OUTCOME_FILE" "$operation" pending \
+    "$started" '' "$old_version" "$candidate_version" "$unit_base" '' \
+    'validated activation is waiting for the originating SSH transport to end' "$diagnostic"
+  DEFERRED_MUTATION_QUEUED=1
+  printf 'Staged/pending activation: %s\n' "$description"
+  printf 'The specific SSH transport must end before the server activates this change.\n'
+  printf 'Transient systemd unit: %s.service\n' "$unit_base"
+  printf 'After reconnecting, run: vpn health -v\n'
 }
 
 start_sing_box() {
@@ -3504,6 +4955,102 @@ start_sing_box() {
   fi
   systemctl is-active --quiet sing-box.service || die 'sing-box did not become active.'
   sing-box check -c "$CONFIG_FILE"
+}
+
+nftables_effective_execstop_is_exact() {
+  local effective="$1"
+  [[ -n "$effective" && "$effective" =~ \}[[:space:]]*$ ]] || return 1
+  awk '
+    function trim(value) {
+      sub(/^[[:space:]]+/, "", value)
+      sub(/[[:space:]]+$/, "", value)
+      return value
+    }
+    {
+      open_count += gsub(/\{/, "&")
+      close_count += gsub(/\}/, "&")
+      text = text $0 " "
+    }
+    END {
+      if (open_count != 1 || close_count != 1 ||
+          match(text, /\{[^{}]*\}/) == 0) {
+        exit 1
+      }
+
+      prefix = substr(text, 1, RSTART - 1)
+      suffix = substr(text, RSTART + RLENGTH)
+      if (prefix ~ /[^[:space:]]/ || suffix ~ /[^[:space:]]/) {
+        exit 1
+      }
+
+      body = substr(text, RSTART + 1, RLENGTH - 2)
+      field_count = split(body, fields, ";")
+      for (field_index = 1; field_index <= field_count; field_index++) {
+        field = trim(fields[field_index])
+        if (field ~ /^path=/) {
+          path_count++
+          sub(/^path=/, "", field)
+          path = field
+        } else if (field ~ /^argv\[\]=/) {
+          argv_count++
+          sub(/^argv\[\]=/, "", field)
+          argv = field
+        } else if (field ~ /^ignore_errors=/) {
+          ignore_errors_count++
+          sub(/^ignore_errors=/, "", field)
+          ignore_errors = field
+        }
+      }
+
+      if (path_count != 1 || argv_count != 1 || ignore_errors_count != 1 ||
+          path != "/usr/sbin/nft" ||
+          argv != "/usr/sbin/nft delete table inet vpn_filter" ||
+          ignore_errors != "yes") {
+        exit 1
+      }
+    }
+  ' <<<"$effective"
+}
+
+nftables_service_boundary_is_healthy() {
+  local effective
+  [[ -f "$NFTABLES_SYSTEMD_DROPIN" && ! -L "$NFTABLES_SYSTEMD_DROPIN" ]] || return 1
+  grep -Fxq '# Managed by vpn-setup. Preserve unrelated nftables tables.' \
+    "$NFTABLES_SYSTEMD_DROPIN" || return 1
+  grep -Fxq 'ExecStop=' "$NFTABLES_SYSTEMD_DROPIN" || return 1
+  grep -Fxq 'ExecStop=-/usr/sbin/nft delete table inet vpn_filter' \
+    "$NFTABLES_SYSTEMD_DROPIN" || return 1
+  effective="$(systemctl show -p ExecStop --value nftables.service 2>/dev/null)" || return 1
+  nftables_effective_execstop_is_exact "$effective"
+}
+
+render_nftables_service_boundary() {
+  local output="$1"
+  cat >"$output" <<'EOF'
+# Managed by vpn-setup. Preserve unrelated nftables tables.
+[Service]
+ExecStop=
+ExecStop=-/usr/sbin/nft delete table inet vpn_filter
+EOF
+}
+
+configure_nftables_service_boundary() {
+  local candidate
+  if [[ -e "$NFTABLES_SYSTEMD_DROPIN" ]]; then
+    [[ -f "$NFTABLES_SYSTEMD_DROPIN" && ! -L "$NFTABLES_SYSTEMD_DROPIN" ]] || \
+      die "Refusing to replace unexpected nftables service boundary: ${NFTABLES_SYSTEMD_DROPIN}"
+    grep -Fxq '# Managed by vpn-setup. Preserve unrelated nftables tables.' \
+      "$NFTABLES_SYSTEMD_DROPIN" || \
+      die "Refusing to replace an unmanaged nftables service boundary: ${NFTABLES_SYSTEMD_DROPIN}"
+  fi
+  install -d -o root -g root -m 0755 "$NFTABLES_SYSTEMD_DROPIN_DIR"
+  candidate="$(mktemp)"
+  render_nftables_service_boundary "$candidate"
+  write_atomic "$NFTABLES_SYSTEMD_DROPIN" root root 0644 "$candidate"
+  rm -f -- "$candidate"
+  systemctl daemon-reload
+  nftables_service_boundary_is_healthy || \
+    die 'The effective nftables.service ExecStop is not exactly the managed vpn_filter cleanup; refusing unsafe global firewall ownership.'
 }
 
 save_firewall_baseline() {
@@ -3526,6 +5073,13 @@ save_firewall_baseline() {
       printf '%s\n' enabled >"${ROLLBACK_DIR}/nftables.service.state"
     else
       printf '%s\n' disabled >"${ROLLBACK_DIR}/nftables.service.state"
+    fi
+    if [[ -e "$NFTABLES_SYSTEMD_DROPIN" ]]; then
+      install -o root -g root -m 0600 "$NFTABLES_SYSTEMD_DROPIN" \
+        "${ROLLBACK_DIR}/nftables.service.dropin.before"
+      printf '%s\n' present >"${ROLLBACK_DIR}/nftables.service.dropin.state"
+    else
+      printf '%s\n' absent >"${ROLLBACK_DIR}/nftables.service.dropin.state"
     fi
   fi
 }
@@ -3642,6 +5196,7 @@ apply_firewall() {
   fi
 
   save_firewall_baseline
+  configure_nftables_service_boundary
   candidate="$(mktemp)"
   write_firewall_candidate "$candidate"
   nft --check --file "$candidate"
@@ -3697,6 +5252,13 @@ rollback_firewall() {
   else
     systemctl disable nftables.service >/dev/null 2>&1 || true
   fi
+  if [[ "$(cat "${ROLLBACK_DIR}/nftables.service.dropin.state" 2>/dev/null || true)" == "present" ]]; then
+    install -o root -g root -m 0644 "${ROLLBACK_DIR}/nftables.service.dropin.before" \
+      "$NFTABLES_SYSTEMD_DROPIN"
+  else
+    rm -f -- "$NFTABLES_SYSTEMD_DROPIN"
+  fi
+  systemctl daemon-reload
   rm -f -- "${STATE_DIR}/firewall.managed" "${STATE_DIR}/firewall.confirmed" "$FIREWALL_UNIT_STATE"
   log 'Previous firewall state restored.'
 }
@@ -3709,6 +5271,8 @@ confirm_firewall() {
   exec 5>"$FIREWALL_LOCK_FILE"
   flock -x 5
   [[ -f "${STATE_DIR}/firewall.managed" ]] || die 'No pending managed firewall exists.'
+  nftables_service_boundary_is_healthy || \
+    die 'The nftables service boundary is missing; refusing to confirm an unsafe firewall.'
   nft --check --file "$NFT_CONFIG"
   [[ -n "$(port_is_listening tcp "$SSH_PORT" || true)" ]] || die 'SSH is not listening; refusing confirmation.'
   systemctl enable --now nftables.service >/dev/null
@@ -3975,12 +5539,74 @@ finalize_installation() {
   printf '%s\n' 'One-time security setup complete. Future SSH logins require the configured key.'
   printf '%s\n' 'No further setup command or reconnect is required.'
 }
+sing_box_package_is_held() {
+  apt-mark showhold 2>/dev/null | grep -Fxq sing-box
+}
+
+ensure_sing_box_package_hold() {
+  apt-mark hold sing-box >/dev/null 2>&1 || return 1
+  sing_box_package_is_held
+}
+
+activate_sing_box_package_update() {
+  local installed="$1" candidate="$2" new_package="$3" old_package="$4" failed=0
+  log "Installing validated sing-box ${candidate} (rollback: ${installed})."
+  dpkg --force-confold -i "$new_package" >/dev/null 2>&1 || failed=1
+  if (( failed == 0 )); then
+    sing-box check -c "$CONFIG_FILE" >/dev/null 2>&1 || failed=1
+    systemctl restart sing-box.service >/dev/null 2>&1 || failed=1
+    systemctl is-active --quiet sing-box.service || failed=1
+    ensure_sing_box_package_hold || failed=1
+  fi
+
+  if (( failed == 1 )); then
+    warn "sing-box ${candidate} failed validation, startup, or APT hold verification; restoring ${installed}."
+    dpkg --force-confold -i "$old_package" >/dev/null || \
+      die 'Automatic package rollback failed during dpkg installation.'
+    sing-box check -c "$CONFIG_FILE" >/dev/null || \
+      die 'Rollback package cannot validate the existing configuration.'
+    systemctl restart sing-box.service
+    systemctl is-active --quiet sing-box.service || \
+      die 'Rollback package was restored, but sing-box is not active.'
+    ensure_sing_box_package_hold || \
+      die 'Rollback package was restored, but the sing-box APT hold could not be verified.'
+    die "Update failed; sing-box ${installed} was restored."
+  fi
+
+  sing-box check -c "$CONFIG_FILE" >/dev/null || \
+    die 'Updated sing-box configuration validation failed after activation.'
+  systemctl is-active --quiet sing-box.service || \
+    die 'Updated sing-box service is not active after activation.'
+  ensure_sing_box_package_hold || \
+    die 'sing-box update completed, but the APT hold postcondition is missing.'
+  prune_sing_box_packages
+  log "sing-box updated successfully: ${installed} -> ${candidate}."
+}
+
+activate_deferred_core_update() {
+  local job="$1" installed candidate old_package new_package
+  require_client_runtime
+  acquire_operation_lock
+  load_settings
+  installed="$(dpkg-query -W -f='${Version}' sing-box 2>/dev/null || true)"
+  candidate="$(deferred_job_field candidate_version "${job}/metadata")"
+  old_package="${job}/sing-box.old.deb"
+  new_package="${job}/sing-box.candidate.deb"
+  [[ -n "$candidate" && -f "$old_package" && -f "$new_package" ]] || \
+    die 'Deferred sing-box update is missing its staged package or version metadata.'
+  [[ "$installed" == "$(deferred_job_field old_version "${job}/metadata")" ]] || \
+    die 'The installed sing-box version changed while the deferred update was pending.'
+  require_supported_sing_box_version "$candidate"
+  activate_sing_box_package_update "$installed" "$candidate" "$new_package" "$old_package"
+}
+
 update_sing_box() {
-  local installed candidate old_package new_package candidate_root failed=0
+  local installed candidate old_package new_package candidate_root
   require_client_runtime
   require_confirmation
   require_command apt-cache
   require_command apt-get
+  require_command apt-mark
   require_command dpkg-deb
 
   acquire_operation_lock
@@ -3997,6 +5623,8 @@ update_sing_box() {
   [[ -n "$candidate" && "$candidate" != "(none)" ]] || die 'No stable sing-box update candidate is available.'
   require_supported_sing_box_version "$candidate"
   if [[ "$candidate" == "$installed" ]]; then
+    ensure_sing_box_package_hold || \
+      die 'sing-box is current, but the required APT hold could not be verified.'
     log "sing-box ${installed} is already the latest supported stable release."
     return
   fi
@@ -4012,27 +5640,18 @@ update_sing_box() {
   new_package="$(archive_sing_box_package "$new_package")"
   cleanup_apt_download_dir
 
-  log "Installing validated sing-box ${candidate} (rollback: ${installed})."
-  dpkg --force-confold -i "$new_package" >/dev/null 2>&1 || failed=1
-  if (( failed == 0 )); then
-    sing-box check -c "$CONFIG_FILE" >/dev/null 2>&1 || failed=1
-    systemctl restart sing-box.service >/dev/null 2>&1 || failed=1
-    systemctl is-active --quiet sing-box.service || failed=1
+  if management_ssh_requires_deferred_activation; then
+    deferred_job_create core-update \
+      "sing-box ${installed} -> ${candidate} update; activation is pending until the SSH transport ends."
+    printf 'old_version=%s\n' "$installed" >>"${DEFERRED_JOB_DIR}/metadata"
+    printf 'candidate_version=%s\n' "$candidate" >>"${DEFERRED_JOB_DIR}/metadata"
+    deferred_job_stage_file "$new_package" sing-box.candidate.deb root root 0600
+    deferred_job_stage_file "$old_package" sing-box.old.deb root root 0600
+    queue_deferred_mutation
+    return
   fi
 
-  if (( failed == 1 )); then
-    warn "sing-box ${candidate} failed validation or startup; restoring ${installed}."
-    dpkg --force-confold -i "$old_package" >/dev/null || die 'Automatic package rollback failed during dpkg installation.'
-    sing-box check -c "$CONFIG_FILE" >/dev/null || die 'Rollback package cannot validate the existing configuration.'
-    systemctl restart sing-box.service
-    systemctl is-active --quiet sing-box.service || die 'Rollback package was restored, but sing-box is not active.'
-    apt-mark hold sing-box >/dev/null
-    die "Update failed; sing-box ${installed} was restored."
-  fi
-
-  apt-mark hold sing-box >/dev/null
-  prune_sing_box_packages
-  log "sing-box updated successfully: ${installed} -> ${candidate}."
+  activate_sing_box_package_update "$installed" "$candidate" "$new_package" "$old_package"
 }
 
 health_build_redaction_literals() {
@@ -4258,6 +5877,8 @@ health_reset_state() {
   HEALTH_REALITY_NOISE_UNIQUE_SOURCES=0
   HEALTH_SS_TCP=""
   HEALTH_SS_UDP=""
+  HEALTH_OPERATION_STATE=PASS
+  HEALTH_OPERATION_DETAIL='no detached or deferred operation recorded'
 }
 
 health_listener_check() {
@@ -4311,6 +5932,7 @@ health_managed_permissions_are_healthy() {
     actual="$(stat -c '%a:%U:%G' "$path" 2>/dev/null || true)"
     [[ "$actual" == "$expected" ]] || return 1
   done
+  hy2_masquerade_is_healthy || return 1
   [[ -d "$SUBSCRIPTION_ROOT" && ! -L "$SUBSCRIPTION_ROOT" ]] || return 1
   actual="$(stat -c '%a:%U:%G' "$SUBSCRIPTION_ROOT" 2>/dev/null || true)"
   [[ "$actual" == '750:root:www-data' ]] || return 1
@@ -4676,6 +6298,67 @@ health_collect_update_policy() {
   fi
 }
 
+health_redact_operation_text() {
+  redact_health_stream | sed -E \
+    -e 's#(^|[^[:alnum:]_-])(([[:alnum:]-]+\.)+[[:alpha:]]{2,})(:[0-9]+)?([^[:alnum:]_.-]|$)#\1[DOMAIN-REDACTED]\5#g'
+}
+
+health_collect_operation_outcome() {
+  local entry output file status operation detail unit diagnostic diagnostic_summary orphan_job
+  HEALTH_OPERATION_STATE=PASS
+  HEALTH_OPERATION_DETAIL='no detached or deferred operation recorded'
+  [[ -d "$OPERATION_OUTCOME_ROOT" && ! -L "$OPERATION_OUTCOME_ROOT" ]] || return 0
+  if declare -F deferred_job_is_orphaned >/dev/null 2>&1 &&
+     [[ -d "$DEFERRED_MUTATION_ROOT" && ! -L "$DEFERRED_MUTATION_ROOT" ]]; then
+    while IFS= read -r orphan_job; do
+      [[ -n "$orphan_job" ]] || continue
+      if deferred_job_is_orphaned "$orphan_job"; then
+        HEALTH_OPERATION_STATE=WARN
+        HEALTH_OPERATION_DETAIL='deferred operation worker disappeared; the stale candidate will be discarded by the next privileged operation'
+        return 0
+      fi
+    done < <(find "$DEFERRED_MUTATION_ROOT" -mindepth 1 -maxdepth 1 -type d \
+      -name 'job.*' -print 2>/dev/null | sort)
+  fi
+  entry="$(find "$OPERATION_OUTCOME_ROOT" -maxdepth 1 -type f -name '*.status' \
+    -print 2>/dev/null | while IFS= read -r output; do
+      mtime="$(stat -c %Y "$output" 2>/dev/null || stat -f %m "$output" 2>/dev/null || printf 0)"
+      printf '%s %s\n' "$mtime" "$output"
+    done | sort -rn | sed -n '1p')"
+  [[ -n "$entry" ]] || return 0
+  file="${entry#* }"
+  [[ -f "$file" && ! -L "$file" ]] || return 0
+  status="$(sed -n 's/^status=//p' "$file" | sed -n '1p')"
+  operation="$(sed -n 's/^operation=//p' "$file" | sed -n '1p')"
+  detail="$(sed -n 's/^detail=//p' "$file" | sed -n '1p')"
+  unit="$(sed -n 's/^unit=//p' "$file" | sed -n '1p')"
+  diagnostic="$(sed -n 's/^diagnostic=//p' "$file" | sed -n '1p')"
+  detail="$(printf '%s' "$detail" | health_redact_operation_text | tr '\r\n' ' ' | cut -c1-240)"
+  if [[ "$status" == failure && -f "$diagnostic" && ! -L "$diagnostic" ]]; then
+    diagnostic_summary="$(health_redact_operation_text <"$diagnostic" | sed -n '1,3p' |
+      tr '\r\n' ' ' | cut -c1-240)"
+    [[ -z "$diagnostic_summary" ]] || detail="${detail:-worker diagnostic}: ${diagnostic_summary}"
+  fi
+  case "$status" in
+    pending|running)
+      HEALTH_OPERATION_STATE=WARN
+      HEALTH_OPERATION_DETAIL="${operation:-operation} pending · ${detail:-activation is not complete}"
+      ;;
+    failure)
+      HEALTH_OPERATION_STATE=WARN
+      HEALTH_OPERATION_DETAIL="${operation:-operation} failed · ${detail:-inspect the bounded unit reference}"
+      ;;
+    success)
+      HEALTH_OPERATION_DETAIL="${operation:-operation} completed · ${detail:-postconditions passed}"
+      ;;
+    *)
+      HEALTH_OPERATION_STATE=WARN
+      HEALTH_OPERATION_DETAIL='operation outcome has an unknown status'
+      ;;
+  esac
+  [[ -z "$unit" ]] || HEALTH_OPERATION_DETAIL+=" · ${unit}.service"
+}
+
 health_collect_state() {
   local dns_one dns_two vless_config=0 hy2_config=0
   health_reset_state
@@ -4737,6 +6420,7 @@ health_collect_state() {
   health_collect_system
   health_collect_recent_errors
   health_collect_update_policy "$OS_ID"
+  health_collect_operation_outcome
   health_recalculate_result
 }
 
@@ -4754,7 +6438,8 @@ health_recalculate_result() {
     "$HEALTH_TARGET_STATE" "$HEALTH_FIREWALL_STATE" "$HEALTH_SSH_STATE" \
     "$HEALTH_PERMISSIONS_STATE" "$HEALTH_TCP443_STATE" "$HEALTH_UDP443_STATE" \
     "$HEALTH_TCP8443_STATE" "$HEALTH_SSH_LISTENER_STATE" "$HEALTH_CONGESTION_STATE" \
-    "$HEALTH_QUEUE_STATE" "$HEALTH_CLOCK_STATE" "$HEALTH_RECENT_ERRORS_STATE"; do
+    "$HEALTH_QUEUE_STATE" "$HEALTH_CLOCK_STATE" "$HEALTH_RECENT_ERRORS_STATE" \
+    "$HEALTH_OPERATION_STATE"; do
     case "$state" in
       FAIL) (( HEALTH_FAILURES += 1 )) ;;
       WARN) (( HEALTH_WARNINGS += 1 )) ;;
@@ -4878,6 +6563,9 @@ render_health_verbose() {
     "$HEALTH_SECURITY_UPDATES_DETAIL"
   health_print_row 'Core updates' "$HEALTH_CORE_UPDATES_STATE" "$HEALTH_CORE_UPDATES_DETAIL"
 
+  print_section 'OPERATIONS'
+  health_print_row Outcome "$HEALTH_OPERATION_STATE" "$HEALTH_OPERATION_DETAIL"
+
   print_section 'RECENT ACTIONABLE ERRORS'
   if [[ "$HEALTH_RECENT_ERRORS_STATE" == PASS ]]; then
     printf '  None\n'
@@ -4953,6 +6641,7 @@ managed_firewall_is_healthy() {
   [[ -s "${STATE_DIR}/firewall.managed" ]] || return 1
   systemctl is-enabled --quiet nftables.service 2>/dev/null || return 1
   systemctl is-active --quiet nftables.service 2>/dev/null || return 1
+  nftables_service_boundary_is_healthy || return 1
   nft --check --file "$NFT_CONFIG" >/dev/null 2>&1 || return 1
   firewall_input="$(nft list chain inet vpn_filter input 2>/dev/null || true)"
   grep -Eq 'tcp dport.*443.*accept' <<<"$firewall_input" || return 1
@@ -5014,6 +6703,56 @@ restore_upgrade_file() {
   fi
 }
 
+backup_upgrade_tree() {
+  local source="$1" label="$2"
+  if [[ -e "$source" ]]; then
+    [[ -d "$source" && ! -L "$source" ]] || die "Unexpected managed directory cannot be backed up safely: $source"
+    install -d -o root -g root -m 0700 "${UPGRADE_BACKUP_DIR}/${label}"
+    cp -a -- "${source}/." "${UPGRADE_BACKUP_DIR}/${label}/"
+    printf '%s\n' present >"${UPGRADE_BACKUP_DIR}/${label}.state"
+  else
+    printf '%s\n' absent >"${UPGRADE_BACKUP_DIR}/${label}.state"
+  fi
+}
+
+restore_upgrade_tree() {
+  local target="$1" label="$2" owner="$3" group="$4" dir_mode="$5" file_mode="$6" state
+  state="$(<"${UPGRADE_BACKUP_DIR}/${label}.state")"
+  if [[ "$state" == present ]]; then
+    [[ ! -L "$target" ]] || return 1
+    rm -rf -- "$target"
+    install -d -o "$owner" -g "$group" -m "$dir_mode" "$target"
+    cp -a -- "${UPGRADE_BACKUP_DIR}/${label}/." "$target/"
+    chown -R "$owner":"$group" "$target"
+    chmod "$dir_mode" "$target"
+    find "$target" -type f -exec chmod "$file_mode" {} +
+  else
+    [[ ! -L "$target" ]] || return 1
+    rm -rf -- "$target"
+  fi
+}
+
+upgrade_file_matches_snapshot() {
+  local target="$1" label="$2" state
+  state="$(<"${UPGRADE_BACKUP_DIR}/${label}.state")"
+  if [[ "$state" == present ]]; then
+    [[ -f "$target" && ! -L "$target" ]] && cmp -s "$target" "${UPGRADE_BACKUP_DIR}/${label}"
+  else
+    [[ ! -e "$target" && ! -L "$target" ]]
+  fi
+}
+
+upgrade_tree_matches_snapshot() {
+  local target="$1" label="$2" state
+  state="$(<"${UPGRADE_BACKUP_DIR}/${label}.state")"
+  if [[ "$state" == present ]]; then
+    [[ -d "$target" && ! -L "$target" ]] &&
+      diff -qr -- "${UPGRADE_BACKUP_DIR}/${label}" "$target" >/dev/null 2>&1
+  else
+    [[ ! -e "$target" && ! -L "$target" ]]
+  fi
+}
+
 prepare_upgrade_transaction() {
   UPGRADE_BACKUP_DIR="$(mktemp -d)"
   chmod 0700 "$UPGRADE_BACKUP_DIR"
@@ -5026,6 +6765,10 @@ prepare_upgrade_transaction() {
   backup_upgrade_file "$USER_COMMAND" vpn-command 0755
   backup_upgrade_file "$INSTALL_COMPLETE_FILE" completion-marker 0600
   backup_upgrade_file "$RUNTIME_VERSION_FILE" runtime-version-marker 0600
+  backup_upgrade_file "$CONFIG_FILE" config 0640
+  backup_upgrade_file "$NFTABLES_SYSTEMD_DROPIN" nftables-service-dropin 0644
+  backup_upgrade_tree "$SUBSCRIPTION_ROOT" subscriptions
+  backup_upgrade_tree "$HY2_MASQUERADE_ROOT" hy2-masquerade
   UPGRADE_ROLLBACK_FAILED=0
   UPGRADE_ROLLBACK_ACTIVE=1
 }
@@ -5042,12 +6785,39 @@ rollback_upgrade_transaction() {
   restore_upgrade_file "$USER_COMMAND" vpn-command root root 0755 || restore_failed=1
   restore_upgrade_file "$INSTALL_COMPLETE_FILE" completion-marker root root 0600 || restore_failed=1
   restore_upgrade_file "$RUNTIME_VERSION_FILE" runtime-version-marker root root 0600 || restore_failed=1
+  restore_upgrade_file "$CONFIG_FILE" config root sing-box 0640 || restore_failed=1
+  restore_upgrade_file "$NFTABLES_SYSTEMD_DROPIN" nftables-service-dropin root root 0644 || restore_failed=1
+  systemctl daemon-reload || restore_failed=1
+  restore_upgrade_tree "$SUBSCRIPTION_ROOT" subscriptions root www-data 0750 0640 || restore_failed=1
+  restore_upgrade_tree "$HY2_MASQUERADE_ROOT" hy2-masquerade root sing-box 0750 0644 || restore_failed=1
   if [[ "$UPGRADE_ORIGINAL_RMEM" =~ ^[0-9]+$ ]]; then
     sysctl -q -w "net.core.rmem_max=${UPGRADE_ORIGINAL_RMEM}" >/dev/null 2>&1 || restore_failed=1
   fi
   if [[ "$UPGRADE_ORIGINAL_WMEM" =~ ^[0-9]+$ ]]; then
     sysctl -q -w "net.core.wmem_max=${UPGRADE_ORIGINAL_WMEM}" >/dev/null 2>&1 || restore_failed=1
   fi
+  upgrade_file_matches_snapshot "$CONFIG_FILE" config || restore_failed=1
+  upgrade_tree_matches_snapshot "$SUBSCRIPTION_ROOT" subscriptions || restore_failed=1
+  upgrade_tree_matches_snapshot "$HY2_MASQUERADE_ROOT" hy2-masquerade || restore_failed=1
+  upgrade_file_matches_snapshot "$UDP_SYSCTL_FILE" udp-sysctl || restore_failed=1
+  upgrade_file_matches_snapshot "$UNATTENDED_UPGRADES_CONFIG" unattended-upgrades || restore_failed=1
+  upgrade_file_matches_snapshot "$CERT_HOOK" certificate-hook || restore_failed=1
+  upgrade_file_matches_snapshot "$INSTALLED_HELPER" vpn-helper || restore_failed=1
+  upgrade_file_matches_snapshot "$USER_COMMAND" vpn-command || restore_failed=1
+  upgrade_file_matches_snapshot "$INSTALL_COMPLETE_FILE" completion-marker || restore_failed=1
+  upgrade_file_matches_snapshot "$RUNTIME_VERSION_FILE" runtime-version-marker || restore_failed=1
+  upgrade_file_matches_snapshot "$NFTABLES_SYSTEMD_DROPIN" nftables-service-dropin || restore_failed=1
+  if sing-box check -c "$CONFIG_FILE" >/dev/null 2>&1; then
+    # reconcile_managed_runtime may already have restarted sing-box with the
+    # candidate config before a later overlay postcondition fails. Restoring
+    # CONFIG_FILE on disk is not enough: reactivate the restored configuration
+    # before declaring the outer transaction rolled back.
+    systemctl restart sing-box.service || restore_failed=1
+  else
+    restore_failed=1
+  fi
+  systemctl is-active --quiet sing-box.service || restore_failed=1
+  subscription_service_healthy || restore_failed=1
   UPGRADE_ROLLBACK_ACTIVE=0
   set -e
   if (( restore_failed == 1 )); then
@@ -5059,10 +6829,47 @@ rollback_upgrade_transaction() {
   fi
 }
 
+queue_deferred_overlay_upgrade() {
+  local candidate_config candidate_subscriptions current_state_version
+  current_state_version="$(installed_state_version)"
+  new_temp_dir
+  candidate_config="${TMP_DIR}/config.deferred.candidate.json"
+  candidate_subscriptions="${TMP_DIR}/subscriptions.deferred.candidate"
+  build_sing_box_config "$CLIENTS_FILE" "$candidate_config"
+  sing-box check -c "$candidate_config" >/dev/null
+  render_subscription_tree "$CLIENTS_FILE" "$candidate_subscriptions"
+  deferred_job_create overlay-upgrade \
+    "Managed overlay upgrade ${current_state_version} -> ${SCRIPT_VERSION}; activation is pending until the SSH transport ends."
+  printf 'old_version=%s\n' "$current_state_version" >>"${DEFERRED_JOB_DIR}/metadata"
+  printf 'candidate_version=%s\n' "$SCRIPT_VERSION" >>"${DEFERRED_JOB_DIR}/metadata"
+  deferred_job_stage_file "$candidate_config" config.candidate root sing-box 0640
+  deferred_job_stage_tree "$candidate_subscriptions" subscriptions
+  deferred_job_stage_activator || {
+    deferred_job_fail_and_remove 'The candidate-compatible deferred activator could not be staged; no live state was changed.'
+    die 'The candidate-compatible deferred activator could not be staged; no live state was changed.'
+  }
+  if ! handoff_deferred_helper "${DEFERRED_JOB_DIR}/activator"; then
+    restore_deferred_helper_or_die
+    deferred_job_fail_and_remove 'The candidate management helper could not be handed off safely; no live state was changed.'
+    die 'The candidate management helper could not be handed off safely; no live state was changed.'
+  fi
+  if ! deferred_job_capture_baseline "$DEFERRED_JOB_DIR" "${DEFERRED_JOB_DIR}/baseline"; then
+    restore_deferred_helper_or_die
+    deferred_job_fail_and_remove 'The deferred baseline could not be recaptured after helper handoff; no live state was changed.'
+    die 'The deferred baseline could not be recaptured after helper handoff; no live state was changed.'
+  fi
+  queue_deferred_mutation
+  if ! commit_deferred_helper_handoff; then
+    log 'Deferred helper backup cleanup was incomplete; the pending worker remains authoritative.'
+  fi
+}
+
 upgrade_existing_installation() {
   local current_helper_version current_state_version current_runtime_version helper_backup=""
+  local health_raw health_bounded
   require_command dpkg
   require_command sysctl
+  acquire_operation_lock
   require_client_runtime
   [[ -f "$INSTALL_COMPLETE_FILE" ]] || die 'Installation completion marker is missing; resume the install command instead of upgrading.'
   [[ -f "${STATE_DIR}/firewall.confirmed" ]] || \
@@ -5088,6 +6895,15 @@ upgrade_existing_installation() {
   if [[ "$current_helper_version" == "$SCRIPT_VERSION" &&
         "$current_state_version" == "$SCRIPT_VERSION" &&
         "$current_runtime_version" == "$SCRIPT_VERSION" ]]; then
+    if ! hy2_masquerade_is_healthy || ! nftables_service_boundary_is_healthy; then
+      cat <<EOF
+Same-version install found drift in non-runtime managed state.
+The current-release ownership and mode invariant will be repaired without restarting sing-box.
+EOF
+      require_confirmation
+      set_step 'same-version non-runtime managed-state reconciliation'
+      reconcile_same_version_non_runtime_state
+    fi
     log "Installer and managed state are already at ${SCRIPT_VERSION}; no overlay update is required."
     return
   fi
@@ -5098,6 +6914,11 @@ Settings, clients, credentials, certificates, SSH and firewall are preserved.
 EOF
   require_confirmation
 
+  if management_ssh_requires_deferred_activation; then
+    queue_deferred_overlay_upgrade
+    return
+  fi
+
   set_step 'existing installation validation'
   sing-box check -c "$CONFIG_FILE" >/dev/null
   systemctl is-active --quiet sing-box.service || die 'sing-box must be active before an overlay update.'
@@ -5106,6 +6927,8 @@ EOF
 
   set_step 'Hysteria2 UDP socket-buffer ceilings'
   configure_udp_buffer_ceilings
+  set_step 'Hysteria2 local masquerade files'
+  install_hy2_masquerade
   set_step 'automatic security updates policy'
   configure_unattended_upgrades
   set_step 'certificate renewal hook refresh'
@@ -5114,6 +6937,8 @@ EOF
   set_step 'management helper atomic replacement'
   install_helper
   helper_backup="$LAST_HELPER_BACKUP"
+  set_step 'nftables service table boundary'
+  configure_nftables_service_boundary
   remove_auto_finalization
   set_step 'managed state version marker'
   write_install_completion_marker
@@ -5122,9 +6947,20 @@ EOF
   set_step 'managed runtime version marker'
   write_runtime_version_marker
   set_step 'upgraded runtime health validation'
-  if ! "$INSTALLED_HELPER" health >/dev/null 2>&1; then
-    restore_installed_helper "$helper_backup" || die 'New helper failed its post-update check and automatic helper rollback also failed.'
-    die 'New helper failed its post-update check; the previous helper and version markers will be restored.'
+  [[ -n "$TMP_DIR" ]] || new_temp_dir
+  health_raw="${TMP_DIR}/overlay-health.raw"
+  health_bounded="${TMP_DIR}/overlay-health.redacted"
+  if ! "$INSTALLED_HELPER" health >"$health_raw" 2>&1; then
+    health_write_bounded_redacted_file "$health_raw" "$health_bounded" 40 8192 || true
+    if [[ -s "$health_bounded" ]]; then
+      printf '[ERROR] Bounded post-update health diagnostic:\n' >&2
+      sed -n '1,80p' "$health_bounded" >&2
+    fi
+    rollback_upgrade_transaction
+    if (( UPGRADE_ROLLBACK_FAILED == 1 )); then
+      die 'New helper failed its post-update check and the complete overlay rollback could not be proven; recovery state was preserved.'
+    fi
+    die 'New helper failed its post-update check; the exact previous overlay state was restored.'
   fi
   UPGRADE_ROLLBACK_ACTIVE=0
   log "Overlay update completed: ${current_state_version} -> ${SCRIPT_VERSION}."
@@ -5293,7 +7129,7 @@ EOF
 main() {
   parse_args "$@"
   case "$COMMAND" in
-    plan|check|install|upgrade|update|self-update|health|finalize|confirm-firewall|rollback-firewall|lockdown-ssh|client-add|client-show|client-delete|client-list|audit-target|set-target|set-fingerprint|set-obfs|help)
+    plan|check|install|upgrade|update|self-update|deferred-activate|health|finalize|confirm-firewall|rollback-firewall|lockdown-ssh|client-add|client-show|client-delete|client-list|audit-target|set-target|set-fingerprint|set-obfs|help)
       ;;
     *)
       usage >&2
@@ -5325,6 +7161,9 @@ main() {
       ;;
     self-update)
       self_update_from_file
+      ;;
+    deferred-activate)
+      deferred_activate_job "$DEFERRED_JOB_DIR"
       ;;
     health)
       if (( DEBUG == 1 )); then

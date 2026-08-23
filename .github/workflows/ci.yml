@@ -19,7 +19,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Install test dependencies
-        run: sudo apt-get update && sudo apt-get install -y jq nftables shellcheck
+        run: sudo apt-get update && sudo apt-get install -y jq nftables openssh-server shellcheck
 
       - name: Check Bash syntax
         run: bash -n src/*.sh scripts/build-standalone.sh install-sing-box-server.sh tests/*.sh
@@ -44,6 +44,24 @@ jobs:
 
       - name: Run package policy smoke tests
         run: bash tests/package-policy-smoke.sh
+
+      - name: Run self-update smoke tests
+        run: bash tests/self-update-smoke.sh
+
+      - name: Run deferred overlay regression
+        run: bash tests/deferred-overlay-smoke.sh
+
+      - name: Run same-version reconciliation regression
+        run: bash tests/same-version-reconciliation-smoke.sh
+
+      - name: Validate detached self-update lifecycle
+        run: sudo bash tests/self-update-systemd-smoke.sh
+
+      - name: Validate deferred SSH transport lifecycle
+        run: sudo bash tests/deferred-ssh-systemd-smoke.sh
+
+      - name: Validate certificate watcher lifecycle
+        run: sudo bash tests/certificate-lifecycle-smoke.sh
 
       - name: Validate dry-run plan
         run: ./install-sing-box-server.sh plan

@@ -1,9 +1,71 @@
+sing_box_package_is_held() {
+  apt-mark showhold 2>/dev/null | grep -Fxq sing-box
+}
+
+ensure_sing_box_package_hold() {
+  apt-mark hold sing-box >/dev/null 2>&1 || return 1
+  sing_box_package_is_held
+}
+
+activate_sing_box_package_update() {
+  local installed="$1" candidate="$2" new_package="$3" old_package="$4" failed=0
+  log "Installing validated sing-box ${candidate} (rollback: ${installed})."
+  dpkg --force-confold -i "$new_package" >/dev/null 2>&1 || failed=1
+  if (( failed == 0 )); then
+    sing-box check -c "$CONFIG_FILE" >/dev/null 2>&1 || failed=1
+    systemctl restart sing-box.service >/dev/null 2>&1 || failed=1
+    systemctl is-active --quiet sing-box.service || failed=1
+    ensure_sing_box_package_hold || failed=1
+  fi
+
+  if (( failed == 1 )); then
+    warn "sing-box ${candidate} failed validation, startup, or APT hold verification; restoring ${installed}."
+    dpkg --force-confold -i "$old_package" >/dev/null || \
+      die 'Automatic package rollback failed during dpkg installation.'
+    sing-box check -c "$CONFIG_FILE" >/dev/null || \
+      die 'Rollback package cannot validate the existing configuration.'
+    systemctl restart sing-box.service
+    systemctl is-active --quiet sing-box.service || \
+      die 'Rollback package was restored, but sing-box is not active.'
+    ensure_sing_box_package_hold || \
+      die 'Rollback package was restored, but the sing-box APT hold could not be verified.'
+    die "Update failed; sing-box ${installed} was restored."
+  fi
+
+  sing-box check -c "$CONFIG_FILE" >/dev/null || \
+    die 'Updated sing-box configuration validation failed after activation.'
+  systemctl is-active --quiet sing-box.service || \
+    die 'Updated sing-box service is not active after activation.'
+  ensure_sing_box_package_hold || \
+    die 'sing-box update completed, but the APT hold postcondition is missing.'
+  prune_sing_box_packages
+  log "sing-box updated successfully: ${installed} -> ${candidate}."
+}
+
+activate_deferred_core_update() {
+  local job="$1" installed candidate old_package new_package
+  require_client_runtime
+  acquire_operation_lock
+  load_settings
+  installed="$(dpkg-query -W -f='${Version}' sing-box 2>/dev/null || true)"
+  candidate="$(deferred_job_field candidate_version "${job}/metadata")"
+  old_package="${job}/sing-box.old.deb"
+  new_package="${job}/sing-box.candidate.deb"
+  [[ -n "$candidate" && -f "$old_package" && -f "$new_package" ]] || \
+    die 'Deferred sing-box update is missing its staged package or version metadata.'
+  [[ "$installed" == "$(deferred_job_field old_version "${job}/metadata")" ]] || \
+    die 'The installed sing-box version changed while the deferred update was pending.'
+  require_supported_sing_box_version "$candidate"
+  activate_sing_box_package_update "$installed" "$candidate" "$new_package" "$old_package"
+}
+
 update_sing_box() {
-  local installed candidate old_package new_package candidate_root failed=0
+  local installed candidate old_package new_package candidate_root
   require_client_runtime
   require_confirmation
   require_command apt-cache
   require_command apt-get
+  require_command apt-mark
   require_command dpkg-deb
 
   acquire_operation_lock
@@ -20,6 +82,8 @@ update_sing_box() {
   [[ -n "$candidate" && "$candidate" != "(none)" ]] || die 'No stable sing-box update candidate is available.'
   require_supported_sing_box_version "$candidate"
   if [[ "$candidate" == "$installed" ]]; then
+    ensure_sing_box_package_hold || \
+      die 'sing-box is current, but the required APT hold could not be verified.'
     log "sing-box ${installed} is already the latest supported stable release."
     return
   fi
@@ -35,27 +99,18 @@ update_sing_box() {
   new_package="$(archive_sing_box_package "$new_package")"
   cleanup_apt_download_dir
 
-  log "Installing validated sing-box ${candidate} (rollback: ${installed})."
-  dpkg --force-confold -i "$new_package" >/dev/null 2>&1 || failed=1
-  if (( failed == 0 )); then
-    sing-box check -c "$CONFIG_FILE" >/dev/null 2>&1 || failed=1
-    systemctl restart sing-box.service >/dev/null 2>&1 || failed=1
-    systemctl is-active --quiet sing-box.service || failed=1
+  if management_ssh_requires_deferred_activation; then
+    deferred_job_create core-update \
+      "sing-box ${installed} -> ${candidate} update; activation is pending until the SSH transport ends."
+    printf 'old_version=%s\n' "$installed" >>"${DEFERRED_JOB_DIR}/metadata"
+    printf 'candidate_version=%s\n' "$candidate" >>"${DEFERRED_JOB_DIR}/metadata"
+    deferred_job_stage_file "$new_package" sing-box.candidate.deb root root 0600
+    deferred_job_stage_file "$old_package" sing-box.old.deb root root 0600
+    queue_deferred_mutation
+    return
   fi
 
-  if (( failed == 1 )); then
-    warn "sing-box ${candidate} failed validation or startup; restoring ${installed}."
-    dpkg --force-confold -i "$old_package" >/dev/null || die 'Automatic package rollback failed during dpkg installation.'
-    sing-box check -c "$CONFIG_FILE" >/dev/null || die 'Rollback package cannot validate the existing configuration.'
-    systemctl restart sing-box.service
-    systemctl is-active --quiet sing-box.service || die 'Rollback package was restored, but sing-box is not active.'
-    apt-mark hold sing-box >/dev/null
-    die "Update failed; sing-box ${installed} was restored."
-  fi
-
-  apt-mark hold sing-box >/dev/null
-  prune_sing_box_packages
-  log "sing-box updated successfully: ${installed} -> ${candidate}."
+  activate_sing_box_package_update "$installed" "$candidate" "$new_package" "$old_package"
 }
 
 health_build_redaction_literals() {
@@ -281,6 +336,8 @@ health_reset_state() {
   HEALTH_REALITY_NOISE_UNIQUE_SOURCES=0
   HEALTH_SS_TCP=""
   HEALTH_SS_UDP=""
+  HEALTH_OPERATION_STATE=PASS
+  HEALTH_OPERATION_DETAIL='no detached or deferred operation recorded'
 }
 
 health_listener_check() {
@@ -334,6 +391,7 @@ health_managed_permissions_are_healthy() {
     actual="$(stat -c '%a:%U:%G' "$path" 2>/dev/null || true)"
     [[ "$actual" == "$expected" ]] || return 1
   done
+  hy2_masquerade_is_healthy || return 1
   [[ -d "$SUBSCRIPTION_ROOT" && ! -L "$SUBSCRIPTION_ROOT" ]] || return 1
   actual="$(stat -c '%a:%U:%G' "$SUBSCRIPTION_ROOT" 2>/dev/null || true)"
   [[ "$actual" == '750:root:www-data' ]] || return 1
@@ -699,6 +757,67 @@ health_collect_update_policy() {
   fi
 }
 
+health_redact_operation_text() {
+  redact_health_stream | sed -E \
+    -e 's#(^|[^[:alnum:]_-])(([[:alnum:]-]+\.)+[[:alpha:]]{2,})(:[0-9]+)?([^[:alnum:]_.-]|$)#\1[DOMAIN-REDACTED]\5#g'
+}
+
+health_collect_operation_outcome() {
+  local entry output file status operation detail unit diagnostic diagnostic_summary orphan_job
+  HEALTH_OPERATION_STATE=PASS
+  HEALTH_OPERATION_DETAIL='no detached or deferred operation recorded'
+  [[ -d "$OPERATION_OUTCOME_ROOT" && ! -L "$OPERATION_OUTCOME_ROOT" ]] || return 0
+  if declare -F deferred_job_is_orphaned >/dev/null 2>&1 &&
+     [[ -d "$DEFERRED_MUTATION_ROOT" && ! -L "$DEFERRED_MUTATION_ROOT" ]]; then
+    while IFS= read -r orphan_job; do
+      [[ -n "$orphan_job" ]] || continue
+      if deferred_job_is_orphaned "$orphan_job"; then
+        HEALTH_OPERATION_STATE=WARN
+        HEALTH_OPERATION_DETAIL='deferred operation worker disappeared; the stale candidate will be discarded by the next privileged operation'
+        return 0
+      fi
+    done < <(find "$DEFERRED_MUTATION_ROOT" -mindepth 1 -maxdepth 1 -type d \
+      -name 'job.*' -print 2>/dev/null | sort)
+  fi
+  entry="$(find "$OPERATION_OUTCOME_ROOT" -maxdepth 1 -type f -name '*.status' \
+    -print 2>/dev/null | while IFS= read -r output; do
+      mtime="$(stat -c %Y "$output" 2>/dev/null || stat -f %m "$output" 2>/dev/null || printf 0)"
+      printf '%s %s\n' "$mtime" "$output"
+    done | sort -rn | sed -n '1p')"
+  [[ -n "$entry" ]] || return 0
+  file="${entry#* }"
+  [[ -f "$file" && ! -L "$file" ]] || return 0
+  status="$(sed -n 's/^status=//p' "$file" | sed -n '1p')"
+  operation="$(sed -n 's/^operation=//p' "$file" | sed -n '1p')"
+  detail="$(sed -n 's/^detail=//p' "$file" | sed -n '1p')"
+  unit="$(sed -n 's/^unit=//p' "$file" | sed -n '1p')"
+  diagnostic="$(sed -n 's/^diagnostic=//p' "$file" | sed -n '1p')"
+  detail="$(printf '%s' "$detail" | health_redact_operation_text | tr '\r\n' ' ' | cut -c1-240)"
+  if [[ "$status" == failure && -f "$diagnostic" && ! -L "$diagnostic" ]]; then
+    diagnostic_summary="$(health_redact_operation_text <"$diagnostic" | sed -n '1,3p' |
+      tr '\r\n' ' ' | cut -c1-240)"
+    [[ -z "$diagnostic_summary" ]] || detail="${detail:-worker diagnostic}: ${diagnostic_summary}"
+  fi
+  case "$status" in
+    pending|running)
+      HEALTH_OPERATION_STATE=WARN
+      HEALTH_OPERATION_DETAIL="${operation:-operation} pending · ${detail:-activation is not complete}"
+      ;;
+    failure)
+      HEALTH_OPERATION_STATE=WARN
+      HEALTH_OPERATION_DETAIL="${operation:-operation} failed · ${detail:-inspect the bounded unit reference}"
+      ;;
+    success)
+      HEALTH_OPERATION_DETAIL="${operation:-operation} completed · ${detail:-postconditions passed}"
+      ;;
+    *)
+      HEALTH_OPERATION_STATE=WARN
+      HEALTH_OPERATION_DETAIL='operation outcome has an unknown status'
+      ;;
+  esac
+  [[ -z "$unit" ]] || HEALTH_OPERATION_DETAIL+=" · ${unit}.service"
+}
+
 health_collect_state() {
   local dns_one dns_two vless_config=0 hy2_config=0
   health_reset_state
@@ -760,6 +879,7 @@ health_collect_state() {
   health_collect_system
   health_collect_recent_errors
   health_collect_update_policy "$OS_ID"
+  health_collect_operation_outcome
   health_recalculate_result
 }
 
@@ -777,7 +897,8 @@ health_recalculate_result() {
     "$HEALTH_TARGET_STATE" "$HEALTH_FIREWALL_STATE" "$HEALTH_SSH_STATE" \
     "$HEALTH_PERMISSIONS_STATE" "$HEALTH_TCP443_STATE" "$HEALTH_UDP443_STATE" \
     "$HEALTH_TCP8443_STATE" "$HEALTH_SSH_LISTENER_STATE" "$HEALTH_CONGESTION_STATE" \
-    "$HEALTH_QUEUE_STATE" "$HEALTH_CLOCK_STATE" "$HEALTH_RECENT_ERRORS_STATE"; do
+    "$HEALTH_QUEUE_STATE" "$HEALTH_CLOCK_STATE" "$HEALTH_RECENT_ERRORS_STATE" \
+    "$HEALTH_OPERATION_STATE"; do
     case "$state" in
       FAIL) (( HEALTH_FAILURES += 1 )) ;;
       WARN) (( HEALTH_WARNINGS += 1 )) ;;
@@ -901,6 +1022,9 @@ render_health_verbose() {
     "$HEALTH_SECURITY_UPDATES_DETAIL"
   health_print_row 'Core updates' "$HEALTH_CORE_UPDATES_STATE" "$HEALTH_CORE_UPDATES_DETAIL"
 
+  print_section 'OPERATIONS'
+  health_print_row Outcome "$HEALTH_OPERATION_STATE" "$HEALTH_OPERATION_DETAIL"
+
   print_section 'RECENT ACTIONABLE ERRORS'
   if [[ "$HEALTH_RECENT_ERRORS_STATE" == PASS ]]; then
     printf '  None\n'
@@ -976,6 +1100,7 @@ managed_firewall_is_healthy() {
   [[ -s "${STATE_DIR}/firewall.managed" ]] || return 1
   systemctl is-enabled --quiet nftables.service 2>/dev/null || return 1
   systemctl is-active --quiet nftables.service 2>/dev/null || return 1
+  nftables_service_boundary_is_healthy || return 1
   nft --check --file "$NFT_CONFIG" >/dev/null 2>&1 || return 1
   firewall_input="$(nft list chain inet vpn_filter input 2>/dev/null || true)"
   grep -Eq 'tcp dport.*443.*accept' <<<"$firewall_input" || return 1

@@ -49,6 +49,9 @@ bash tests/fingerprint-smoke.sh
 bash tests/health-smoke.sh
 bash tests/management-lifecycle-smoke.sh
 bash tests/package-policy-smoke.sh
+bash tests/self-update-smoke.sh
+bash tests/deferred-overlay-smoke.sh
+bash tests/same-version-reconciliation-smoke.sh
 ./install-sing-box-server.sh plan
 ```
 
@@ -56,6 +59,16 @@ On Linux with nftables, also run `sudo bash tests/firewall-smoke.sh`. The macOS
 suite cannot prove Linux systemd, APT, nftables, kernel, listener, or qdisc
 behavior. A JSON-validating test stub also does not replace `sing-box check`
 against the supported real binary.
+
+On a Linux host booted with systemd, also run
+`sudo bash tests/self-update-systemd-smoke.sh` and
+`sudo bash tests/deferred-ssh-systemd-smoke.sh` and
+`sudo bash tests/certificate-lifecycle-smoke.sh`. The portable self-update test
+mocks the release-download and handoff boundaries; only the Linux test proves
+that a real transient systemd worker survives loss of its initiating process.
+The deferred SSH test starts a private loopback OpenSSH listener and proves that
+activation waits for the exact accepted transport across sudo, PTY/no-PTY, and
+an unrelated connection.
 
 The compatibility window is defined by `SING_BOX_MIN_VERSION` and
 `SING_BOX_MAX_EXCLUSIVE` in `src/00-preamble.sh`. A release candidate must be
@@ -68,17 +81,36 @@ the latest repository candidate was executed in the current environment.
 - Generated config or protocols: parse the generated JSON, run real
   `sing-box check`, and verify the exact two-inbound topology.
 - Firewall: run the Linux nftables smoke test and confirm unrelated tables
-  survive apply, confirmation, and rollback.
+  survive apply, confirmation, rollback, and the `nftables.service` lifecycle.
+  The late local-admin drop-in `90-vpn-table-boundary.conf` narrows service-stop
+  cleanup to `inet vpn_filter` instead of the distribution default global
+  ruleset flush; health must prove the effective `ExecStop` contains exactly one
+  managed command.
 - Health or diagnostics: cover healthy and failing states, bounded timeouts,
   redaction, exit codes, and the permanent client-path/provider boundary.
 - Certificates: cover invalid and expiring files, ACME/deployed-copy mismatch,
-  served-certificate mismatch, hook rollback, and both service reloads.
+  served-certificate mismatch, watcher propagation with unchanged sing-box PID,
+  nginx reload, and hook rollback without a deliberate sing-box restart.
 - Clients/settings/obfs/target: cover commit failure, exact restoration, unchanged
   credentials for other clients, and subscription revocation.
 - Packages/upgrade: cover security-only unattended upgrades, APT hold, private
   `_apt` staging, candidate validation, service failure, and rollback package.
 - SSH/systemd: validate generated files, service state, key-only policy, and the
   first-login firewall finalization path on a clean VM/VPS.
+- Installer self-update: mock both official release assets, cover strict
+  checksum/candidate/version failures before handoff, numeric worker exit and
+  cleanup statuses, bounded diagnostics, candidate-compatible deferred
+  activation, and then verify a real transient systemd worker survives
+  initiating-session loss on Linux.
+- Deferred management: cover SSH ancestry recovery, conservative direct versus
+  self-tunneled classification, exact socket cookie/inode lifetime, serialized
+  pending jobs, live-state baseline mismatch, orphan recovery, and exact overlay
+  rollback of config, runtime markers, subscriptions, and Hysteria2 masquerade
+  files. The focused deferred overlay regression also models the published
+  1.0.10 caller: helper handoff
+  precedes a successful pending return, runtime markers stay old until the
+  worker runs once, and queue failure restores the old helper without an
+  orphaned job.
 
 ## Rollback testing
 
@@ -94,9 +126,9 @@ prove that unrelated nftables tables remain unchanged. Keep the original SSH
 session open.
 
 Certificate-hook rollback must cover failure after certificate replacement and
-after each service reload. The previous sing-box certificate copy must be
-restored, nginx must serve the current Certbot-managed ACME certificate, and
-both services must return active.
+after nginx reload. The previous sing-box certificate copy must be restored,
+sing-box must remain active with the same PID, and nginx must serve the current
+Certbot-managed ACME certificate.
 
 ## Clean-install and release evidence
 
@@ -108,16 +140,17 @@ transaction cancellation/acceptance, NTP/qdisc, unattended-upgrades policy, and
 the sing-box APT hold.
 
 Verify that the committed standalone equals a fresh build and note its SHA-256.
-The current README bootstrap downloads mutable `main`; that is a trust boundary,
-not by itself a demonstrated exploit. A low-complexity release procedure is:
+The README bootstrap and automatic self-update use the latest normal published
+GitHub Release rather than mutable `main`. A low-complexity release procedure is:
 
 1. publish the reviewed standalone at a versioned release/tag;
 2. publish its SHA-256 through a separately reviewed release channel;
 3. have users download, verify, and only then execute it as root.
 
-A checksum fetched only from the same mutable location is not an independent
-trust anchor. Do not introduce custom PKI, TUF, cosign infrastructure, or an
-update daemon solely to change this boundary.
+A checksum fetched from the same GitHub Release detects accidental corruption
+or mismatched assets, but is not a trust anchor independent of GitHub. Do not
+introduce custom PKI, TUF, cosign infrastructure, or an update daemon solely to
+change this boundary.
 
 Release verification must explicitly separate local/CI results, clean-VPS
 runtime evidence, and external client-network evidence. If no external client

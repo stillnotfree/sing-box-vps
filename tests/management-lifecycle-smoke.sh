@@ -35,6 +35,9 @@ trap on_error ERR
 assert_clean_cli_failure "$duplicate_output" \
   'Client default already exists (names are case-insensitive).'
 
+[[ "$(management_proc_parent_pid_from_stat \
+  '123 (command name with ) parentheses) S 42 7 8 9 10')" == 42 ]]
+
 trap - ERR
 if missing_output="$(require_existing_client missing '' 2>&1)"; then
   printf 'Missing client unexpectedly passed.\n' >&2
@@ -146,6 +149,234 @@ lock_line="$(awk '/acquire_operation_lock/ {print NR; exit}' <<<"$set_target_bod
   accepted_output="$(set_reality_target 2>&1)"
   grep -Fq 'TRANSACTION-STARTED' <<<"$accepted_output"
 )
+
+# SSH classification is conservative: a public peer alone is not evidence of
+# a direct transport. The exact local socket and sshd ownership must also be
+# positively observed.
+(
+  management_ss_established_connections() {
+    printf '%s\n' \
+      'ESTAB 0 0 203.0.113.10:22 198.51.100.20:50122 users:(("sshd-session",pid=4242,fd=4)) uid:0 ino:98765 sk:a1b2c3'
+  }
+  management_capture_ssh_transport_identity \
+    203.0.113.10:22 198.51.100.20:50122
+  [[ "$MANAGEMENT_TRANSPORT_LOCAL_ENDPOINT" == 203.0.113.10:22 ]]
+  [[ "$MANAGEMENT_TRANSPORT_REMOTE_ENDPOINT" == 198.51.100.20:50122 ]]
+  [[ "$MANAGEMENT_TRANSPORT_SOCKET_COOKIE" == a1b2c3 ]]
+  [[ "$MANAGEMENT_TRANSPORT_SOCKET_INODE" == 98765 ]]
+
+  management_ss_transport_connections() {
+    printf '%s\n' \
+      'ESTAB 0 0 203.0.113.10:22 198.51.100.20:50122 uid:0 ino:98765 sk:a1b2c3'
+  }
+  management_transport_identity_is_present \
+    203.0.113.10:22 198.51.100.20:50122 a1b2c3 98765
+  management_ss_transport_connections() {
+    printf '%s\n' \
+      'ESTAB 0 0 203.0.113.10:22 198.51.100.20:50122 uid:0 ino:98766 sk:d4e5f6'
+  }
+  if management_transport_identity_is_present \
+      203.0.113.10:22 198.51.100.20:50122 a1b2c3 98765; then
+    printf '%s\n' 'A reconnected socket was confused with the originating transport.' >&2
+    exit 1
+  fi
+  management_ss_transport_connections() {
+    printf '%s\n' 'ESTAB 0 0 203.0.113.10:22 198.51.100.20:50122'
+  }
+  if management_transport_identity_is_present \
+      203.0.113.10:22 198.51.100.20:50122 a1b2c3 98765; then
+    printf '%s\n' 'An unparseable transport observation was accepted.' >&2
+    exit 1
+  else
+    [[ $? == 2 ]]
+  fi
+)
+
+(
+  SERVER_IPV4=203.0.113.10
+  SSH_CONNECTION='198.51.100.20 50122 203.0.113.10 22'
+  management_address_is_local() { [[ "$1" == 203.0.113.10 ]]; }
+  management_capture_ssh_transport_identity() {
+    MANAGEMENT_TRANSPORT_LOCAL_ENDPOINT="$1"
+    MANAGEMENT_TRANSPORT_REMOTE_ENDPOINT="$2"
+    MANAGEMENT_TRANSPORT_SOCKET_COOKIE=a1b2c3
+    MANAGEMENT_TRANSPORT_SOCKET_INODE=98765
+  }
+  management_ssh_context_from_ancestry() {
+    MANAGEMENT_SSH_ANCESTOR_FOUND=1
+    MANAGEMENT_SSH_ANCESTOR_PID=4242
+    return 0
+  }
+  management_sing_box_connection_to_ssh_endpoint() { return 1; }
+  classify_management_ssh_session
+  [[ "$MANAGEMENT_SESSION_CLASS" == direct ]]
+  [[ "$MANAGEMENT_SESSION_REASON" == *'positively establish'* ]]
+
+  SSH_CONNECTION='203.0.113.10 50122 203.0.113.10 22'
+  classify_management_ssh_session
+  [[ "$MANAGEMENT_SESSION_CLASS" == deferred ]]
+
+  SSH_CONNECTION='198.51.100.20 50122 203.0.113.10 22'
+  management_capture_ssh_transport_identity() { return 1; }
+  classify_management_ssh_session
+  [[ "$MANAGEMENT_SESSION_CLASS" == deferred ]]
+
+  # A root-side command may lose SSH_CONNECTION after sudo. The ancestry
+  # recovery path must still classify the session conservatively.
+  unset SSH_CONNECTION
+  management_ssh_context_from_ancestry() {
+    MANAGEMENT_SSH_ANCESTOR_FOUND=1
+    MANAGEMENT_SSH_ANCESTOR_PID=4242
+    MANAGEMENT_SSH_CONNECTION='198.51.100.20 50122 203.0.113.10 22'
+    return 0
+  }
+  management_capture_ssh_transport_identity() {
+    MANAGEMENT_TRANSPORT_LOCAL_ENDPOINT="$1"
+    MANAGEMENT_TRANSPORT_REMOTE_ENDPOINT="$2"
+    MANAGEMENT_TRANSPORT_SOCKET_COOKIE=a1b2c3
+    MANAGEMENT_TRANSPORT_SOCKET_INODE=98765
+  }
+  classify_management_ssh_session
+  [[ "$MANAGEMENT_SESSION_CLASS" == direct ]]
+
+  # Positive socket evidence is still not enough when sing-box owns an
+  # outbound connection to the managed SSH endpoint (1:1 NAT self-tunnel).
+  SSH_CONNECTION='198.51.100.20 50122 203.0.113.10 22'
+  management_sing_box_connection_to_ssh_endpoint() { return 0; }
+  classify_management_ssh_session
+  [[ "$MANAGEMENT_SESSION_CLASS" == deferred ]]
+  [[ "$MANAGEMENT_SESSION_REASON" == *'1:1 NAT'* ]]
+
+  # Without positive SSH ancestry, a copied SSH_CONNECTION is not evidence of
+  # a controlling direct session.
+  management_ssh_context_from_ancestry() {
+    MANAGEMENT_SSH_ANCESTOR_FOUND=0
+    MANAGEMENT_SSH_ANCESTOR_PID=
+    return 1
+  }
+  management_sing_box_connection_to_ssh_endpoint() { return 1; }
+  classify_management_ssh_session
+  [[ "$MANAGEMENT_SESSION_CLASS" == deferred ]]
+
+  MANAGEMENT_TRANSPORT_LOCAL_ENDPOINT=""
+  MANAGEMENT_TRANSPORT_REMOTE_ENDPOINT=""
+  MANAGEMENT_TRANSPORT_SOCKET_COOKIE=""
+  MANAGEMENT_TRANSPORT_SOCKET_INODE=""
+  if missing_identity_output="$(deferred_job_create client-add test 2>&1)"; then
+    printf '%s\n' 'Deferred staging accepted a missing SSH transport identity.' >&2
+    exit 1
+  fi
+  grep -Fq 'exact controlling SSH transport identity is unavailable' \
+    <<<"$missing_identity_output"
+)
+
+fingerprint_body="$(declare -f set_client_fingerprint)"
+grep -Fq 'management_ssh_requires_deferred_activation' <<<"$fingerprint_body"
+grep -Fq 'deferred_job_create fingerprint' <<<"$fingerprint_body"
+for mutation_body in "$(declare -f set_reality_target)" "$(declare -f set_hy2_obfs)"; do
+  grep -Fq 'management_ssh_requires_deferred_activation' <<<"$mutation_body"
+  grep -Fq 'queue_deferred_mutation' <<<"$mutation_body"
+done
+
+# Deferred jobs carry a live-state baseline, refuse a second pending mutation,
+# and are recovered when their transient unit disappears even if the original
+# session is still alive.
+baseline_installer="${work}/baseline-installer.sh"
+cp "${repo_root}/install-sing-box-server.sh" "$baseline_installer"
+for mapping in \
+  "DEFERRED_MUTATION_ROOT:${work}/deferred-mutations" \
+  "OPERATION_OUTCOME_ROOT:${work}/operation-outcomes" \
+  "CLIENTS_FILE:${work}/clients.json" \
+  "CONFIG_FILE:${work}/config.json" \
+  "SETTINGS_FILE:${work}/settings.json" \
+  "SUBSCRIPTION_ROOT:${work}/subscriptions"
+do
+  constant="${mapping%%:*}"
+  path="${mapping#*:}"
+  sed -i.bak "s|^readonly ${constant}=.*|readonly ${constant}=\"${path}\"|" \
+    "$baseline_installer"
+  rm -f -- "${baseline_installer}.bak"
+done
+bash -c '
+  set -Eeuo pipefail
+  # shellcheck disable=SC1090
+  source "$1"
+  trap - ERR
+  install() {
+    directory=0
+    mode=""
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        -d) directory=1; shift ;;
+        -o|-g) shift 2 ;;
+        -m) mode="$2"; shift 2 ;;
+        *) break ;;
+      esac
+    done
+    if (( directory == 1 )); then
+      mkdir -p "$1"
+      [ -z "$mode" ] || chmod "$mode" "$1"
+    else
+      cp "$1" "$2"
+      [ -z "$mode" ] || chmod "$mode" "$2"
+    fi
+  }
+  mkdir -p "$DEFERRED_MUTATION_ROOT" "$OPERATION_OUTCOME_ROOT" "$SUBSCRIPTION_ROOT"
+  printf "%s\n" live >"$CLIENTS_FILE"
+  printf "%s\n" live >"$CONFIG_FILE"
+  printf "%s\n" live >"$SETTINGS_FILE"
+  printf "%s\n" subscription >"${SUBSCRIPTION_ROOT}/token.links"
+  job="${DEFERRED_MUTATION_ROOT}/job.pending"
+  mkdir -p "$job"
+  printf "%s\n" operation=client-add >"${job}/metadata"
+  deferred_job_capture_baseline "$job" "${job}/baseline"
+  deferred_job_verify_baseline "$job"
+  printf "%s\n" changed >"$CLIENTS_FILE"
+  if deferred_job_verify_baseline "$job"; then
+    printf "%s\n" "Baseline mismatch was not detected." >&2
+    exit 1
+  fi
+  [[ "$DEFERRED_BASELINE_MISMATCH" == clients.json*changed* ]]
+  DEFERRED_JOB_DIR=""
+  if pending_output="$(deferred_refuse_if_pending 2>&1)"; then
+    printf "%s\n" "A second pending mutation was accepted." >&2
+    exit 1
+  fi
+  grep -Fq "already pending" <<<"$pending_output"
+  DEFERRED_JOB_DIR="$job"
+  deferred_refuse_if_pending
+  rm -rf -- "$job"
+
+  orphan="${DEFERRED_MUTATION_ROOT}/job.orphan"
+  mkdir -p "$orphan"
+  printf "%s\n" \
+    operation=client-delete \
+    created=2026-08-20T20:00:00Z \
+    unit=vpn-deferred-missing \
+    transport_local=203.0.113.10:22 \
+    transport_remote=198.51.100.20:50122 \
+    transport_cookie=a1b2c3 \
+    transport_inode=98765 \
+    >"${orphan}/metadata"
+  systemctl() {
+    case "$*" in
+      *LoadState*) printf "%s\n" not-found ;;
+      *ActiveState*) printf "%s\n" inactive ;;
+      *) return 1 ;;
+    esac
+  }
+  if deferred_job_is_orphaned "$orphan"; then
+    :
+  else
+    printf "%s\n" "Orphaned transient unit was not detected." >&2
+    exit 1
+  fi
+  deferred_recover_orphaned_jobs
+  [[ ! -e "$orphan" ]]
+  grep -Fxq "status=failure" "${OPERATION_OUTCOME_ROOT}/job.orphan.status"
+  grep -Fxq "exit_status=125" "${OPERATION_OUTCOME_ROOT}/job.orphan.status"
+  grep -Fq "worker/session disappeared" "${OPERATION_OUTCOME_ROOT}/job.orphan.status"
+' _ "$baseline_installer"
 
 SERVER_IPV4=203.0.113.10
 TLS_DOMAIN=vpn.example.com
@@ -353,6 +584,10 @@ grep -Fq 'install -o root -g www-data -m 0640' <<<"$activation_body"
   ' _ "${repo_root}/install-sing-box-server.sh" "$work"
 )
 permissions_body="$(declare -f health_managed_permissions_are_healthy)"
+masquerade_permissions_body="$(declare -f hy2_masquerade_is_healthy)"
+grep -Fq "'750:root:sing-box'" <<<"$masquerade_permissions_body"
+grep -Fq "'644:root:sing-box'" <<<"$masquerade_permissions_body"
+grep -Fq 'hy2_masquerade_is_healthy' <<<"$permissions_body"
 grep -Fq "'750:root:www-data'" <<<"$permissions_body"
 grep -Fq "'640:root:www-data'" <<<"$permissions_body"
 grep -Fq '.clients[].subscription_token' <<<"$permissions_body"
