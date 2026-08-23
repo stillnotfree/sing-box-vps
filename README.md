@@ -291,8 +291,7 @@ open, or that traffic passes a particular ISP's filtering.
 
 A working Hysteria2 connection does not prove that REALITY, TCP/443, or the
 server IP is universally unblocked. A successful handshake also does not prove
-a usable tunnel. The field evidence behind this model is summarized in
-[docs/research/russia-network-findings.md](docs/research/russia-network-findings.md).
+a usable tunnel.
 
 ## Limitations
 

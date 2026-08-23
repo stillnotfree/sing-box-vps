@@ -136,7 +136,5 @@ and external client-network probe were actually performed.
 
 - Development, testing, release, and rollback: `docs/development.md`.
 - Subscription boundary and client formats: `docs/SUBSCRIPTIONS.md`.
-- Connectivity evidence from Russian networks:
-  `docs/research/russia-network-findings.md`.
 - User operation and troubleshooting: `README.md` and `README_RU.md`.
 - Vulnerability reporting and log-sharing rules: `SECURITY.md`.

@@ -282,9 +282,7 @@ Mihomo в зависимости от `User-Agent`; формат Mihomo такж
    default без воспроизведённого случая.
 
 Работа Hysteria2 не доказывает, что REALITY, TCP/443 или IP не блокируются во
-всех сетях. Успешный handshake также не доказывает пригодный tunnel. Основания
-для этой модели кратко сохранены в
-[docs/research/russia-network-findings.md](docs/research/russia-network-findings.md).
+всех сетях. Успешный handshake также не доказывает пригодный tunnel.
 
 ## Ограничения
 
