@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
+# shellcheck disable=SC2317 # Test doubles are invoked indirectly by sourced installer functions.
 
 set -Eeuo pipefail
 IFS=$'\n\t'
